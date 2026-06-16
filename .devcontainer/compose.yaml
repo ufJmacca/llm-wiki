@@ -1,0 +1,28 @@
+services:
+  devcontainer:
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_ADMIN
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    command: sleep infinity
+    working_dir: /workspace
+    user: vscode
+    environment:
+      NPM_CONFIG_CACHE: /home/vscode/.npm
+    volumes:
+      - ..:/workspace
+      - devcontainer-codex-home:/home/vscode/.codex
+      - ${HOME}/.codex/auth.json:/mnt/host-codex/auth.json:ro
+      - ${HOME}/.codex/config.toml:/mnt/host-codex/config.toml:ro
+      - ${HOME}/.ssh:/home/vscode/.ssh:ro
+      - ${HOME}/.gitconfig:/home/vscode/.gitconfig:ro
+      - ${HOME}/.config:/mnt/host-config
+      - /var/run/docker.sock:/var/run/docker.sock
+      - devcontainer-npm-cache:/home/vscode/.npm
+
+volumes:
+  devcontainer-codex-home:
+  devcontainer-npm-cache:

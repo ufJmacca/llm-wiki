@@ -2,6 +2,7 @@ import { Command, CommanderError, InvalidArgumentError, Option } from "commander
 
 import { DEFAULT_INIT_OPTIONS, type InitAgent, SUPPORTED_INIT_AGENTS } from "../config/defaults.js";
 import { createWiki } from "../scaffold/createWiki.js";
+import { formatCdCommand, initializeGitRepository, type GitInitResult } from "../utils/git.js";
 import { resolveSafeTargetPath, type ScaffoldWriteReport } from "../utils/fs.js";
 import { ok, type Result } from "../utils/result.js";
 import type { CliIo } from "../cli.js";
@@ -18,13 +19,36 @@ export type InitOptions = {
 
 export type InitCommandOutput = {
   command: "init";
+  status: "initialized" | "initialized_with_warnings";
   targetDir: string;
-  options: InitOptions;
-  scaffold: ScaffoldWriteReport;
+  createdPaths: string[];
+  overwrittenPaths: string[];
+  skippedPaths: string[];
+  optionalGroups: InitOptionalGroups;
+  noOp: InitNoOpFlags;
+  git: GitInitResult;
+  warnings: string[];
+  errors: string[];
 };
 
 type RawInitOptions = Partial<Record<keyof InitOptions, unknown>>;
-type PreparedInitCommand = Omit<InitCommandOutput, "scaffold">;
+type PreparedInitCommand = {
+  command: "init";
+  targetDir: string;
+  options: InitOptions;
+};
+
+type InitOptionalGroups = {
+  agent: InitAgent;
+  obsidian: boolean;
+  dataview: boolean;
+  git: boolean;
+  quartzReady: boolean;
+};
+
+type InitNoOpFlags = {
+  git: boolean;
+};
 
 export function parseInitAgent(value: string): InitAgent {
   if (isInitAgent(value)) {
@@ -67,18 +91,111 @@ export function registerInitCommand(program: Command, io: CliIo): void {
         return;
       }
 
-      const output: InitCommandOutput = {
-        ...prepared.value,
-        scaffold: scaffold.value,
-      };
+      const git = await initializeGitRepository(
+        prepared.value.targetDir,
+        prepared.value.options.git,
+        scaffoldGitAddPaths(scaffold.value),
+      );
+      const output = buildInitOutput(prepared.value, scaffold.value, git);
 
-      if (output.options.json) {
+      if (prepared.value.options.json) {
         io.stdout(JSON.stringify(output));
         return;
       }
 
-      io.stdout(`llm-wiki initialized ${output.targetDir}`);
+      io.stdout(formatHumanInitOutput(output));
     });
+}
+
+function buildInitOutput(
+  prepared: PreparedInitCommand,
+  scaffold: ScaffoldWriteReport,
+  git: GitInitResult,
+): InitCommandOutput {
+  const warnings = git.ok
+    ? []
+    : [
+        `Git setup did not complete after scaffold files were written: ${git.error}. Run the manual Git commands listed in this output.`,
+      ];
+
+  return {
+    command: "init",
+    status: warnings.length > 0 ? "initialized_with_warnings" : "initialized",
+    targetDir: prepared.targetDir,
+    createdPaths: scaffold.created,
+    overwrittenPaths: scaffold.overwritten,
+    skippedPaths: scaffold.skipped,
+    optionalGroups: {
+      agent: prepared.options.agent,
+      obsidian: prepared.options.obsidian,
+      dataview: prepared.options.dataview,
+      git: prepared.options.git,
+      quartzReady: prepared.options.quartzReady,
+    },
+    noOp: {
+      git: !prepared.options.git,
+    },
+    git,
+    warnings,
+    errors: [],
+  };
+}
+
+function scaffoldGitAddPaths(scaffold: ScaffoldWriteReport): string[] {
+  return [...scaffold.created, ...scaffold.overwritten, ...scaffold.skipped].sort();
+}
+
+function formatHumanInitOutput(output: InitCommandOutput): string {
+  const lines = [
+    "LLM Wiki initialized",
+    `Path: ${output.targetDir}`,
+    `Created paths: ${output.createdPaths.length}`,
+    `Optional groups: ${formatOptionalGroups(output.optionalGroups)}`,
+    `Git: ${formatGitSummary(output.git)}`,
+    output.warnings.length === 0 ? "Warnings: none" : "Warnings:",
+  ];
+
+  for (const warning of output.warnings) {
+    lines.push(`- ${warning}`);
+  }
+
+  if (!output.git.ok && output.git.manualCommands.length > 0) {
+    lines.push("Manual Git next steps:");
+    for (const command of output.git.manualCommands) {
+      lines.push(`- ${command}`);
+    }
+  }
+
+  lines.push("Next commands:", formatCdCommand(output.targetDir), "llm-wiki add <source> --title <title>");
+
+  return lines.join("\n");
+}
+
+function formatOptionalGroups(groups: InitOptionalGroups): string {
+  return [
+    `agent=${groups.agent}`,
+    `obsidian=${onOff(groups.obsidian)}`,
+    `dataview=${onOff(groups.dataview)}`,
+    `quartz-ready=${onOff(groups.quartzReady)}`,
+  ].join(", ");
+}
+
+function onOff(value: boolean): "on" | "off" {
+  return value ? "on" : "off";
+}
+
+function formatGitSummary(git: GitInitResult): string {
+  if (!git.enabled) {
+    return "skipped (--no-git)";
+  }
+
+  if (git.ok) {
+    return git.committed
+      ? `initialized and committed (${git.commitMessage})`
+      : "initialized; no scaffold changes to commit";
+  }
+
+  return "manual action required";
 }
 
 export function prepareInitCommand(

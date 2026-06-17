@@ -1,4 +1,4 @@
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -17,6 +17,11 @@ type InitJson = {
     quartzReady: boolean;
     force: boolean;
     json: boolean;
+  };
+  scaffold: {
+    created: string[];
+    overwritten: string[];
+    skipped: string[];
   };
 };
 
@@ -72,7 +77,7 @@ describe("llm-wiki init command surface", () => {
     }
   });
 
-  it("parses default init options without scaffold side effects", async () => {
+  it("creates the default scaffold and reports deterministic JSON path activity", async () => {
     // Arrange
     const parent = await mkdtemp(resolve(tmpdir(), "llm-wiki-init-default-"));
     const targetDir = resolve(parent, "wiki");
@@ -97,8 +102,20 @@ describe("llm-wiki init command surface", () => {
           force: false,
           json: true,
         },
+        scaffold: {
+          created: payload.scaffold.created,
+          overwritten: [],
+          skipped: [],
+        },
       });
-      expect(await pathExists(targetDir)).toBe(false);
+      expect(payload.scaffold.created).toEqual([...payload.scaffold.created].sort());
+      expect(payload.scaffold.created).toContain("AGENTS.md");
+      expect(payload.scaffold.created).toContain(".llm-wiki/config.yml");
+      expect(payload.scaffold.created).toContain("curated/index.md");
+      expect(payload.scaffold.created).toContain("curated/log.md");
+      expect(await readFile(resolve(targetDir, "AGENTS.md"), "utf8")).toContain(
+        "Maintain this repo as a persistent, compounding LLM Wiki.",
+      );
     } finally {
       await rm(parent, { force: true, recursive: true });
     }
@@ -107,13 +124,12 @@ describe("llm-wiki init command surface", () => {
   it("parses supported agent and feature options", async () => {
     // Arrange
     const parent = await mkdtemp(resolve(tmpdir(), "llm-wiki-init-options-"));
-    const targetDir = resolve(parent, "wiki");
 
     try {
       // Act
       const codex = await runCliBuffered([
         "init",
-        targetDir,
+        resolve(parent, "codex-wiki"),
         "--agent",
         "codex",
         "--obsidian",
@@ -123,8 +139,15 @@ describe("llm-wiki init command surface", () => {
         "--force",
         "--json",
       ]);
-      const claude = await runCliBuffered(["init", targetDir, "--agent", "claude", "--no-git", "--json"]);
-      const generic = await runCliBuffered(["init", targetDir, "--agent", "generic", "--json"]);
+      const claude = await runCliBuffered([
+        "init",
+        resolve(parent, "claude-wiki"),
+        "--agent",
+        "claude",
+        "--no-git",
+        "--json",
+      ]);
+      const generic = await runCliBuffered(["init", resolve(parent, "generic-wiki"), "--agent", "generic", "--json"]);
 
       // Assert
       expect(codex.exitCode).toBe(0);
@@ -147,7 +170,8 @@ describe("llm-wiki init command surface", () => {
       expect(parseInitJson(generic.stdout).options).toMatchObject({
         agent: "generic",
       });
-      expect(await pathExists(targetDir)).toBe(false);
+      expect(parseInitJson(codex.stdout).scaffold.created).toContain("CODEX.md");
+      expect(parseInitJson(claude.stdout).scaffold.created).toContain("CLAUDE.md");
     } finally {
       await rm(parent, { force: true, recursive: true });
     }

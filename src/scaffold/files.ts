@@ -16,6 +16,15 @@ export function planWikiScaffold(options: WikiScaffoldOptions): ScaffoldEntry[] 
     { path: ".llm-wiki/profiles/public.yml", content: publicProfileContent() },
     { path: ".llm-wiki/profiles/review.yml", content: reviewProfileContent() },
     { path: ".llm-wiki/schema.yml", content: schemaContent() },
+    { path: ".llm-wiki/templates/comparison.md", content: comparisonTemplateContent() },
+    { path: ".llm-wiki/templates/concept.md", content: conceptTemplateContent() },
+    { path: ".llm-wiki/templates/entity.md", content: entityTemplateContent() },
+    { path: ".llm-wiki/templates/log-entry.md", content: logEntryTemplateContent() },
+    { path: ".llm-wiki/templates/question.md", content: questionTemplateContent() },
+    { path: ".llm-wiki/templates/review-page.md", content: reviewPageTemplateContent() },
+    { path: ".llm-wiki/templates/source-card.md", content: sourceCardTemplateContent() },
+    { path: ".llm-wiki/templates/source-summary.md", content: sourceSummaryTemplateContent() },
+    { path: ".llm-wiki/templates/topic.md", content: topicTemplateContent() },
     { path: "AGENTS.md", content: agentInstructionsContent() },
     { path: "README.md", content: readmeContent() },
     { path: "curated/contradictions.md", content: titledPage("Contradictions", "page") },
@@ -24,6 +33,8 @@ export function planWikiScaffold(options: WikiScaffoldOptions): ScaffoldEntry[] 
     { path: "curated/log.md", content: logContent() },
     { path: "curated/map.md", content: titledPage("Map", "page") },
     { path: "curated/open-questions.md", content: titledPage("Open Questions", "page") },
+    { path: "raw/inputs/.gitkeep", content: "" },
+    { path: "raw/queue/.gitkeep", content: "" },
     { path: "raw/README.md", content: rawReadmeContent() },
   ];
 
@@ -53,6 +64,14 @@ function readmeContent(): string {
   return `# llm-wiki
 
 This repository is an LLM Wiki workspace with immutable raw sources and curated Markdown synthesis.
+
+## Core layout
+
+- \`raw/inputs/\` stores captured originals and source cards.
+- \`raw/queue/\` stores source queue items waiting for ingest.
+- \`curated/\` stores LLM-maintained Markdown pages.
+- \`curated/index.md\` is the wiki map.
+- \`curated/log.md\` is the append-only operation ledger.
 `;
 }
 
@@ -66,25 +85,102 @@ quartz/public/
 
 function configContent(options: WikiScaffoldOptions): string {
   return `version: 1
-agent: ${options.agent}
+agent:
+  default: ${options.agent}
 features:
   obsidian: ${options.obsidian}
   dataview: ${options.dataview}
   git: ${options.git}
+defaults:
+  visibility: private
+  source_status: queued
+paths:
+  raw: raw
+  raw_inputs: raw/inputs
+  raw_queue: raw/queue
+  curated: curated
+  index: curated/index.md
+  log: curated/log.md
+raw:
+  immutable_original_glob: raw/inputs/**/original.*
+  source_card_name: _source.md
+  default_visibility: private
+curated:
+  default_visibility: private
+  require_source_ids: true
+  write_policy: llm-maintained-human-reviewable
+control_plane:
+  index: curated/index.md
+  log: curated/log.md
+privacy:
+  raw_public_by_default: false
+  public_requires_visibility: public
 `;
 }
 
 function schemaContent(): string {
-  return `frontmatter:
+  return `version: 1
+visibility:
+  default: private
+  allowed:
+    - private
+    - public
+page_types:
+  raw:
+    - raw_source
+  curated:
+    - source_summary
+    - entity
+    - concept
+    - topic
+    - question
+    - comparison
+    - dashboard
+    - index
+    - log
+    - page
+raw_source:
+  required:
+    - type
+    - source_id
+    - title
+    - source_kind
+    - origin
+    - captured_at
+    - content_hash
+    - status
+    - visibility
+  immutable:
+    - raw/inputs/**/original.*
+curated_page:
   required:
     - type
     - title
     - visibility
+    - source_ids
+  recommended:
+    - status
+    - review_status
+    - tags
+log:
+  append_only: true
+  operations:
+    - init
+    - add
+    - ingest
+    - query
+    - lint
+    - explore
+    - deploy
+    - upload
+  heading_pattern: "^## \\\\[[^\\\\]]+\\\\] (init|add|ingest|query|lint|explore|deploy|upload) \\\\| .+ \\\\| .+$"
 `;
 }
 
 function agentInstructionsContent(): string {
   return `# LLM Wiki Agent Instructions
+
+AGENTS.md is the canonical instruction source for this LLM Wiki. Agent-specific files may point here, but this file defines the shared rules.
 
 ## Mission
 
@@ -104,6 +200,54 @@ Maintain this repo as a persistent, compounding LLM Wiki.
 10. Prefer updating existing pages over creating duplicates.
 11. Respect page \`visibility\`.
 12. Never make private/raw content public without explicit human instruction.
+
+## Page types
+
+- source_summary
+- entity
+- concept
+- topic
+- question
+- comparison
+- dashboard
+
+## Ingest workflow
+
+1. Read the source card and original or extracted content.
+2. Read \`curated/index.md\` before creating pages.
+3. Create or update the curated source summary.
+4. Update relevant entity, concept, topic, question, or comparison pages.
+5. Add source provenance through \`source_ids\`.
+6. Update \`curated/index.md\`.
+7. Append an entry to \`curated/log.md\`.
+
+## Query workflow
+
+Use curated pages first, cite source IDs when filing answers back, and save durable answers under \`curated/questions/\` only when requested.
+
+## Lint workflow
+
+Check frontmatter, wikilinks, source IDs, raw immutability, index coverage, log format, and public/private visibility before considering work complete.
+
+## Review workflow
+
+Flag incomplete evidence with \`review_status: needs-human-review\`, add open questions when facts are missing, and record contradictions explicitly.
+
+## Frontmatter schema
+
+Curated pages must include \`type\`, \`title\`, \`visibility\`, and \`source_ids\`. Raw source cards must include stable source metadata and default to \`visibility: private\`.
+
+## Citation and provenance conventions
+
+Use source-level provenance through \`source_ids\`. Do not invent missing facts or silently merge conflicting claims.
+
+## Public/private visibility rules
+
+Private is the default visibility. Public pages must not link to raw originals, private pages, private source summaries, queue files, or local-only assets.
+
+## Quartz Explorer profile rules
+
+Local and review profiles may include private curated pages and source cards. Public profiles must include only public curated content and fail closed on leaks.
 `;
 }
 
@@ -147,6 +291,24 @@ function indexContent(): string {
 
 function logContent(): string {
   return `${frontmatter("log", "Log")}# Log
+
+## Entry format
+
+Append entries using this parseable heading shape:
+
+\`\`\`markdown
+## [operation-timestamp] operation | affected-id | title
+
+- actor:
+- command:
+- git_branch:
+- git_commit:
+- raw_source:
+- created:
+- updated:
+- contradictions:
+- follow_ups:
+\`\`\`
 `;
 }
 
@@ -158,7 +320,207 @@ function titledPage(title: string, type: string): string {
 function rawReadmeContent(): string {
   return `# Raw Sources
 
-Raw source originals are immutable. Store captured inputs under raw/inputs/.
+Raw source originals are immutable and private by default. Store captured inputs under \`raw/inputs/\`.
+
+Each source folder should contain a source card named \`_source.md\` and an immutable captured original named \`original.*\`. Derived files such as extracted text may be added next to the original.
+`;
+}
+
+function sourceCardTemplateContent(): string {
+  return `---
+type: raw_source
+source_id:
+title:
+source_kind:
+origin:
+origin_url:
+captured_at:
+content_hash:
+status: queued
+visibility: private
+tags: []
+curated_summary:
+ingested_at:
+supersedes:
+superseded_by:
+---
+
+# Raw Source Card
+
+Original file: [[original]]
+
+## Capture notes
+
+## Human notes
+
+## Ingest status
+
+- Status: queued
+- Curated summary:
+`;
+}
+
+function sourceSummaryTemplateContent(): string {
+  return `---
+type: source_summary
+source_id:
+title:
+source_kind:
+source_path:
+status: active
+visibility: private
+confidence: medium
+source_ids: []
+tags:
+  - source-summary
+---
+
+# Source Summary
+
+## Summary
+
+## Key claims
+
+## Useful concepts
+
+## Links created or updated
+
+## Contradictions or tensions
+
+## Open questions
+
+## Source references
+`;
+}
+
+function conceptTemplateContent(): string {
+  return wikiPageTemplateContent("concept", "Concept");
+}
+
+function entityTemplateContent(): string {
+  return wikiPageTemplateContent("entity", "Entity");
+}
+
+function topicTemplateContent(): string {
+  return wikiPageTemplateContent("topic", "Topic");
+}
+
+function questionTemplateContent(): string {
+  return `---
+type: question
+title:
+status: active
+visibility: private
+source_ids: []
+source_count: 0
+review_status: needs-human-review
+tags:
+  - question
+---
+
+# Question
+
+## Question
+
+## Answer
+
+## Evidence
+
+## Open questions
+`;
+}
+
+function comparisonTemplateContent(): string {
+  return `---
+type: comparison
+title:
+status: active
+visibility: private
+source_ids: []
+source_count: 0
+review_status: needs-human-review
+tags:
+  - comparison
+---
+
+# Comparison
+
+## Compared items
+
+## Summary
+
+## Similarities
+
+## Differences
+
+## Evidence
+
+## Open questions
+`;
+}
+
+function reviewPageTemplateContent(): string {
+  return `---
+type: dashboard
+title:
+visibility: private
+source_ids: []
+tags:
+  - review
+---
+
+# Review
+
+## Needs human review
+
+## Recent changes
+
+## Contradictions
+
+## Follow-ups
+`;
+}
+
+function logEntryTemplateContent(): string {
+  return `## [operation-timestamp] operation | affected-id | title
+
+- actor:
+- command:
+- git_branch:
+- git_commit:
+- raw_source:
+- created:
+- updated:
+- contradictions:
+- follow_ups:
+`;
+}
+
+function wikiPageTemplateContent(type: string, title: string): string {
+  return `---
+type: ${type}
+title:
+aliases: []
+status: active
+visibility: private
+source_ids: []
+source_count: 0
+review_status: needs-human-review
+tags:
+  - ${type}
+---
+
+# ${title}
+
+## Definition
+
+## Why it matters
+
+## Related pages
+
+## Evidence
+
+## Open questions
 `;
 }
 
@@ -191,6 +553,7 @@ function frontmatter(type: string, title: string): string {
 type: ${type}
 title: ${title}
 visibility: private
+source_ids: []
 ---
 
 `;

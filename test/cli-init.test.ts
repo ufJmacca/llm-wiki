@@ -8,21 +8,34 @@ import { runCli } from "../src/cli.js";
 
 type InitJson = {
   command: "init";
+  status: "initialized" | "initialized_with_warnings";
   targetDir: string;
-  options: {
+  createdPaths: string[];
+  overwrittenPaths: string[];
+  skippedPaths: string[];
+  optionalGroups: {
     agent: "codex" | "claude" | "generic";
     obsidian: boolean;
     dataview: boolean;
     git: boolean;
     quartzReady: boolean;
-    force: boolean;
-    json: boolean;
   };
-  scaffold: {
-    created: string[];
-    overwritten: string[];
-    skipped: string[];
+  noOp: {
+    git: boolean;
   };
+  git: {
+    enabled: boolean;
+    attempted: boolean;
+    ok: boolean;
+    initialized: boolean;
+    staged: boolean;
+    committed: boolean;
+    commitMessage: string;
+    manualCommands: string[];
+    error: string | null;
+  };
+  warnings: string[];
+  errors: string[];
 };
 
 async function pathExists(path: string): Promise<boolean> {
@@ -92,27 +105,31 @@ describe("llm-wiki init command surface", () => {
       expect(result.stderr).toEqual([]);
       expect(payload).toEqual({
         command: "init",
+        status: payload.status,
         targetDir,
-        options: {
+        createdPaths: payload.createdPaths,
+        overwrittenPaths: [],
+        skippedPaths: [],
+        optionalGroups: {
           agent: "generic",
           obsidian: false,
           dataview: false,
           git: true,
           quartzReady: false,
-          force: false,
-          json: true,
         },
-        scaffold: {
-          created: payload.scaffold.created,
-          overwritten: [],
-          skipped: [],
+        noOp: {
+          git: false,
         },
+        git: payload.git,
+        warnings: payload.warnings,
+        errors: [],
       });
-      expect(payload.scaffold.created).toEqual([...payload.scaffold.created].sort());
-      expect(payload.scaffold.created).toContain("AGENTS.md");
-      expect(payload.scaffold.created).toContain(".llm-wiki/config.yml");
-      expect(payload.scaffold.created).toContain("curated/index.md");
-      expect(payload.scaffold.created).toContain("curated/log.md");
+      expect(payload.createdPaths).toEqual([...payload.createdPaths].sort());
+      expect(payload.createdPaths).toContain("AGENTS.md");
+      expect(payload.createdPaths).toContain(".llm-wiki/config.yml");
+      expect(payload.createdPaths).toContain("curated/index.md");
+      expect(payload.createdPaths).toContain("curated/log.md");
+      expect(payload.git.commitMessage).toBe("chore: initialize llm-wiki");
       expect(await readFile(resolve(targetDir, "AGENTS.md"), "utf8")).toContain(
         "Maintain this repo as a persistent, compounding LLM Wiki.",
       );
@@ -151,27 +168,25 @@ describe("llm-wiki init command surface", () => {
 
       // Assert
       expect(codex.exitCode).toBe(0);
-      expect(parseInitJson(codex.stdout).options).toEqual({
+      expect(parseInitJson(codex.stdout).optionalGroups).toEqual({
         agent: "codex",
         obsidian: true,
         dataview: true,
         git: true,
         quartzReady: true,
-        force: true,
-        json: true,
       });
       expect(claude.exitCode).toBe(0);
-      expect(parseInitJson(claude.stdout).options).toMatchObject({
+      expect(parseInitJson(claude.stdout).optionalGroups).toMatchObject({
         agent: "claude",
         git: false,
         quartzReady: false,
       });
       expect(generic.exitCode).toBe(0);
-      expect(parseInitJson(generic.stdout).options).toMatchObject({
+      expect(parseInitJson(generic.stdout).optionalGroups).toMatchObject({
         agent: "generic",
       });
-      expect(parseInitJson(codex.stdout).scaffold.created).toContain("CODEX.md");
-      expect(parseInitJson(claude.stdout).scaffold.created).toContain("CLAUDE.md");
+      expect(parseInitJson(codex.stdout).createdPaths).toContain("CODEX.md");
+      expect(parseInitJson(claude.stdout).createdPaths).toContain("CLAUDE.md");
     } finally {
       await rm(parent, { force: true, recursive: true });
     }

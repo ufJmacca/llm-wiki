@@ -55,6 +55,10 @@ export type CliResult = {
   stdout: string[];
 };
 
+export type RunCliBufferedOptions = {
+  stdin?: string | (() => Promise<string>);
+};
+
 export async function withTempWorkspace<T>(
   prefix: string,
   run: (workspaceDir: string) => Promise<T>,
@@ -68,13 +72,17 @@ export async function withTempWorkspace<T>(
   }
 }
 
-export async function runCliBuffered(args: string[]): Promise<CliResult> {
+export async function runCliBuffered(args: string[], options: RunCliBufferedOptions = {}): Promise<CliResult> {
   const stdout: string[] = [];
   const stderr: string[] = [];
+  const stdinOption = options.stdin;
+  const stdin =
+    stdinOption === undefined ? undefined : typeof stdinOption === "function" ? stdinOption : async () => stdinOption;
 
   const exitCode = await runCli(args, {
     stdout: (message) => stdout.push(message),
     stderr: (message) => stderr.push(message),
+    stdin,
   });
 
   return { exitCode, stderr, stdout };

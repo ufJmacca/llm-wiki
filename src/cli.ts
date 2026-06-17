@@ -4,12 +4,15 @@ import { pathToFileURL } from "node:url";
 
 import { Command, CommanderError } from "commander";
 
+import { registerAddCommand } from "./commands/add.js";
+import { registerAddTextCommand } from "./commands/addText.js";
 import { registerInitCommand } from "./commands/init.js";
 import { registerStatusCommand } from "./commands/status.js";
 
 export type CliIo = {
   stdout: (message: string) => void;
   stderr: (message: string) => void;
+  stdin?: () => Promise<string>;
 };
 
 const VERSION = "0.0.0";
@@ -21,6 +24,7 @@ const defaultIo: CliIo = {
   stderr: (message) => {
     process.stderr.write(message.endsWith("\n") ? message : `${message}\n`);
   },
+  stdin: readProcessStdin,
 };
 
 export async function runCli(args = process.argv.slice(2), io = defaultIo): Promise<number> {
@@ -59,9 +63,24 @@ function createProgram(io: CliIo): Command {
     });
 
   registerInitCommand(program, io);
+  registerAddCommand(program, io);
+  registerAddTextCommand(program, io);
   registerStatusCommand(program, io);
 
   return program;
+}
+
+async function readProcessStdin(): Promise<string> {
+  if (process.stdin.isTTY) {
+    return "";
+  }
+
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  }
+
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function isCliEntrypoint(argvPath: string | undefined, moduleUrl: string): boolean {

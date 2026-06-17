@@ -2,7 +2,7 @@
 
 `llm-wiki` is a local-first CLI for creating a Git-backed, Obsidian-compatible Markdown wiki that can later grow into the full LLM Wiki workflow described in the PRD.
 
-The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
+The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add` and `llm-wiki add-text` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
 
 ## Development
 
@@ -23,6 +23,8 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 
 - `src/cli.ts` registers the CLI entrypoint and command surface.
 - `src/commands/init.ts` owns the first supported `llm-wiki init` command behavior.
+- `src/commands/add.ts` and `src/commands/addText.ts` own source capture command behavior.
+- `src/sourceCapture/` owns deterministic source IDs, hashing, metadata, duplicate detection, and raw writes.
 - `src/scaffold/` plans and writes generated wiki files.
 - `src/scaffold/templates/` contains reusable scaffold template content.
 - `src/utils/` contains filesystem, Git, and result helpers.
@@ -37,6 +39,8 @@ Build the CLI, then initialize a wiki:
 npm run build
 llm-wiki init my-wiki --agent codex --obsidian --dataview --git --quartz-ready
 cd my-wiki
+llm-wiki add ../notes/research-note.md --title "Research Note"
+llm-wiki add-text --title "Pasted Note" --text "Captured text"
 git status
 ```
 
@@ -50,20 +54,36 @@ Non-init commands accept the shared runtime options:
 llm-wiki status --repo my-wiki
 llm-wiki status --repo my-wiki --json
 llm-wiki status --repo my-wiki --quiet
+llm-wiki add ../notes/research-note.md --repo my-wiki --title "Research Note" --json
+llm-wiki add-text --repo my-wiki --title "Pasted Note" --text "Captured text" --json
 ```
 
 - `--repo <path>` may point at a wiki root or any descendant directory containing `.llm-wiki/config.yml` above it.
 - `--json` prints stable envelopes shaped as `{ ok, command, repo, data, warnings }` on success or `{ ok, command, repo, error, issues }` on failure.
 - `--quiet` suppresses human success output only. Human errors and JSON output are still printed.
 
-`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. Full health reporting is deferred to the status slice.
+`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add` and `add-text` return the captured source metadata, created paths, or duplicate source metadata. Full health reporting is deferred to the status slice.
+
+## Source Capture
+
+`llm-wiki add <path> --title <title>` copies a local source file into `raw/inputs/YYYY/MM/<source_id>/original.<ext>`, writes a source card at `_source.md`, writes `raw/queue/<source_id>.json`, and appends a parseable `add` entry to `curated/log.md`.
+
+`llm-wiki add-text --title <title> --text <text>` stores pasted text as `original.md` with `source_kind: text`, `origin: pasted_text`, `visibility: private`, and queued status.
+
+Source IDs are deterministic for the UTC capture date, source title slug, and content hash:
+
+```text
+src_<yyyy>_<mm>_<dd>_<slug>_<12-char-sha256>
+```
+
+Duplicate content returns the existing source metadata with `status: duplicate` and does not write new files or log entries. Raw originals are written with binary-safe no-overwrite semantics.
 
 ## Generated Scaffold Semantics
 
 `llm-wiki init` creates a wiki repository scaffold, not a completed knowledge base.
 
-- `raw/inputs/` is reserved for captured source folders. Future `add` commands will place raw originals and source cards here. Once present, raw originals are immutable source material.
-- `raw/queue/` is reserved for source queue items waiting for ingest.
+- `raw/inputs/` stores captured source folders. Once present, raw originals are immutable source material.
+- `raw/queue/` stores source queue items waiting for ingest.
 - `curated/` stores LLM-maintained Markdown pages.
 - `curated/index.md` is the content-oriented wiki map.
 - `curated/log.md` is the append-only operation ledger.
@@ -106,7 +126,6 @@ Agent-specific files are thin pointers:
 
 The following PRD features are not implemented in this foundation slice:
 
-- `add/add-text` source capture commands.
 - `ingest` task orchestration and validation.
 - `lint command behavior` beyond generated lint-rule configuration.
 - `Quartz runtime`, including `explore init`, `explore sync`, `explore serve`, search, backlinks, and graph UI.

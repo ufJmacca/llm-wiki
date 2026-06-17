@@ -93,7 +93,6 @@ describe("repository documentation and CI foundation", () => {
   it("documents privacy defaults, agent-file behavior, and deferred features", async () => {
     // Arrange
     const deferredFeatures = [
-      "add/add-text",
       "ingest",
       "lint command behavior",
       "Quartz runtime",
@@ -113,6 +112,9 @@ describe("repository documentation and CI foundation", () => {
     expect(readme).toContain("canonical, model-agnostic");
     expect(readme).toContain("CODEX.md is generated only with `--agent codex`");
     expect(readme).toContain("CLAUDE.md is generated only with `--agent claude`");
+    expect(readme).toContain("`llm-wiki add <path> --title <title>`");
+    expect(readme).toContain("`llm-wiki add-text --title <title> --text <text>`");
+    expect(readme).toContain("Duplicate content returns the existing source metadata");
     for (const feature of deferredFeatures) {
       expect(readme, feature).toContain(feature);
     }

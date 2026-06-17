@@ -6,6 +6,7 @@ import { parse } from "yaml";
 import { describe, expect, it } from "vitest";
 
 import { createWiki, type CreateWikiOptions } from "../src/scaffold/createWiki.js";
+import { readGeneratedYaml } from "./helpers/init.js";
 
 const defaultOptions: CreateWikiOptions = {
   agent: "generic",
@@ -28,6 +29,16 @@ type Profile = {
   safety?: Record<string, boolean>;
   features?: Record<string, boolean>;
   source_links?: Record<string, boolean>;
+};
+
+type LintRules = {
+  rules: {
+    public_pages_require_visibility: { severity: string; required_value: string };
+    public_pages_must_not_link_raw: { severity: string };
+    public_pages_must_not_link_private: { severity: string };
+    public_search_must_not_include_private_text: { severity: string };
+    public_graph_must_not_include_private_nodes: { severity: string };
+  };
 };
 
 async function pathExists(path: string): Promise<boolean> {
@@ -155,6 +166,32 @@ describe("profile privacy scaffold contract", () => {
       expect(reviewProfile.visibility).toMatchObject({ include_private: true });
       expect(reviewProfile.include).toEqual(expect.arrayContaining(["curated/**", "raw/inputs/**/_source.md", "raw/queue/**"]));
       expect(reviewProfile.exclude).toEqual(expect.arrayContaining(["raw/inputs/**/original.*"]));
+    } finally {
+      await rm(parent, { force: true, recursive: true });
+    }
+  });
+
+  it("pairs public profile defaults with fail-closed lint rules", async () => {
+    // Arrange
+    const parent = await mkdtemp(resolve(tmpdir(), "llm-wiki-profile-lint-rules-"));
+    const targetDir = resolve(parent, "wiki");
+
+    try {
+      await createWiki(targetDir, defaultOptions);
+
+      // Act
+      const publicProfile = await readProfile(targetDir, "public");
+      const lintRules = await readGeneratedYaml<LintRules>(targetDir, ".llm-wiki/checks/lint-rules.yml");
+
+      // Assert
+      expect(lintRules.rules.public_pages_require_visibility).toEqual({
+        severity: "error",
+        required_value: publicProfile.visibility?.required_value,
+      });
+      expect(lintRules.rules.public_pages_must_not_link_raw.severity).toBe("error");
+      expect(lintRules.rules.public_pages_must_not_link_private.severity).toBe("error");
+      expect(lintRules.rules.public_search_must_not_include_private_text.severity).toBe("error");
+      expect(lintRules.rules.public_graph_must_not_include_private_nodes.severity).toBe("error");
     } finally {
       await rm(parent, { force: true, recursive: true });
     }

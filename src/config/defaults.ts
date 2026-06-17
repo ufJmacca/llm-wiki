@@ -19,3 +19,14 @@ export const DEFAULT_INIT_OPTIONS = {
   force: boolean;
   json: boolean;
 };
+
+export const PUBLIC_PROFILE_REQUIRED_VISIBILITY = "public";
+
+export const PUBLIC_PROFILE_EXCLUDES = [
+  "raw/**",
+  "raw/queue/**",
+  "curated/log.md",
+  "curated/sources/**",
+  "curated/dashboards/private/**",
+  "curated/private/**",
+] as const;

@@ -1,5 +1,6 @@
 import type { InitAgent } from "../config/defaults.js";
 import type { ScaffoldEntry } from "../utils/fs.js";
+import { localProfileContent, publicProfileContent, reviewProfileContent } from "./templates/profiles.js";
 
 export type WikiScaffoldOptions = {
   agent: InitAgent;
@@ -556,47 +557,6 @@ visibility: private
 source_ids: []
 ---
 
-`;
-}
-
-function localProfileContent(): string {
-  return `name: local
-mode: local-exploration
-include:
-  - curated/**
-  - raw/inputs/**/_source.md
-exclude:
-  - raw/inputs/**/original.*
-visibility:
-  include_private: true
-`;
-}
-
-function reviewProfileContent(): string {
-  return `name: review
-mode: review
-include:
-  - curated/**
-  - raw/queue/**
-visibility:
-  include_private: true
-`;
-}
-
-function publicProfileContent(): string {
-  return `name: public
-mode: deploy
-include:
-  - curated/**
-exclude:
-  - raw/**
-  - curated/log.md
-visibility:
-  include_private: false
-safety:
-  fail_on_private_links: true
-  fail_on_raw_links: true
-  fail_on_missing_visibility: true
 `;
 }
 

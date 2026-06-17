@@ -1,8 +1,8 @@
-import { resolve } from "node:path";
-
-import { Command, InvalidArgumentError, Option } from "commander";
+import { Command, CommanderError, InvalidArgumentError, Option } from "commander";
 
 import { DEFAULT_INIT_OPTIONS, type InitAgent, SUPPORTED_INIT_AGENTS } from "../config/defaults.js";
+import { createWiki } from "../scaffold/createWiki.js";
+import { resolveSafeTargetPath, type ScaffoldWriteReport } from "../utils/fs.js";
 import { ok, type Result } from "../utils/result.js";
 import type { CliIo } from "../cli.js";
 
@@ -20,9 +20,11 @@ export type InitCommandOutput = {
   command: "init";
   targetDir: string;
   options: InitOptions;
+  scaffold: ScaffoldWriteReport;
 };
 
 type RawInitOptions = Partial<Record<keyof InitOptions, unknown>>;
+type PreparedInitCommand = Omit<InitCommandOutput, "scaffold">;
 
 export function parseInitAgent(value: string): InitAgent {
   if (isInitAgent(value)) {
@@ -51,32 +53,47 @@ export function registerInitCommand(program: Command, io: CliIo): void {
     .option("--quartz-ready", "record future Quartz Explorer readiness intent", DEFAULT_INIT_OPTIONS.quartzReady)
     .option("--force", "allow replacing existing generated files in later scaffold slices", DEFAULT_INIT_OPTIONS.force)
     .option("--json", "print machine-readable command dispatch output", DEFAULT_INIT_OPTIONS.json)
-    .action((targetDir: string, rawOptions: RawInitOptions) => {
-      const result = prepareInitCommand(targetDir, rawOptions);
+    .action(async (targetDir: string, rawOptions: RawInitOptions) => {
+      const prepared = prepareInitCommand(targetDir, rawOptions);
 
-      if (!result.ok) {
-        io.stderr(result.error.message);
+      if (!prepared.ok) {
+        throwCommandError(io, prepared.error);
         return;
       }
 
-      if (result.value.options.json) {
-        io.stdout(JSON.stringify(result.value));
+      const scaffold = await createWiki(prepared.value.targetDir, prepared.value.options);
+      if (!scaffold.ok) {
+        throwCommandError(io, scaffold.error);
         return;
       }
 
-      io.stdout(`llm-wiki init accepted for ${result.value.targetDir}`);
+      const output: InitCommandOutput = {
+        ...prepared.value,
+        scaffold: scaffold.value,
+      };
+
+      if (output.options.json) {
+        io.stdout(JSON.stringify(output));
+        return;
+      }
+
+      io.stdout(`llm-wiki initialized ${output.targetDir}`);
     });
 }
 
 export function prepareInitCommand(
   targetDir: string,
   rawOptions: RawInitOptions = {},
-): Result<InitCommandOutput> {
+): Result<PreparedInitCommand> {
   const options = normalizeInitOptions(rawOptions);
+  const safeTargetDir = resolveSafeTargetPath(targetDir);
+  if (!safeTargetDir.ok) {
+    return safeTargetDir;
+  }
 
   return ok({
     command: "init",
-    targetDir: resolve(targetDir),
+    targetDir: safeTargetDir.value,
     options,
   });
 }
@@ -107,4 +124,9 @@ function normalizeBoolean(value: unknown, fallback: boolean): boolean {
 
 function isInitAgent(value: string): value is InitAgent {
   return SUPPORTED_INIT_AGENTS.includes(value as InitAgent);
+}
+
+function throwCommandError(io: CliIo, error: Error): never {
+  io.stderr(error.message);
+  throw new CommanderError(1, "llm-wiki.init", error.message);
 }

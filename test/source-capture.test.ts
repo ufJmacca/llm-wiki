@@ -53,7 +53,7 @@ type SourceCaptureData = {
     captured_at: string;
     content_hash: string;
     visibility: "private";
-    queue_status: "queued";
+    queue_status: "queued" | "ingesting" | "ingested" | "blocked";
     original_path: string;
     source_card_path: string;
     queue_path: string;
@@ -574,6 +574,80 @@ describe("source capture core", () => {
       });
       expect(afterDuplicate).toEqual(beforeDuplicate);
     });
+  });
+
+  it("detects duplicate content after queue items leave the queued state", async () => {
+    const statusTransitions = [
+      { status: "ingesting", transitions: ["ingesting"] },
+      { status: "ingested", transitions: ["ingesting", "ingested"] },
+      { status: "blocked", transitions: ["ingesting", "blocked"] },
+    ] as const;
+
+    for (const { status, transitions } of statusTransitions) {
+      await withTempWorkspace(`llm-wiki-add-duplicate-${status}-`, async (workspaceDir) => {
+        // Arrange
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(capturedAt));
+        const wikiDir = resolve(workspaceDir, "wiki");
+        const title = `Duplicate ${status}`;
+        const content = `Duplicate content after ${status}.\n`;
+        const sourceId = expectedSourceId(title, content);
+        await initializeWiki(wikiDir);
+        const firstAdd = await runCliBuffered([
+          "add-text",
+          content,
+          "--repo",
+          wikiDir,
+          "--title",
+          title,
+          "--json",
+        ]);
+        expect(firstAdd.exitCode).toBe(0);
+
+        for (const transition of transitions) {
+          const transitionResult = await runCliBuffered([
+            "queue",
+            "set-status",
+            sourceId,
+            transition,
+            "--repo",
+            wikiDir,
+            "--json",
+          ]);
+          expect(transitionResult.exitCode).toBe(0);
+        }
+
+        const beforeDuplicate = await readTreeSnapshot(wikiDir);
+
+        // Act
+        const duplicateResult = await runCliBuffered([
+          "add-text",
+          content,
+          "--repo",
+          wikiDir,
+          "--title",
+          `Duplicate ${status} Again`,
+          "--json",
+        ]);
+        const payload = parseJsonEnvelope<SourceCaptureData>(duplicateResult.stdout);
+        const afterDuplicate = await readTreeSnapshot(wikiDir);
+
+        // Assert
+        expect(duplicateResult.exitCode).toBe(0);
+        expect(duplicateResult.stderr).toEqual([]);
+        expect(payload.data).toMatchObject({
+          status: "duplicate",
+          source: {
+            source_id: sourceId,
+            title,
+            source_kind: "text",
+            queue_status: status,
+          },
+          created_paths: [],
+        });
+        expect(afterDuplicate).toEqual(beforeDuplicate);
+      });
+    }
   });
 
   it("skips malformed queue JSON while scanning for duplicates", async () => {

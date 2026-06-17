@@ -14,7 +14,7 @@ import {
 import { err, ok, type Result } from "../utils/result.js";
 
 export type SourceKind = "file" | "text" | "url";
-export type QueueStatus = "queued";
+export type QueueStatus = "queued" | "ingesting" | "ingested" | "blocked";
 
 export type CapturedSource = {
   source_id: string;
@@ -494,7 +494,7 @@ async function findDuplicateSource(
       captured_at: typeof queueItem.captured_at === "string" ? queueItem.captured_at : "",
       content_hash: contentHash,
       visibility: "private",
-      queue_status: "queued",
+      queue_status: queueItem.status,
       original_path: queueItem.original_path,
       source_card_path: queueItem.path,
       queue_path: `raw/queue/${queueFile}`,
@@ -605,7 +605,7 @@ function isValidDuplicateQueueItem(value: unknown, contentHash: string): value i
     isNonEmptyString(value.origin) &&
     (value.source_kind !== "url" || isNonEmptyString(value.origin_url)) &&
     isNonEmptyString(value.captured_at) &&
-    value.status === "queued" &&
+    isQueueStatus(value.status) &&
     value.visibility === "private" &&
     isNonEmptyString(value.path) &&
     isNonEmptyString(value.original_path)
@@ -622,6 +622,10 @@ function isNonEmptyString(value: unknown): value is string {
 
 function isSourceKind(value: unknown): value is SourceKind {
   return value === "file" || value === "text" || value === "url";
+}
+
+function isQueueStatus(value: unknown): value is QueueStatus {
+  return value === "queued" || value === "ingesting" || value === "ingested" || value === "blocked";
 }
 
 function isSourceId(value: unknown): value is string {

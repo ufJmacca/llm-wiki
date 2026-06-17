@@ -2,6 +2,7 @@ import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
+import { parse } from "yaml";
 import { describe, expect, it } from "vitest";
 
 import { createWiki, type CreateWikiOptions } from "../src/scaffold/createWiki.js";
@@ -24,6 +25,15 @@ async function pathExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function parseMarkdownFrontmatter(content: string): Record<string, unknown> {
+  const match = /^---\n(?<yaml>[\s\S]*?)\n---\n\n/.exec(content);
+  if (match?.groups?.yaml === undefined) {
+    throw new Error("missing frontmatter");
+  }
+
+  return parse(match.groups.yaml) as Record<string, unknown>;
 }
 
 describe("safe scaffold planner and writer", () => {
@@ -408,6 +418,11 @@ describe("safe scaffold planner and writer", () => {
     const plannedEntries = new Map(
       planWikiScaffold({ ...defaultOptions, dataview: true }).map((entry) => [entry.path, entry.content]),
     );
+    const schemaContent = plannedEntries.get(".llm-wiki/schema.yml");
+    if (schemaContent === undefined) {
+      throw new Error("missing planned schema");
+    }
+    const schema = parse(schemaContent) as { curated_page: { required: string[] } };
     const curatedPages = [
       "curated/contradictions.md",
       "curated/dashboards/ingestion-queue.md",
@@ -425,7 +440,12 @@ describe("safe scaffold planner and writer", () => {
         throw new Error(`missing planned page: ${pagePath}`);
       }
 
-      expect(content).toMatch(/^---\ntype: .+\ntitle: .+\nvisibility: private\n---\n\n# /);
+      const frontmatter = parseMarkdownFrontmatter(content);
+      for (const requiredField of schema.curated_page.required) {
+        expect(frontmatter, pagePath).toHaveProperty(requiredField);
+      }
+      expect(frontmatter.source_ids, pagePath).toEqual([]);
+      expect(content).toMatch(/^---\n[\s\S]+?\n---\n\n# /);
     }
   });
 });

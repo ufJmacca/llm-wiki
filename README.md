@@ -2,7 +2,7 @@
 
 `llm-wiki` is a local-first CLI for creating a Git-backed, Obsidian-compatible Markdown wiki that can later grow into the full LLM Wiki workflow described in the PRD.
 
-The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, and `llm-wiki add-url` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue` and `llm-wiki log` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
+The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, and `llm-wiki add-url` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki log`, `llm-wiki lint`, and `llm-wiki index rebuild` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
 
 ## Development
 
@@ -25,7 +25,11 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/commands/init.ts` owns the first supported `llm-wiki init` command behavior.
 - `src/commands/add.ts`, `src/commands/addText.ts`, and `src/commands/addUrl.ts` own source capture command behavior.
 - `src/commands/queue.ts` and `src/commands/log.ts` own queue inspection, status transitions, and parsed runtime log output.
+- `src/commands/lint.ts` and `src/commands/index.ts` own executable lint checks and rebuildable cache generation.
 - `src/sourceCapture/` owns deterministic source IDs, hashing, metadata, duplicate detection, and raw writes.
+- `src/scanner/` normalizes repository Markdown, queue, profile, raw, and log state for lint and cache rebuild workflows.
+- `src/lint/` owns raw hash, source-card, queue, log, index, wikilink, provenance, and public-profile leak rules.
+- `src/index/` owns generated `.llm-wiki/cache/*` files built from source Markdown and raw state.
 - `src/runtime/queue.ts` and `src/runtime/log.ts` own queue/source-card consistency and runtime log parsing/appending.
 - `src/scaffold/` plans and writes generated wiki files.
 - `src/scaffold/templates/` contains reusable scaffold template content.
@@ -48,6 +52,10 @@ llm-wiki queue
 llm-wiki queue show <source_id>
 llm-wiki queue set-status <source_id> ingesting
 llm-wiki log
+llm-wiki lint
+llm-wiki lint --fix
+llm-wiki lint --profile public --strict
+llm-wiki index rebuild
 git status
 ```
 
@@ -68,13 +76,16 @@ llm-wiki queue --repo my-wiki --json
 llm-wiki queue show <source_id> --repo my-wiki --json
 llm-wiki queue set-status <source_id> ingesting --repo my-wiki --json
 llm-wiki log --repo my-wiki --json
+llm-wiki lint --repo my-wiki --json
+llm-wiki lint --repo my-wiki --profile public --strict --json
+llm-wiki index rebuild --repo my-wiki --json
 ```
 
 - `--repo <path>` may point at a wiki root or any descendant directory containing `.llm-wiki/config.yml` above it.
 - `--json` prints stable envelopes shaped as `{ ok, command, repo, data, warnings }` on success or `{ ok, command, repo, error, issues }` on failure.
 - `--quiet` suppresses human success output only. Human errors and JSON output are still printed.
 
-`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. Full health reporting is deferred to the status slice.
+`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. Full health reporting is deferred to the status slice.
 
 ## Source Capture
 
@@ -102,6 +113,18 @@ Duplicate content returns the existing source metadata with `status: duplicate` 
 
 `llm-wiki log` parses runtime entries from `curated/log.md` while ignoring the seeded entry-format template and fenced examples. JSON output includes parsed entries, scanner issues, and counts.
 
+## Lint and Index Rebuild
+
+`llm-wiki lint` reports stable issue records with `rule_id`, severity, path, optional line, message, fix hint, and fixability. Error-severity issues return exit code 1, and JSON failures use `error.code: lint_failed`.
+
+Current lint rules detect raw source hash drift, malformed source cards, queue/source-card mismatches, source cards without queue items, ingested sources without curated summaries, missing `source_ids`, malformed runtime log headings, stale `curated/index.md`, broken wikilinks, and orphan pages.
+
+`llm-wiki lint --fix` only performs deterministic safe repairs. Currently it regenerates `curated/index.md` from source cards and valid curated pages. It does not rewrite raw originals and does not invent missing provenance.
+
+`llm-wiki lint --profile public --strict` fails closed when a public profile would select private pages, raw originals, public pages that link raw content, public pages that link private targets, or private nodes/text that would leak into public graph/search output.
+
+`llm-wiki index rebuild` writes `.llm-wiki/cache/pages.json`, `sources.json`, `queue.json`, `graph.json`, and `metadata.json`. These caches are rebuildable and non-authoritative; existing `.llm-wiki/cache/*` files are ignored as scan inputs.
+
 ## Generated Scaffold Semantics
 
 `llm-wiki init` creates a wiki repository scaffold, not a completed knowledge base.
@@ -124,11 +147,11 @@ Generated files are deterministic. The scaffold avoids timestamps so init output
 
 The scaffold is private by default.
 
-- Raw source cards and curated pages default to `visibility: private`.
-- Public publishing is opt-in through `visibility: public`.
+- Raw source cards must remain `visibility: private`; curated pages default to `visibility: private`.
+- Public publishing is opt-in for curated pages through `visibility: public`.
 - The public profile excludes `raw/**`, source summaries, logs, private dashboards, queues, and private curated paths.
 - Local and review profiles may include private curated pages and raw source cards, but raw source originals are excluded from Explorer profiles by default.
-- Public leak checks are represented in generated lint-rule configuration, but the executable lint command is deferred.
+- Public leak checks are represented in generated lint-rule configuration and enforced by `llm-wiki lint --profile public --strict`.
 
 ## Agent Files
 
@@ -151,7 +174,6 @@ Agent-specific files are thin pointers:
 The following PRD features are not implemented in this foundation slice:
 
 - `ingest` task orchestration and validation.
-- `lint command behavior` beyond generated lint-rule configuration.
 - `Quartz runtime`, including `explore init`, `explore sync`, `explore serve`, search, backlinks, and graph UI.
 - `upload` workflows, local daemon, remote API, and browser upload form.
 - `GitHub Pages deploy`, including deploy profile initialization, local preflight, generated Pages workflow, and Pages status checks.

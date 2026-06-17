@@ -38,12 +38,23 @@ export type WikiLink = {
   embed: boolean;
 };
 
+export type MarkdownLink = {
+  path: string;
+  line: number;
+  column: number;
+  raw: string;
+  text: string;
+  target: string;
+  embed: boolean;
+};
+
 export type MarkdownDocumentScan = {
   path: string;
   frontmatter?: Record<string, unknown>;
   body: string;
   headings: MarkdownHeading[];
   wikilinks: WikiLink[];
+  markdownLinks: MarkdownLink[];
   issues: ScannerIssue[];
 };
 
@@ -84,6 +95,7 @@ export type QueueItem = {
   source_kind?: string;
   status: "queued" | "ingesting" | "ingested" | "blocked";
   path: string;
+  original_path: string;
   [key: string]: unknown;
 };
 
@@ -140,6 +152,7 @@ export function scanMarkdownDocument(input: ScannerInput): MarkdownDocumentScan 
     body: contentForBody,
     headings: parseMarkdownHeadings({ path: input.path, content: contentForBody }, { lineOffset }),
     wikilinks: parseWikilinks({ path: input.path, content: contentForBody }, { lineOffset }),
+    markdownLinks: parseMarkdownLinks({ path: input.path, content: contentForBody }, { lineOffset }),
     issues,
   };
 }
@@ -195,7 +208,7 @@ export function parseWikilinks(input: ScannerInput, options: { lineOffset?: numb
     }
 
     const scanLine = maskInlineCodeSpans(line);
-    const linkPattern = /!?\[\[([^\]\n]+)\]\]/g;
+    const linkPattern = /!?\[\[((?:[^\]\n]|\](?!\]))+)\]\]/g;
     for (const match of scanLine.matchAll(linkPattern)) {
       if (match.index === undefined) {
         continue;
@@ -223,6 +236,212 @@ export function parseWikilinks(input: ScannerInput, options: { lineOffset?: numb
   }
 
   return links;
+}
+
+type MarkdownReferenceDefinition = {
+  label: string;
+  target: string;
+};
+
+type PendingMarkdownReferenceLink = Omit<MarkdownLink, "target"> & {
+  label: string;
+};
+
+type HtmlAttributeScanLine = {
+  line: string;
+  scanLine: string;
+  lineNumber: number;
+};
+
+export function parseMarkdownLinks(input: ScannerInput, options: { lineOffset?: number } = {}): MarkdownLink[] {
+  const links: MarkdownLink[] = [];
+  const referenceDefinitions = new Map<string, MarkdownReferenceDefinition>();
+  const referenceLinks: PendingMarkdownReferenceLink[] = [];
+  const markdownInlineChunks: HtmlAttributeScanLine[][] = [];
+  let currentMarkdownInlineChunk: HtmlAttributeScanLine[] = [];
+  const htmlAttributeChunks: HtmlAttributeScanLine[][] = [];
+  let currentHtmlAttributeChunk: HtmlAttributeScanLine[] = [];
+  const lines = splitLines(input.content);
+  const lineOffset = options.lineOffset ?? 0;
+  let activeFenceMarker: MarkdownFenceMarker | null = null;
+  let activeListContexts: MarkdownListContext[] = [];
+  const flushHtmlAttributeChunk = (): void => {
+    if (currentHtmlAttributeChunk.length > 0) {
+      htmlAttributeChunks.push(currentHtmlAttributeChunk);
+      currentHtmlAttributeChunk = [];
+    }
+  };
+  const flushMarkdownInlineChunk = (): void => {
+    if (currentMarkdownInlineChunk.length > 0) {
+      markdownInlineChunks.push(currentMarkdownInlineChunk);
+      currentMarkdownInlineChunk = [];
+    }
+  };
+
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex] ?? "";
+    const wasInsideFence = activeFenceMarker !== null;
+    let listItem: MarkdownListContext | null = null;
+    let isRecognizedListItem = false;
+
+    if (!wasInsideFence) {
+      activeListContexts = pruneMarkdownListContexts(activeListContexts, line);
+      listItem = markdownListItemContext(line);
+      if (listItem !== null) {
+        const currentListItem = listItem;
+        isRecognizedListItem =
+          !isIndentedCodeLine(line) ||
+          activeListContexts.some((context) => currentListItem.markerIndent > context.markerIndent);
+      }
+    }
+
+    const fenceState = updateFenceState(
+      lineForWikilinkFenceScan(line, activeListContexts, isRecognizedListItem ? listItem : null),
+      activeFenceMarker,
+    );
+    if (fenceState.boundary) {
+      flushMarkdownInlineChunk();
+      flushHtmlAttributeChunk();
+      activeFenceMarker = fenceState.marker;
+      if (!wasInsideFence && isRecognizedListItem && listItem !== null) {
+        activeListContexts = replaceMarkdownListContext(activeListContexts, listItem);
+      }
+      continue;
+    }
+
+    if (activeFenceMarker !== null) {
+      flushMarkdownInlineChunk();
+      flushHtmlAttributeChunk();
+      continue;
+    }
+
+    const lineForCodeBlockScan = stripMarkdownBlockquoteMarkers(line);
+    const isListContinuation = isMarkdownListContinuationLine(
+      lineForCodeBlockScan,
+      activeListContexts,
+      isRecognizedListItem,
+    );
+    if (isIndentedCodeLine(lineForCodeBlockScan) && !isRecognizedListItem && !isListContinuation) {
+      if (hasOpenHtmlTag(currentHtmlAttributeChunk)) {
+        const scanLine = maskInlineCodeSpans(line);
+        currentHtmlAttributeChunk.push({
+          line,
+          scanLine: maskMarkdownInlineLinkDestinations(scanLine),
+          lineNumber: lineIndex + 1 + lineOffset,
+        });
+        continue;
+      }
+      flushMarkdownInlineChunk();
+      flushHtmlAttributeChunk();
+      continue;
+    }
+
+    const scanLine = maskInlineCodeSpans(line);
+    currentMarkdownInlineChunk.push({
+      line,
+      scanLine,
+      lineNumber: lineIndex + 1 + lineOffset,
+    });
+    const referenceDefinition = parseMarkdownReferenceDefinition(scanLine);
+    if (referenceDefinition !== null && !referenceDefinitions.has(referenceDefinition.label)) {
+      referenceDefinitions.set(referenceDefinition.label, referenceDefinition);
+    }
+
+    links.push(...parseInlineMarkdownLinks(input.path, line, scanLine, lineIndex + 1 + lineOffset));
+
+    const referenceScanLine = maskMarkdownInlineLinks(scanLine);
+    if (referenceDefinition === null) {
+      links.push(...parseMarkdownAutolinks(input.path, line, referenceScanLine, lineIndex + 1 + lineOffset));
+      currentHtmlAttributeChunk.push({
+        line,
+        scanLine: maskMarkdownInlineLinkDestinations(scanLine),
+        lineNumber: lineIndex + 1 + lineOffset,
+      });
+    } else {
+      flushHtmlAttributeChunk();
+    }
+
+    const referenceLinkPattern = /!?\[([^\]\n]+)\]\[([^\]\n]*)\]/g;
+    for (const match of referenceScanLine.matchAll(referenceLinkPattern)) {
+      if (match.index === undefined) {
+        continue;
+      }
+
+      const raw = line.slice(match.index, match.index + match[0].length);
+      const label = markdownReferenceLabel((match[2] ?? "") === "" ? (match[1] ?? "") : (match[2] ?? ""));
+      if (label === "") {
+        continue;
+      }
+
+      referenceLinks.push({
+        path: input.path,
+        line: lineIndex + 1 + lineOffset,
+        column: match.index + 1,
+        raw,
+        text: match[1] ?? "",
+        label,
+        embed: raw.startsWith("!"),
+      });
+    }
+
+    const shortcutReferenceScanLine =
+      referenceDefinition === null ? maskMarkdownReferenceLinks(referenceScanLine) : "";
+    const shortcutReferenceLinkPattern = /!?\[([^\]\n]+)\](?![\[(])/g;
+    for (const match of shortcutReferenceScanLine.matchAll(shortcutReferenceLinkPattern)) {
+      if (match.index === undefined) {
+        continue;
+      }
+
+      const raw = line.slice(match.index, match.index + match[0].length);
+      const label = markdownReferenceLabel(match[1] ?? "");
+      if (label === "") {
+        continue;
+      }
+
+      referenceLinks.push({
+        path: input.path,
+        line: lineIndex + 1 + lineOffset,
+        column: match.index + 1,
+        raw,
+        text: match[1] ?? "",
+        label,
+        embed: raw.startsWith("!"),
+      });
+    }
+
+    if (isRecognizedListItem && listItem !== null) {
+      activeListContexts = replaceMarkdownListContext(activeListContexts, listItem);
+    }
+  }
+
+  flushMarkdownInlineChunk();
+  flushHtmlAttributeChunk();
+  for (const chunk of markdownInlineChunks) {
+    links.push(...parseMultilineInlineMarkdownLinks(input.path, chunk));
+  }
+
+  for (const chunk of htmlAttributeChunks) {
+    links.push(...parseHtmlAttributeLinks(input.path, chunk));
+  }
+
+  for (const link of referenceLinks) {
+    const definition = referenceDefinitions.get(link.label);
+    if (definition === undefined) {
+      continue;
+    }
+
+    links.push({
+      path: link.path,
+      line: link.line,
+      column: link.column,
+      raw: link.raw,
+      text: link.text,
+      target: definition.target,
+      embed: link.embed,
+    });
+  }
+
+  return links.sort((left, right) => left.line - right.line || left.column - right.column || left.raw.localeCompare(right.raw));
 }
 
 export function parseLogEntries(input: ScannerInput): RuntimeLogScan {
@@ -691,7 +910,7 @@ function validateProfile(path: string, data: Record<string, unknown>): ScannerIs
 
 function validateQueueItem(path: string, data: Record<string, unknown>): ScannerIssue[] {
   const issues: ScannerIssue[] = [];
-  const requiredStrings = ["source_id", "title", "kind", "status", "path"];
+  const requiredStrings = ["source_id", "title", "kind", "status", "path", "original_path"];
 
   for (const field of requiredStrings) {
     if (typeof data[field] !== "string" || data[field].trim() === "") {
@@ -764,6 +983,522 @@ function splitWikilinkBody(body: string): [target: string, alias: string | null]
   }
 
   return [body.slice(0, separatorIndex).trim(), body.slice(separatorIndex + 1).trim()];
+}
+
+function markdownLinkDestination(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("<")) {
+    const closingIndex = trimmed.indexOf(">");
+    return closingIndex === -1
+      ? ""
+      : decodeHtmlCharacterReferences(unescapeMarkdownDestination(trimmed.slice(1, closingIndex).trim()));
+  }
+
+  return decodeHtmlCharacterReferences(unescapeMarkdownDestination(trimmed.split(/\s+/, 1)[0]?.trim() ?? ""));
+}
+
+function unescapeMarkdownDestination(value: string): string {
+  return value.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, "$1");
+}
+
+function parseInlineMarkdownLinks(path: string, line: string, scanLine: string, lineNumber: number): MarkdownLink[] {
+  const links: MarkdownLink[] = [];
+  let searchIndex = 0;
+
+  while (searchIndex < scanLine.length) {
+    const labelStart = scanLine.indexOf("[", searchIndex);
+    if (labelStart === -1) {
+      break;
+    }
+
+    const labelEnd = findMarkdownLinkLabelEnd(scanLine, labelStart);
+    if (labelEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    if (scanLine[labelEnd + 1] !== "(") {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const destinationStart = labelEnd + 2;
+    const destinationEnd = findMarkdownInlineDestinationEnd(scanLine, destinationStart);
+    if (destinationEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const rawStart = labelStart > 0 && scanLine[labelStart - 1] === "!" ? labelStart - 1 : labelStart;
+    const raw = line.slice(rawStart, destinationEnd + 1);
+    const target = markdownLinkDestination(line.slice(destinationStart, destinationEnd));
+    if (target !== "") {
+      links.push({
+        path,
+        line: lineNumber,
+        column: rawStart + 1,
+        raw,
+        text: line.slice(labelStart + 1, labelEnd),
+        target,
+        embed: raw.startsWith("!"),
+      });
+    }
+
+    searchIndex = labelStart + 1;
+  }
+
+  return links;
+}
+
+function parseMultilineInlineMarkdownLinks(path: string, lines: HtmlAttributeScanLine[]): MarkdownLink[] {
+  if (lines.length < 2) {
+    return [];
+  }
+
+  const links: MarkdownLink[] = [];
+  const scanContent = lines.map((line) => line.scanLine).join("\n");
+  const rawContent = lines.map((line) => line.line).join("\n");
+  const lineStarts: number[] = [];
+  let lineStart = 0;
+  let searchIndex = 0;
+
+  for (const line of lines) {
+    lineStarts.push(lineStart);
+    lineStart += line.scanLine.length + 1;
+  }
+
+  while (searchIndex < scanContent.length) {
+    const labelStart = scanContent.indexOf("[", searchIndex);
+    if (labelStart === -1) {
+      break;
+    }
+
+    const labelEnd = findMarkdownLinkLabelEnd(scanContent, labelStart);
+    if (labelEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    if (scanContent[labelEnd + 1] !== "(") {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const destinationStart = labelEnd + 2;
+    const destinationEnd = findMarkdownInlineDestinationEnd(scanContent, destinationStart);
+    if (destinationEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const rawStart = labelStart > 0 && scanContent[labelStart - 1] === "!" ? labelStart - 1 : labelStart;
+    const raw = rawContent.slice(rawStart, destinationEnd + 1);
+    if (!raw.includes("\n")) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const target = markdownLinkDestination(rawContent.slice(destinationStart, destinationEnd));
+    if (target !== "") {
+      const location = htmlAttributeLocation(lines, lineStarts, rawStart);
+      links.push({
+        path,
+        line: location.line,
+        column: location.column,
+        raw,
+        text: rawContent.slice(labelStart + 1, labelEnd),
+        target,
+        embed: raw.startsWith("!"),
+      });
+    }
+
+    searchIndex = labelStart + 1;
+  }
+
+  return links;
+}
+
+function parseMarkdownAutolinks(path: string, line: string, scanLine: string, lineNumber: number): MarkdownLink[] {
+  const links: MarkdownLink[] = [];
+  const autolinkPattern = /<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>\u0000-\u001F]*)>/g;
+
+  for (const match of scanLine.matchAll(autolinkPattern)) {
+    if (match.index === undefined) {
+      continue;
+    }
+
+    const raw = line.slice(match.index, match.index + match[0].length);
+    const target = match[1] ?? "";
+    if (target === "") {
+      continue;
+    }
+
+    links.push({
+      path,
+      line: lineNumber,
+      column: match.index + 1,
+      raw,
+      text: target,
+      target,
+      embed: false,
+    });
+  }
+
+  return links;
+}
+
+function parseHtmlAttributeLinks(path: string, lines: HtmlAttributeScanLine[]): MarkdownLink[] {
+  const links: MarkdownLink[] = [];
+  const tagPattern = /<[A-Za-z][A-Za-z0-9:-]*(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?>/g;
+  const linkAttributePattern = /\b(href|src|srcset|poster|data)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gi;
+  const scanContent = lines.map((line) => line.scanLine).join("\n");
+  const rawContent = lines.map((line) => line.line).join("\n");
+  const lineStarts: number[] = [];
+  let lineStart = 0;
+
+  for (const line of lines) {
+    lineStarts.push(lineStart);
+    lineStart += line.scanLine.length + 1;
+  }
+
+  for (const tagMatch of scanContent.matchAll(tagPattern)) {
+    if (tagMatch.index === undefined) {
+      continue;
+    }
+
+    const tag = tagMatch[0];
+    for (const attributeMatch of tag.matchAll(linkAttributePattern)) {
+      if (attributeMatch.index === undefined) {
+        continue;
+      }
+
+      const attributeName = (attributeMatch[1] ?? "").toLowerCase();
+      const attributeValue = decodeHtmlCharacterReferences(attributeMatch[2] ?? attributeMatch[3] ?? attributeMatch[4] ?? "");
+      if (attributeValue.trim() === "") {
+        continue;
+      }
+
+      const attributeStart = tagMatch.index + attributeMatch.index;
+      const location = htmlAttributeLocation(lines, lineStarts, attributeStart);
+      const raw = rawContent.slice(attributeStart, attributeStart + attributeMatch[0].length);
+      const targets = attributeName === "srcset" ? parseSrcsetTargets(attributeValue) : [attributeValue];
+
+      for (const target of targets) {
+        links.push({
+          path,
+          line: location.line,
+          column: location.column,
+          raw,
+          text: attributeName,
+          target,
+          embed: attributeName === "src" || attributeName === "srcset" || attributeName === "poster" || attributeName === "data",
+        });
+      }
+    }
+  }
+
+  return links;
+}
+
+function parseSrcsetTargets(value: string): string[] {
+  return value
+    .split(",")
+    .map((candidate) => candidate.trim().match(/^\S+/)?.[0] ?? "")
+    .filter((target) => target !== "");
+}
+
+function htmlAttributeLocation(
+  lines: HtmlAttributeScanLine[],
+  lineStarts: number[],
+  index: number,
+): { line: number; column: number } {
+  let lineIndex = 0;
+  while (lineIndex + 1 < lineStarts.length && (lineStarts[lineIndex + 1] ?? 0) <= index) {
+    lineIndex += 1;
+  }
+
+  return {
+    line: lines[lineIndex]?.lineNumber ?? 1,
+    column: index - (lineStarts[lineIndex] ?? 0) + 1,
+  };
+}
+
+function hasOpenHtmlTag(lines: HtmlAttributeScanLine[]): boolean {
+  const content = lines.map((line) => line.scanLine).join("\n");
+  let inTag = false;
+  let quote: "\"" | "'" | null = null;
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index];
+    if (quote !== null) {
+      if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+
+    if (inTag) {
+      if (char === "\"" || char === "'") {
+        quote = char;
+      } else if (char === ">") {
+        inTag = false;
+      }
+      continue;
+    }
+
+    if (isHtmlTagStart(content, index)) {
+      inTag = true;
+    }
+  }
+
+  return inTag;
+}
+
+function isHtmlTagStart(content: string, index: number): boolean {
+  if (content[index] !== "<" || !/[A-Za-z]/.test(content[index + 1] ?? "")) {
+    return false;
+  }
+
+  let tagNameEnd = index + 2;
+  while (/[A-Za-z0-9:-]/.test(content[tagNameEnd] ?? "")) {
+    tagNameEnd += 1;
+  }
+
+  const afterTagName = content[tagNameEnd];
+  return afterTagName === undefined || /[\s/>]/.test(afterTagName);
+}
+
+function findMarkdownLinkLabelEnd(line: string, startIndex: number): number {
+  let depth = 0;
+  let escaped = false;
+
+  for (let index = startIndex; index < line.length; index += 1) {
+    const char = line[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+
+    if (char === "[") {
+      depth += 1;
+      continue;
+    }
+
+    if (char === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+
+      if (depth < 0) {
+        return -1;
+      }
+    }
+  }
+
+  return -1;
+}
+
+function findMarkdownInlineDestinationEnd(line: string, startIndex: number): number {
+  let depth = 0;
+  let inAngleDestination = false;
+  let escaped = false;
+
+  for (let index = startIndex; index < line.length; index += 1) {
+    const char = line[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+
+    if (inAngleDestination) {
+      if (char === ">") {
+        inAngleDestination = false;
+      }
+      continue;
+    }
+
+    if (char === "<") {
+      inAngleDestination = true;
+      continue;
+    }
+
+    if (char === "(") {
+      depth += 1;
+      continue;
+    }
+
+    if (char === ")") {
+      if (depth === 0) {
+        return index;
+      }
+      depth -= 1;
+    }
+  }
+
+  return -1;
+}
+
+function parseMarkdownReferenceDefinition(scanLine: string): MarkdownReferenceDefinition | null {
+  const normalizedScanLine = stripMarkdownBlockquoteMarkers(scanLine);
+  const match = /^( {0,3})\[([^\]\n]+)\]:[ \t]*(.*)$/.exec(normalizedScanLine);
+  if (!match) {
+    return null;
+  }
+
+  const label = markdownReferenceLabel(match[2] ?? "");
+  const target = markdownLinkDestination(match[3] ?? "");
+  if (label === "" || label.startsWith("^") || target === "") {
+    return null;
+  }
+
+  return {
+    label,
+    target,
+  };
+}
+
+function markdownReferenceLabel(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function maskMarkdownInlineLinks(line: string): string {
+  const masked = line.split("");
+  let searchIndex = 0;
+
+  while (searchIndex < line.length) {
+    const labelStart = line.indexOf("[", searchIndex);
+    if (labelStart === -1) {
+      break;
+    }
+
+    const labelEnd = findMarkdownLinkLabelEnd(line, labelStart);
+    if (labelEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    if (line[labelEnd + 1] !== "(") {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const destinationEnd = findMarkdownInlineDestinationEnd(line, labelEnd + 2);
+    if (destinationEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const maskStart = labelStart > 0 && line[labelStart - 1] === "!" ? labelStart - 1 : labelStart;
+    masked.fill(" ", maskStart, destinationEnd + 1);
+    searchIndex = destinationEnd + 1;
+  }
+
+  return masked.join("");
+}
+
+function maskMarkdownInlineLinkDestinations(line: string): string {
+  const masked = line.split("");
+  let searchIndex = 0;
+
+  while (searchIndex < line.length) {
+    const labelStart = line.indexOf("[", searchIndex);
+    if (labelStart === -1) {
+      break;
+    }
+
+    const labelEnd = findMarkdownLinkLabelEnd(line, labelStart);
+    if (labelEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    if (line[labelEnd + 1] !== "(") {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const destinationEnd = findMarkdownInlineDestinationEnd(line, labelEnd + 2);
+    if (destinationEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    masked.fill(" ", labelEnd + 1, destinationEnd + 1);
+    searchIndex = destinationEnd + 1;
+  }
+
+  return masked.join("");
+}
+
+function maskMarkdownReferenceLinks(line: string): string {
+  return line.replace(/!?\[([^\]\n]+)\]\[([^\]\n]*)\]/g, (match) => " ".repeat(match.length));
+}
+
+const HTML_CHARACTER_REFERENCES = new Map<string, string>([
+  ["amp", "&"],
+  ["apos", "'"],
+  ["bsol", "\\"],
+  ["colon", ":"],
+  ["comma", ","],
+  ["commat", "@"],
+  ["equals", "="],
+  ["fullstop", "."],
+  ["gt", ">"],
+  ["lcub", "{"],
+  ["lowbar", "_"],
+  ["lpar", "("],
+  ["lsqb", "["],
+  ["lt", "<"],
+  ["num", "#"],
+  ["percnt", "%"],
+  ["period", "."],
+  ["quest", "?"],
+  ["quot", '"'],
+  ["rcub", "}"],
+  ["rpar", ")"],
+  ["rsqb", "]"],
+  ["semi", ";"],
+  ["sol", "/"],
+  ["verbar", "|"],
+]);
+
+function decodeHtmlCharacterReferences(value: string): string {
+  return value.replace(/&(#(?:x[0-9a-fA-F]+|\d+)|[A-Za-z][A-Za-z0-9]+);?/g, (match, entity: string) => {
+    if (entity.startsWith("#x") || entity.startsWith("#X")) {
+      const codePoint = Number.parseInt(entity.slice(2), 16);
+      return htmlCodePointCharacter(codePoint) ?? match;
+    }
+
+    if (entity.startsWith("#")) {
+      const codePoint = Number.parseInt(entity.slice(1), 10);
+      return htmlCodePointCharacter(codePoint) ?? match;
+    }
+
+    return HTML_CHARACTER_REFERENCES.get(entity.toLowerCase()) ?? match;
+  });
+}
+
+function htmlCodePointCharacter(codePoint: number): string | null {
+  if (!Number.isInteger(codePoint) || codePoint <= 0 || codePoint > 0x10ffff) {
+    return null;
+  }
+
+  try {
+    return String.fromCodePoint(codePoint);
+  } catch {
+    return null;
+  }
 }
 
 function isIndentedCodeLine(line: string): boolean {

@@ -188,6 +188,69 @@ export async function writeBinaryFileNoOverwriteInsideRoot(
   return ok(undefined);
 }
 
+export async function writeTextFileInsideRoot(
+  rootDir: string,
+  relativePath: string,
+  content: string,
+): Promise<Result<void, BinaryWriteError>> {
+  const normalizedPath = normalizeContainedRelativePath(relativePath);
+  if (!normalizedPath.ok) {
+    return normalizedPath;
+  }
+
+  const rootPath = resolve(rootDir);
+  const absolutePath = resolve(rootPath, normalizedPath.value);
+  const relativeToRoot = relative(rootPath, absolutePath);
+  if (relativeToRoot === "" || relativeToRoot.startsWith("..") || isAbsolute(relativeToRoot)) {
+    return err(destinationPathUnsafe(relativePath));
+  }
+
+  try {
+    const rootRealPath = await realpath(rootPath);
+    const parentReady = await ensureContainedParentDirectory(rootPath, rootRealPath, normalizedPath.value);
+    if (!parentReady.ok) {
+      return parentReady;
+    }
+
+    const destinationReady = await readAppendDestinationState(rootRealPath, normalizedPath.value, absolutePath);
+    if (!destinationReady.ok) {
+      return destinationReady;
+    }
+
+    const file = await open(absolutePath, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o666);
+    try {
+      await file.writeFile(content, "utf8");
+    } finally {
+      await file.close();
+    }
+  } catch (error) {
+    return err({
+      code: "DESTINATION_PARENT_UNSAFE",
+      message: error instanceof Error ? error.message : String(error),
+      path: normalizedPath.value,
+      hint: "Capture writes must stay inside the wiki repository and must not follow symlinks.",
+    });
+  }
+
+  return ok(undefined);
+}
+
+export async function validateTextFileWriteInsideRoot(
+  rootDir: string,
+  relativePath: string,
+): Promise<Result<void, BinaryWriteError>> {
+  const target = await validateContainedWriteTarget(rootDir, relativePath);
+  if (!target.ok) {
+    return target;
+  }
+
+  if (!target.value.parentExists) {
+    return ok(undefined);
+  }
+
+  return readAppendDestinationState(target.value.rootRealPath, target.value.normalizedPath, target.value.absolutePath);
+}
+
 export async function validateBinaryFileNoOverwriteInsideRoot(
   rootDir: string,
   relativePath: string,

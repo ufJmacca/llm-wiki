@@ -160,7 +160,9 @@ describe("optional init scaffold groups", () => {
       // Assert
       expect(defaultResult.ok).toBe(true);
       expect(dataviewResult.ok).toBe(true);
-      expect(await pathExists(resolve(defaultTargetDir, "curated/dashboards"))).toBe(false);
+      expect(await pathExists(resolve(defaultTargetDir, "curated/dashboards/.gitkeep"))).toBe(true);
+      expect(await pathExists(resolve(defaultTargetDir, "curated/dashboards/ingestion-queue.md"))).toBe(false);
+      expect(await pathExists(resolve(defaultTargetDir, "curated/dashboards/needs-review.md"))).toBe(false);
       expect(ingestionQueue).toContain("FROM \"raw/inputs\"");
       expect(ingestionQueue).toContain("WHERE type = \"raw_source\" AND status != \"ingested\"");
       expect(needsReview).toContain("FROM \"curated\"");

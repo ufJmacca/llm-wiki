@@ -41,6 +41,7 @@ describe("safe scaffold planner and writer", () => {
     // Arrange
     const expectedStablePrefix = [
       ".gitignore",
+      ".llm-wiki/checks/lint-rules.yml",
       ".llm-wiki/config.yml",
       ".llm-wiki/profiles/local.yml",
       ".llm-wiki/profiles/public.yml",

@@ -15,6 +15,7 @@ export type WikiScaffoldOptions = {
 export function planWikiScaffold(options: WikiScaffoldOptions): ScaffoldEntry[] {
   const entries: ScaffoldEntry[] = [
     { path: ".gitignore", content: gitignoreContent() },
+    { path: ".llm-wiki/checks/lint-rules.yml", content: lintRulesContent() },
     { path: ".llm-wiki/config.yml", content: configContent(options) },
     { path: ".llm-wiki/profiles/local.yml", content: localProfileContent() },
     { path: ".llm-wiki/profiles/public.yml", content: publicProfileContent() },
@@ -31,12 +32,20 @@ export function planWikiScaffold(options: WikiScaffoldOptions): ScaffoldEntry[] 
     { path: ".llm-wiki/templates/topic.md", content: topicTemplateContent() },
     { path: "AGENTS.md", content: agentInstructionsContent() },
     { path: "README.md", content: readmeContent() },
+    { path: "curated/comparisons/.gitkeep", content: "" },
+    { path: "curated/concepts/.gitkeep", content: "" },
     { path: "curated/contradictions.md", content: titledPage("Contradictions", "page") },
+    { path: "curated/dashboards/.gitkeep", content: "" },
+    { path: "curated/entities/.gitkeep", content: "" },
     { path: "curated/home.md", content: titledPage("Home", "page") },
     { path: "curated/index.md", content: indexContent() },
     { path: "curated/log.md", content: logContent() },
     { path: "curated/map.md", content: titledPage("Map", "page") },
     { path: "curated/open-questions.md", content: titledPage("Open Questions", "page") },
+    { path: "curated/questions/.gitkeep", content: "" },
+    { path: "curated/sources/.gitkeep", content: "" },
+    { path: "curated/topics/.gitkeep", content: "" },
+    { path: "raw/assets/.gitkeep", content: "" },
     { path: "raw/inputs/.gitkeep", content: "" },
     { path: "raw/queue/.gitkeep", content: "" },
     { path: "raw/README.md", content: rawReadmeContent() },
@@ -119,6 +128,39 @@ control_plane:
 privacy:
   raw_public_by_default: false
   public_requires_visibility: public
+`;
+}
+
+function lintRulesContent(): string {
+  return `version: 1
+rules:
+  raw_originals_are_immutable:
+    severity: error
+    glob: raw/inputs/**/original.*
+  raw_sources_default_private:
+    severity: error
+    required_value: private
+  curated_pages_require_frontmatter:
+    severity: error
+    required:
+      - type
+      - title
+      - visibility
+      - source_ids
+  log_entries_use_parseable_headings:
+    severity: error
+    heading_pattern: "^## \\\\[[^\\\\]]+\\\\] (init|add|ingest|query|lint|explore|deploy|upload) \\\\| .+ \\\\| .+$"
+  public_pages_require_visibility:
+    severity: error
+    required_value: public
+  public_pages_must_not_link_raw:
+    severity: error
+  public_pages_must_not_link_private:
+    severity: error
+  public_search_must_not_include_private_text:
+    severity: error
+  public_graph_must_not_include_private_nodes:
+    severity: error
 `;
 }
 

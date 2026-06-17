@@ -16,3 +16,4 @@ __pycache__/
 orchestrator_demo/orchestrator/orchestrator_user_sim*.evalset.json
 orchestrator_demo/evals/generated/
 orchestrator_demo/evals/orchestrator_user_sim*.evalset.json
+coverage/

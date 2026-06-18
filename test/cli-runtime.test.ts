@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { parseInitJson, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
+import { runRuntimeCommand } from "../src/runtime/command.js";
 
 type RuntimeSuccessEnvelope = {
   ok: true;
@@ -17,7 +18,7 @@ type RuntimeSuccessEnvelope = {
 
 type RuntimeFailureEnvelope = {
   ok: false;
-  command: "status";
+  command: string;
   repo: string | null;
   error: {
     code: string;
@@ -336,6 +337,63 @@ describe("non-init CLI runtime contracts", () => {
       expect(result.exitCode).toBe(1);
       expect(result.stdout).toEqual([]);
       expect(result.stderr).toEqual([`Error: Could not find .llm-wiki/config.yml from ${nonWikiDir}`]);
+    });
+  });
+
+  it("wraps post-resolution search and nav runtime errors in JSON failure envelopes", async () => {
+    await withTempWorkspace("llm-wiki-runtime-json-run-failure-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const cases = [
+        { command: "search" as const, code: "SEARCH_FAILED" },
+        { command: "nav graph" as const, code: "NAV_GRAPH_FAILED" },
+      ];
+
+      for (const testCase of cases) {
+        const stdout: string[] = [];
+        const stderr: string[] = [];
+
+        // Act
+        await expect(
+          runRuntimeCommand({
+            command: testCase.command,
+            rawOptions: { repo: wikiDir, json: true },
+            io: {
+              stdout: (message) => stdout.push(message),
+              stderr: (message) => stderr.push(message),
+            },
+            run: async () => {
+              throw new Error("scanner exploded");
+            },
+            formatHuman: () => "unused",
+          }),
+        ).rejects.toMatchObject({ exitCode: 1 });
+        const payload = JSON.parse(stdout[0]) as RuntimeFailureEnvelope;
+
+        // Assert
+        expect(stderr).toEqual([]);
+        expect(stdout).toHaveLength(1);
+        expect(payload).toEqual({
+          ok: false,
+          command: testCase.command,
+          repo: wikiDir,
+          error: {
+            code: testCase.code,
+            message: "scanner exploded",
+            hint: `Fix the repository data or permissions, then rerun llm-wiki ${testCase.command}.`,
+          },
+          issues: [
+            {
+              severity: "error",
+              code: testCase.code,
+              message: "scanner exploded",
+              path: ".",
+              hint: `Fix the repository data or permissions, then rerun llm-wiki ${testCase.command}.`,
+            },
+          ],
+        });
+      }
     });
   });
 });

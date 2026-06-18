@@ -2,10 +2,12 @@ import { CommanderError, type Command } from "commander";
 
 import type { CliIo } from "../cli.js";
 import {
+  buildRuntimeCommandFailureEnvelope,
   buildRuntimeFailureEnvelope,
   buildRuntimeSuccessEnvelope,
   type RuntimeSuccessEnvelope,
 } from "./envelope.js";
+import { RuntimeCommandError } from "./errors.js";
 import { resolveWikiRoot, type WikiRoot } from "./repo.js";
 
 export type RuntimeCommandOptions = {
@@ -62,7 +64,32 @@ export async function runRuntimeCommand<CommandName extends string, Data>(
     throw new CommanderError(1, `llm-wiki.${config.command}`, envelope.error.message);
   }
 
-  const commandResult = await config.run({ repo: resolvedRepo.value, options });
+  let commandResult: RuntimeCommandResult<Data>;
+  try {
+    commandResult = await config.run({ repo: resolvedRepo.value, options });
+  } catch (error) {
+    if (error instanceof CommanderError) {
+      throw error;
+    }
+
+    const commandError = error instanceof RuntimeCommandError
+      ? error
+      : new RuntimeCommandError({
+          code: `${normalizeCommandCode(config.command)}_FAILED`,
+          message: error instanceof Error ? error.message : String(error),
+          hint: `Fix the repository data or permissions, then rerun llm-wiki ${config.command}.`,
+          path: ".",
+        });
+
+    const envelope = buildRuntimeCommandFailureEnvelope(config.command, commandError, resolvedRepo.value.rootDir);
+    if (options.json) {
+      config.io.stdout(JSON.stringify(envelope));
+    } else {
+      config.io.stderr(`Error: ${envelope.error.message}`);
+    }
+
+    throw new CommanderError(1, `llm-wiki.${config.command}`, envelope.error.message);
+  }
   const envelope = buildRuntimeSuccessEnvelope(
     config.command,
     resolvedRepo.value.rootDir,
@@ -78,6 +105,10 @@ export async function runRuntimeCommand<CommandName extends string, Data>(
   if (!options.quiet) {
     config.io.stdout(config.formatHuman(envelope));
   }
+}
+
+function normalizeCommandCode(command: string): string {
+  return command.trim().toUpperCase().replaceAll(/[^A-Z0-9]+/g, "_").replaceAll(/^_+|_+$/g, "") || "COMMAND";
 }
 
 function normalizeRuntimeOptions(rawOptions: RawRuntimeCommandOptions): RuntimeCommandOptions {

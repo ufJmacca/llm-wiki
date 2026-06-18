@@ -92,6 +92,8 @@ function gitignoreContent(): string {
   return `.DS_Store
 .llm-wiki/cache/
 node_modules/
+quartz/.quartz-cache/
+quartz/content/
 quartz/public/
 `;
 }

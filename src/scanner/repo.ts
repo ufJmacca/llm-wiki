@@ -77,6 +77,7 @@ const SKIPPED_ROOTS = [
   ".llm-wiki/templates",
   "dist",
   "node_modules",
+  "quartz/.quartz-cache",
   "quartz/content",
   "quartz/node_modules",
   "quartz/public",

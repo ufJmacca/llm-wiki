@@ -15,8 +15,10 @@ describe("repository scanner", () => {
       await mkdir(resolve(workspaceDir, "raw/queue"), { recursive: true });
       await mkdir(resolve(workspaceDir, "curated/topics"), { recursive: true });
       await mkdir(resolve(workspaceDir, ".llm-wiki/profiles"), { recursive: true });
+      await mkdir(resolve(workspaceDir, "quartz/.quartz-cache"), { recursive: true });
 
       await writeFile(resolve(rawDir, "original.md"), "# Raw original\n\nThis must stay out of search/nav scans.\n", "utf8");
+      await writeFile(resolve(workspaceDir, "quartz/.quartz-cache/generated.md"), "# Generated cache\n", "utf8");
       await writeFile(
         resolve(rawDir, "_source.md"),
         [

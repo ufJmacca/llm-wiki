@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 
 import { scanWikiRepository, isRawOriginalPath, type RepoMarkdownFile, type RepoScan, type SourceCard } from "../scanner/repo.js";
-import { computeContentHash, parseSourceId, type MarkdownLink, type QueueItem, type WikiLink } from "../scanner/index.js";
+import { computeContentHash, parseSourceId, parseWikilinks, type MarkdownLink, type QueueItem, type WikiLink } from "../scanner/index.js";
 import { writeTextFileInsideRoot } from "../utils/fs.js";
 
 export type LintSeverity = "error" | "warning";
@@ -43,6 +43,7 @@ export type LinkResolutionIndex = {
   filePaths: ReadonlySet<string>;
   markdownByPath: ReadonlyMap<string, RepoMarkdownFile>;
   markdownByTitle: ReadonlyMap<string, RepoMarkdownFile>;
+  markdownByAlias: ReadonlyMap<string, RepoMarkdownFile>;
   markdownByBasename: ReadonlyMap<string, RepoMarkdownFile>;
 };
 
@@ -65,6 +66,11 @@ const VALID_SOURCE_KINDS = new Set(["file", "text", "url"]);
 const VALID_SOURCE_STATUSES = new Set(["queued", "ingesting", "ingested", "blocked"]);
 const VALID_VISIBILITIES = new Set(["private", "public"]);
 const INDEXABLE_CURATED_DIRECTORIES = ["curated/concepts/", "curated/entities/", "curated/topics/", "curated/questions/", "curated/comparisons/"];
+const GENERATED_INDEX_LIST_ROUTE_PREFIXES = ["concepts/", "entities/", "topics/", "questions/", "comparisons/"];
+const GENERATED_INDEX_LIST_SECTIONS = new Set(["Concepts", "Entities", "Topics", "Questions", "Comparisons"]);
+const GENERATED_INDEX_TABLE_SECTIONS = new Set(["Sources"]);
+const PUBLIC_CURATED_SITE_ROUTE_PREFIXES = ["concepts/", "entities/", "topics/", "questions/", "comparisons/", "sources/", "dashboards/"];
+const PUBLIC_FORBIDDEN_RUNTIME_LOG_PATHS = new Set(["curated/log.md"]);
 const PUBLIC_FORBIDDEN_SKIPPED_PROFILE_ROOTS = [
   {
     path: ".llm-wiki/cache",
@@ -76,6 +82,34 @@ const PUBLIC_FORBIDDEN_SKIPPED_PROFILE_ROOTS = [
       ".llm-wiki/cache/graph.json",
       ".llm-wiki/cache/metadata.json",
       ".llm-wiki/cache/__private__.json",
+    ],
+  },
+  {
+    path: "dist",
+    candidates: [
+      "dist",
+      "dist/src/cli.js",
+      "dist/src/index.js",
+      "dist/assets/private.js",
+      "dist/__private__.json",
+    ],
+  },
+  {
+    path: "quartz/content",
+    candidates: [
+      "quartz/content",
+      "quartz/content/index.md",
+      "quartz/content/.index.json",
+      "quartz/content/private.md",
+    ],
+  },
+  {
+    path: "quartz/public",
+    candidates: [
+      "quartz/public",
+      "quartz/public/index.html",
+      "quartz/public/search.json",
+      "quartz/public/static/contentIndex.json",
     ],
   },
 ] as const;
@@ -262,6 +296,17 @@ function sourceCardIssues(scan: RepoScan): LintIssue[] {
       });
     }
 
+    if (typeof card.scan.frontmatter.content_hash === "string" && !isSha256ContentHash(card.scan.frontmatter.content_hash)) {
+      issues.push({
+        rule_id: "source_card_malformed",
+        severity: "error",
+        path: card.path,
+        message: `Source card has malformed content_hash: ${card.path}.`,
+        fix_hint: "Use a sha256:<64 lowercase hex> content hash captured with the raw source.",
+        fixable: false,
+      });
+    }
+
     const sourceKind = card.scan.frontmatter.source_kind;
     if (typeof sourceKind === "string" && sourceKind.trim() !== "" && !VALID_SOURCE_KINDS.has(sourceKind)) {
       issues.push({
@@ -339,6 +384,18 @@ function queueSourceIssues(scan: RepoScan): LintIssue[] {
         path: queueFile.path,
         message: `Queue item has unsupported ${queueValueIssue} for ${queueFile.item.source_id}.`,
         fix_hint: "Use supported kind/source_kind values and keep them aligned.",
+        fixable: false,
+      });
+    }
+
+    const originalPathIssue = queueOriginalPathIssue(queueFile.item);
+    if (originalPathIssue !== null) {
+      issues.push({
+        rule_id: "queue_item_malformed",
+        severity: "error",
+        path: queueFile.path,
+        message: `Queue item has malformed original_path for ${queueFile.item.source_id}: ${originalPathIssue}.`,
+        fix_hint: "Keep original_path pointed at raw/inputs/YYYY/MM/<source_id>/original.<ext> for the same source ID.",
         fixable: false,
       });
     }
@@ -426,6 +483,33 @@ function queueItemValueIssue(item: QueueItem): string | null {
   return null;
 }
 
+function queueOriginalPathIssue(item: QueueItem): string | null {
+  const parsedSourceId = parseSourceId(item.source_id);
+  if (!parsedSourceId.ok) {
+    return null;
+  }
+
+  if (typeof item.original_path !== "string" || item.original_path.trim() === "") {
+    return "missing original_path";
+  }
+
+  const expectedPrefix = `raw/inputs/${parsedSourceId.value.year}/${parsedSourceId.value.month}/${parsedSourceId.value.sourceId}/original.`;
+  if (!item.original_path.startsWith(expectedPrefix)) {
+    return `expected ${expectedPrefix}<ext>`;
+  }
+
+  const originalExtension = item.original_path.slice(expectedPrefix.length);
+  if (originalExtension === "") {
+    return `expected ${expectedPrefix}<ext>`;
+  }
+
+  if (originalExtension.includes("/")) {
+    return "original_path must name a file directly inside the source capture directory";
+  }
+
+  return null;
+}
+
 function firstQueueSourceCardMismatch(item: QueueItem, card: SourceCard): string | null {
   const frontmatter = card.scan.frontmatter ?? {};
   const fields: Array<[field: string, queueValue: unknown, cardValue: unknown]> = [
@@ -464,9 +548,15 @@ function rawHashIssues(scan: RepoScan): LintIssue[] {
   const issues: LintIssue[] = [];
   const originalsByPath = new Map(scan.rawOriginals.map((original) => [original.path, original]));
   const checkedSourceIds = new Set<string>();
+  const cardsById = new Map(scan.sourceCards.filter((card) => card.source_id !== null).map((card) => [card.source_id, card]));
 
   for (const queueFile of scan.queueItems) {
     checkedSourceIds.add(queueFile.item.source_id);
+    const card = cardsById.get(queueFile.item.source_id);
+    if (!isQueueHashCheckable(queueFile.item, card)) {
+      continue;
+    }
+
     const original = originalsByPath.get(String(queueFile.item.original_path));
     if (!original) {
       issues.push({
@@ -493,7 +583,7 @@ function rawHashIssues(scan: RepoScan): LintIssue[] {
   }
 
   for (const card of scan.sourceCards) {
-    if (card.source_id === null || checkedSourceIds.has(card.source_id) || card.content_hash_field === null) {
+    if (card.source_id === null || checkedSourceIds.has(card.source_id) || !isSha256ContentHash(card.content_hash_field)) {
       continue;
     }
 
@@ -523,6 +613,22 @@ function rawHashIssues(scan: RepoScan): LintIssue[] {
   }
 
   return issues;
+}
+
+function isQueueHashCheckable(item: QueueItem, card: SourceCard | undefined): boolean {
+  if (queueOriginalPathIssue(item) !== null) {
+    return false;
+  }
+
+  if (!isSha256ContentHash(item.content_hash)) {
+    return false;
+  }
+
+  return card?.content_hash_field === undefined || card.content_hash_field === item.content_hash;
+}
+
+function isSha256ContentHash(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);
 }
 
 function ingestedSummaryIssues(scan: RepoScan): LintIssue[] {
@@ -750,8 +856,35 @@ function indexIssues(scan: RepoScan): LintIssue[] {
 
   const expectedEntries = generatedIndexEntries(scan);
   const missing = expectedEntries.filter((entry) => !indexPage.content.includes(entry));
+  const stale = staleGeneratedIndexRows(indexPage.content, expectedEntries);
   if (missing.length === 0) {
-    return [];
+    if (stale.length === 0) {
+      return [];
+    }
+
+    return [
+      {
+        rule_id: "index_stale",
+        severity: "warning",
+        path: "curated/index.md",
+        message: `curated/index.md has ${stale.length} stale generated row${stale.length === 1 ? "" : "s"}.`,
+        fix_hint: "Run llm-wiki lint --fix to regenerate deterministic index entries.",
+        fixable: true,
+      },
+    ];
+  }
+
+  if (stale.length === 0) {
+    return [
+      {
+        rule_id: "index_stale",
+        severity: "warning",
+        path: "curated/index.md",
+        message: `curated/index.md is missing ${missing.length} known page or source entr${missing.length === 1 ? "y" : "ies"}.`,
+        fix_hint: "Run llm-wiki lint --fix to regenerate deterministic index entries.",
+        fixable: true,
+      },
+    ];
   }
 
   return [
@@ -759,11 +892,201 @@ function indexIssues(scan: RepoScan): LintIssue[] {
       rule_id: "index_stale",
       severity: "warning",
       path: "curated/index.md",
-      message: `curated/index.md is missing ${missing.length} known page or source entr${missing.length === 1 ? "y" : "ies"}.`,
+      message: `curated/index.md is missing ${missing.length} known page or source entr${missing.length === 1 ? "y" : "ies"} and has ${stale.length} stale generated row${stale.length === 1 ? "" : "s"}.`,
       fix_hint: "Run llm-wiki lint --fix to regenerate deterministic index entries.",
       fixable: true,
     },
   ];
+}
+
+function staleGeneratedIndexRows(content: string, expectedEntries: string[]): string[] {
+  return staleGeneratedIndexRowMatches(content, expectedEntries).map((row) => row.content);
+}
+
+type StaleGeneratedIndexRow = {
+  line: number;
+  content: string;
+};
+
+function staleGeneratedIndexRowMatches(content: string, expectedEntries: string[]): StaleGeneratedIndexRow[] {
+  const expectedEntrySet = new Set(expectedEntries);
+  const generatedLinkTargets = new Set(expectedEntries.filter((entry) => entry.startsWith("- [[")).flatMap(generatedLinkRowTargets));
+  const generatedTableKeys = new Set(
+    expectedEntries
+      .filter((entry) => entry.startsWith("|"))
+      .map(generatedTableRowKey)
+      .filter((key): key is string => key !== null),
+  );
+  const staleRows: StaleGeneratedIndexRow[] = [];
+  let section: string | null = null;
+
+  for (const [lineIndex, line] of content.split(/\r?\n/).entries()) {
+    const trimmedLine = line.trim();
+    const nextSection = generatedIndexSectionHeading(trimmedLine);
+    if (nextSection !== null) {
+      section = nextSection;
+      continue;
+    }
+
+    if (expectedEntrySet.has(trimmedLine)) {
+      continue;
+    }
+
+    if (
+      section !== null &&
+      GENERATED_INDEX_TABLE_SECTIONS.has(section) &&
+      isStaleGeneratedTableRow(trimmedLine, generatedTableKeys)
+    ) {
+      staleRows.push({ line: lineIndex + 1, content: trimmedLine });
+      continue;
+    }
+
+    if (
+      section !== null &&
+      GENERATED_INDEX_LIST_SECTIONS.has(section) &&
+      isStaleGeneratedLinkRow(trimmedLine, generatedLinkTargets)
+    ) {
+      staleRows.push({ line: lineIndex + 1, content: trimmedLine });
+    }
+  }
+
+  return staleRows;
+}
+
+function generatedIndexSectionHeading(line: string): string | null {
+  const match = /^##\s+(.+?)\s*$/.exec(line);
+  return match?.[1] ?? null;
+}
+
+function isStaleGeneratedLinkRow(line: string, generatedTargets: ReadonlySet<string>): boolean {
+  const body = markdownListItemBody(line);
+  if (body === null) {
+    return false;
+  }
+
+  const firstLink = indexEntryLinks(body)[0];
+  if (firstLink === undefined || !body.startsWith(firstLink)) {
+    return false;
+  }
+
+  return generatedLinkRowTargets(line).some((target) => generatedTargets.has(target) || isGeneratedIndexListTarget(target));
+}
+
+function markdownListItemBody(line: string): string | null {
+  const match = /^[-+*][\t ]+(.+)$/.exec(line);
+  return match?.[1] ?? null;
+}
+
+function isStaleGeneratedTableRow(line: string, generatedKeys: ReadonlySet<string>): boolean {
+  if (!line.startsWith("|")) {
+    return false;
+  }
+
+  const key = generatedTableRowKey(line);
+  return (key !== null && (generatedKeys.has(key) || isGeneratedIndexTableKey(key))) || isGeneratedSourceTableBodyRow(line);
+}
+
+function generatedLinkRowTargets(row: string): string[] {
+  const firstLink = indexEntryLinks(row)[0];
+  if (firstLink === undefined) {
+    return [];
+  }
+
+  const target = indexRouteTargetKey(indexWikilinkTarget(firstLink));
+  return target === null ? [] : [target];
+}
+
+function isGeneratedIndexListTarget(target: string): boolean {
+  return GENERATED_INDEX_LIST_ROUTE_PREFIXES.some((prefix) => target.startsWith(prefix));
+}
+
+function isGeneratedIndexTableKey(key: string): boolean {
+  if (!key.startsWith("link:")) {
+    return false;
+  }
+
+  const target = indexRouteTargetKey(key.slice("link:".length));
+  return target !== null && (target.startsWith("sources/") || target.startsWith("raw/inputs/"));
+}
+
+function generatedTableRowKey(row: string): string | null {
+  const firstLink = indexEntryLinks(row)[0];
+  if (firstLink !== undefined) {
+    const target = indexRouteTargetKey(indexWikilinkTarget(firstLink));
+    return target === null ? null : `link:${target}`;
+  }
+
+  const firstCell = firstTableCell(row);
+  return firstCell === null || firstCell === "" ? null : `cell:${firstCell}`;
+}
+
+function firstTableCell(row: string): string | null {
+  return markdownTableCells(row)?.[0] ?? null;
+}
+
+function isGeneratedSourceTableBodyRow(row: string): boolean {
+  const cells = markdownTableCells(row);
+  if (cells === null || cells.length < 4 || cells[0] === "") {
+    return false;
+  }
+
+  if (cells[0] === "Source" && cells[1] === "Status" && cells[2] === "Summary" && cells[3] === "Key pages") {
+    return false;
+  }
+
+  return !cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function markdownTableCells(row: string): string[] | null {
+  const trimmed = row.trim();
+  if (!trimmed.startsWith("|")) {
+    return null;
+  }
+
+  const cells: string[] = [];
+  let cell = "";
+  for (let index = 1; index < trimmed.length; index += 1) {
+    const character = trimmed[index];
+    if (character === "|" && !isEscapedMarkdownDelimiter(trimmed, index)) {
+      cells.push(cell.trim());
+      cell = "";
+      continue;
+    }
+
+    cell += character;
+  }
+
+  if (cell.trim() !== "" || !trimmed.endsWith("|")) {
+    cells.push(cell.trim());
+  }
+
+  return cells;
+}
+
+function isEscapedMarkdownDelimiter(value: string, index: number): boolean {
+  let slashCount = 0;
+  for (let cursor = index - 1; cursor >= 0 && value[cursor] === "\\"; cursor -= 1) {
+    slashCount += 1;
+  }
+
+  return slashCount % 2 === 1;
+}
+
+function indexEntryLinks(entry: string): string[] {
+  return parseWikilinks({ path: "curated/index.md", content: entry }).map((link) => link.raw);
+}
+
+function indexWikilinkTarget(link: string): string {
+  return link.slice(2, -2).split("|", 1)[0]?.trim() ?? "";
+}
+
+function indexRouteTargetKey(target: string): string | null {
+  const normalized = normalizePath(stripUrlQueryAndFragment(target).replaceAll("\\", "/").replace(/^\/+/, "").replace(/^curated\//, ""));
+  if (normalized === "") {
+    return null;
+  }
+
+  return normalized.replace(/\.md$/i, "");
 }
 
 function indexFixFailedIssue(error: { message: string }): LintIssue {
@@ -835,6 +1158,18 @@ function publicProfileIssues(scan: RepoScan, profileName: string, linkIndex: Lin
       continue;
     }
 
+    if (PUBLIC_FORBIDDEN_RUNTIME_LOG_PATHS.has(path)) {
+      issues.push({
+        rule_id: "public_runtime_log_selected",
+        severity: "error",
+        path,
+        message: `Public profile selects a runtime log: ${path}.`,
+        fix_hint: "Exclude runtime logs from public profiles; publish reviewed status pages instead.",
+        fixable: false,
+      });
+      continue;
+    }
+
     const page = markdownByPath.get(path);
     if (!page) {
       issues.push({
@@ -885,7 +1220,7 @@ function publicProfileIssues(scan: RepoScan, profileName: string, linkIndex: Lin
       severity: "error",
       path,
       message: `Public profile selects skipped generated/private data: ${path}.`,
-      fix_hint: "Exclude .llm-wiki/cache/** from public profiles; rebuildable cache files are not public source inputs.",
+      fix_hint: "Exclude .llm-wiki/cache/**, dist/**, quartz/content/**, and quartz/public/** from public profiles; rebuildable generated files are not public source inputs.",
       fixable: false,
     });
   }
@@ -926,6 +1261,60 @@ function publicProfileIssues(scan: RepoScan, profileName: string, linkIndex: Lin
       const windowsDrivePath = windowsDriveLinkPath(resolution.link.target);
       if (windowsDrivePath !== null) {
         if (hasRawPathSegment(windowsDrivePath)) {
+          issues.push({
+            rule_id: "public_raw_link",
+            severity: "error",
+            path: page.path,
+            line: resolution.link.line,
+            message: `Public page links to raw content: ${resolution.link.raw}.`,
+            fix_hint: "Replace raw links with public-safe source summaries or remove the link.",
+            fixable: false,
+          });
+        } else {
+          issues.push({
+            rule_id: "public_local_file_link",
+            severity: "error",
+            path: page.path,
+            line: resolution.link.line,
+            message: `Public page links to a local file: ${resolution.link.raw}.`,
+            fix_hint: "Remove local file links from public pages before syncing or building public output.",
+            fixable: false,
+          });
+        }
+        continue;
+      }
+
+      const skippedGeneratedRoot = forbiddenSkippedRootLinkTarget(page.path, resolution);
+      if (skippedGeneratedRoot !== null) {
+        issues.push({
+          rule_id: "public_skipped_private_path_link",
+          severity: "error",
+          path: page.path,
+          line: resolution.link.line,
+          message: `Public page links to skipped generated/private data under ${skippedGeneratedRoot}: ${resolution.link.raw}.`,
+          fix_hint: "Remove links to .llm-wiki/cache, dist, quartz/content, and quartz/public from public pages; generated output is rebuilt from selected public Markdown.",
+          fixable: false,
+        });
+        continue;
+      }
+
+      const runtimeLogPath = forbiddenRuntimeLogLinkTarget(page.path, resolution);
+      if (runtimeLogPath !== null) {
+        issues.push({
+          rule_id: "public_runtime_log_link",
+          severity: "error",
+          path: page.path,
+          line: resolution.link.line,
+          message: `Public page links to a runtime log: ${resolution.link.raw}.`,
+          fix_hint: "Remove runtime log links from public pages; publish reviewed status pages instead.",
+          fixable: false,
+        });
+        continue;
+      }
+
+      const posixLocalPath = absolutePosixLocalFileLinkPath(resolution.link.target);
+      if (posixLocalPath !== null && !isRepoRootCuratedLink(posixLocalPath, resolution)) {
+        if (hasRawPathSegment(posixLocalPath)) {
           issues.push({
             rule_id: "public_raw_link",
             severity: "error",
@@ -1003,6 +1392,7 @@ function publicProfileIssues(scan: RepoScan, profileName: string, linkIndex: Lin
   }
 
   issues.push(...publicRawSourceIndexLeakIssues(scan, selectedPaths, markdownByPath, requiredVisibility));
+  issues.push(...publicStaleIndexRowLeakIssues(scan, selectedPaths, markdownByPath, requiredVisibility));
 
   return issues;
 }
@@ -1055,6 +1445,34 @@ function publicRawSourceIndexLeakIssues(
   return issues;
 }
 
+function publicStaleIndexRowLeakIssues(
+  scan: RepoScan,
+  selectedPaths: ReadonlySet<string>,
+  markdownByPath: ReadonlyMap<string, RepoMarkdownFile>,
+  requiredVisibility: string,
+): LintIssue[] {
+  if (!selectedPaths.has("curated/index.md")) {
+    return [];
+  }
+
+  const indexPage = markdownByPath.get("curated/index.md");
+  if (!indexPage || indexPage.scan.frontmatter?.visibility !== requiredVisibility) {
+    return [];
+  }
+
+  return staleGeneratedIndexRowMatches(indexPage.content, comparableGeneratedIndexEntries(scan, generatedIndexEntries(scan))).map(
+    (row) => ({
+      rule_id: "public_index_stale_row_leak",
+      severity: "error" as const,
+      path: "curated/index.md",
+      line: row.line,
+      message: "Public index contains stale generated row content that may leak private text.",
+      fix_hint: "Run llm-wiki lint --fix to regenerate deterministic public-safe index rows before publishing.",
+      fixable: true,
+    }),
+  );
+}
+
 function sourceCardOriginal(scan: RepoScan, card: SourceCard): RepoScan["rawOriginals"][number] | null {
   const expectedPrefix = `${dirname(card.path)}/original.`;
   return scan.rawOriginals.find((original) => original.path.startsWith(expectedPrefix)) ?? null;
@@ -1099,6 +1517,39 @@ function isRawLocalLinkTarget(fromPath: string, rawTarget: string): boolean {
   return pathCandidates(fromPath, target).some((candidate) => candidate === "raw" || candidate.startsWith("raw/"));
 }
 
+function forbiddenSkippedRootLinkTarget(fromPath: string, resolution: LinkResolution): string | null {
+  if (resolution.resolved_path !== null) {
+    return forbiddenSkippedRootForPath(resolution.resolved_path);
+  }
+
+  return localLinkPathCandidates(fromPath, resolution.link.target)
+    .map((candidate) => forbiddenSkippedRootForPath(candidate))
+    .find((root): root is string => root !== null) ?? null;
+}
+
+function forbiddenSkippedRootForPath(path: string): string | null {
+  return PUBLIC_FORBIDDEN_SKIPPED_PROFILE_ROOTS.find(
+    (root) => path === root.path || path.startsWith(`${root.path}/`),
+  )?.path ?? null;
+}
+
+function forbiddenRuntimeLogLinkTarget(fromPath: string, resolution: LinkResolution): string | null {
+  if (resolution.resolved_path !== null) {
+    return PUBLIC_FORBIDDEN_RUNTIME_LOG_PATHS.has(resolution.resolved_path) ? resolution.resolved_path : null;
+  }
+
+  return localLinkPathCandidates(fromPath, resolution.link.target).find((candidate) => PUBLIC_FORBIDDEN_RUNTIME_LOG_PATHS.has(candidate)) ?? null;
+}
+
+function localLinkPathCandidates(fromPath: string, rawTarget: string): string[] {
+  const target = normalizeLocalLinkTarget(stripUrlQueryAndFragment(rawTarget.trim()));
+  if (target === "" || isExternalLinkTarget(target)) {
+    return [];
+  }
+
+  return pathCandidates(fromPath, target);
+}
+
 function stripUrlQueryAndFragment(target: string): string {
   const queryIndex = target.indexOf("?");
   const fragmentIndex = target.indexOf("#");
@@ -1121,6 +1572,34 @@ function isWindowsDrivePath(target: string): boolean {
 function windowsDriveLinkPath(rawTarget: string): string | null {
   const target = normalizeLocalLinkTarget(stripUrlQueryAndFragment(rawTarget.trim()));
   return isWindowsDrivePath(target) ? target : null;
+}
+
+function absolutePosixLocalFileLinkPath(rawTarget: string): string | null {
+  const target = normalizeLocalLinkTarget(stripUrlQueryAndFragment(rawTarget.trim()));
+  return isAbsolutePosixLocalFilePath(target) ? target : null;
+}
+
+function isAbsolutePosixLocalFilePath(target: string): boolean {
+  return target.startsWith("/") && target !== "/" && !target.startsWith("//");
+}
+
+function isRepoRootCuratedLink(posixPath: string, resolution: LinkResolution): boolean {
+  if (resolution.resolved_path === null || !resolution.resolved_path.startsWith("curated/")) {
+    return false;
+  }
+
+  const target = indexRouteTargetKey(posixPath);
+  const resolvedTarget = indexRouteTargetKey(resolution.resolved_path);
+  if (target === null || resolvedTarget === null || target !== resolvedTarget) {
+    return false;
+  }
+
+  const normalizedTarget = normalizePath(posixPath.replace(/^\/+/, "").replaceAll("\\", "/"));
+  return (
+    normalizedTarget.startsWith("curated/") ||
+    PUBLIC_CURATED_SITE_ROUTE_PREFIXES.some((prefix) => target.startsWith(prefix)) ||
+    !normalizedTarget.includes("/")
+  );
 }
 
 function localFileLinkPath(rawTarget: string): string | null {
@@ -1221,6 +1700,14 @@ function generatedIndexEntries(scan: RepoScan): string[] {
   return [...sourceIndexRows(scan, visibility), ...pageEntries].filter((entry) => entry.trim() !== "");
 }
 
+function comparableGeneratedIndexEntries(scan: RepoScan, expectedEntries: string[]): string[] {
+  if (existingIndexVisibility(scan) !== "public") {
+    return expectedEntries;
+  }
+
+  return [...new Set([...expectedEntries, ...publicSourceSummaryIndexRows(scan)])];
+}
+
 type IndexTarget = {
   path: string;
   title: string;
@@ -1273,6 +1760,18 @@ function sourceSummaryTargets(scan: RepoScan, indexVisibility = "private"): Inde
       return target === undefined ? [] : [target];
     })
     .sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function publicSourceSummaryIndexRows(scan: RepoScan): string[] {
+  return scan.curatedPages
+    .filter((page) => /^curated\/sources\/[^/]+\.md$/.test(page.path))
+    .filter((page) => hasValidCuratedIndexFrontmatter(page))
+    .filter((page) => page.scan.frontmatter?.visibility === "public")
+    .map((page) => {
+      const title = page.scan.frontmatter?.title as string;
+      return `| ${curatedIndexLink(page.path, title)} | | | |`;
+    })
+    .sort((left, right) => left.localeCompare(right));
 }
 
 function sourceIndexRows(scan: RepoScan, indexVisibility: string): string[] {
@@ -1400,6 +1899,7 @@ export function createLinkResolutionIndex(scan: RepoScan): LinkResolutionIndex {
   const filePaths = new Set(scan.files.map((file) => file.path));
   const markdownByPath = new Map<string, RepoMarkdownFile>();
   const markdownByTitle = new Map<string, RepoMarkdownFile>();
+  const markdownByAlias = new Map<string, RepoMarkdownFile>();
   const markdownByBasename = new Map<string, RepoMarkdownFile>();
 
   for (const file of scan.markdown) {
@@ -1408,6 +1908,13 @@ export function createLinkResolutionIndex(scan: RepoScan): LinkResolutionIndex {
     const title = normalizeTitle(String(file.scan.frontmatter?.title ?? ""));
     if (title !== "" && !markdownByTitle.has(title)) {
       markdownByTitle.set(title, file);
+    }
+
+    for (const alias of frontmatterAliases(file)) {
+      const normalizedAlias = normalizeTitle(alias);
+      if (normalizedAlias !== "" && !markdownByAlias.has(normalizedAlias)) {
+        markdownByAlias.set(normalizedAlias, file);
+      }
     }
 
     const basename = normalizeTitle(file.path.split("/").pop()?.replace(/\.md$/, "") ?? "");
@@ -1420,8 +1927,18 @@ export function createLinkResolutionIndex(scan: RepoScan): LinkResolutionIndex {
     filePaths,
     markdownByPath,
     markdownByTitle,
+    markdownByAlias,
     markdownByBasename,
   };
+}
+
+function frontmatterAliases(file: RepoMarkdownFile): string[] {
+  const aliases = file.scan.frontmatter?.aliases;
+  if (!Array.isArray(aliases)) {
+    return [];
+  }
+
+  return aliases.filter((alias): alias is string => typeof alias === "string");
 }
 
 export function resolveWikilinkTarget(
@@ -1472,11 +1989,16 @@ function resolveWikilinkTargetWithOptions(
   }
 
   const basenameMatch = linkIndex.markdownByBasename.get(normalizedTitle);
-  if (!basenameMatch) {
-    return null;
+  if (basenameMatch) {
+    return !options.validateHeading || headingPart === undefined || hasHeading(basenameMatch, headingPart) ? basenameMatch.path : null;
   }
 
-  return !options.validateHeading || headingPart === undefined || hasHeading(basenameMatch, headingPart) ? basenameMatch.path : null;
+  const aliasMatch = linkIndex.markdownByAlias.get(normalizedTitle);
+  if (aliasMatch) {
+    return !options.validateHeading || headingPart === undefined || hasHeading(aliasMatch, headingPart) ? aliasMatch.path : null;
+  }
+
+  return null;
 }
 
 function missingProfileIssue(profileName: string): LintIssue {
@@ -1547,20 +2069,42 @@ function matchesProfile(path: string, include: string[], exclude: string[]): boo
 
 function selectedForbiddenSkippedProfileRoots(include: string[], exclude: string[]): string[] {
   return PUBLIC_FORBIDDEN_SKIPPED_PROFILE_ROOTS.flatMap((root) =>
-    [...root.candidates, ...concreteForbiddenRootCandidates(root.path, include)].some((path) =>
-      include.some((pattern) => matchesGlob(path, pattern)) && !isForbiddenRootCandidateExcluded(root.path, path, exclude),
+    include.some((pattern) =>
+      forbiddenSkippedRootCandidate(root.path, root.candidates, pattern, exclude) !== null,
     )
       ? [root.path]
       : [],
   );
 }
 
-function concreteForbiddenRootCandidates(rootPath: string, include: string[]): string[] {
-  return include.filter((pattern) => pattern === rootPath || pattern.startsWith(`${rootPath}/`) || pattern.startsWith(`${rootPath}**`));
+function forbiddenSkippedRootCandidate(rootPath: string, configuredCandidates: readonly string[], includePattern: string, exclude: string[]): string | null {
+  const candidates = [...new Set([
+    ...configuredCandidates.filter((path) => matchesGlob(path, includePattern)),
+    ...concreteForbiddenRootCandidates(rootPath, includePattern),
+    ...representativeForbiddenRootCandidates(rootPath).filter((path) => matchesGlob(path, includePattern)),
+    ...globCandidatesAtOrBelowRoot(rootPath, includePattern),
+  ].filter((path): path is string => path !== null))];
+
+  return candidates.find((path) => !isForbiddenRootCandidateExcluded(rootPath, path, exclude)) ?? null;
 }
 
 function isForbiddenRootCandidateExcluded(rootPath: string, path: string, exclude: string[]): boolean {
-  return isProfileExcluded(path, exclude) || (path === rootPath && isProfileExcluded(`${rootPath}/__sentinel__`, exclude));
+  return isProfileExcluded(path, exclude) || (path === rootPath && isForbiddenRootSubtreeExcluded(rootPath, exclude));
+}
+
+function isForbiddenRootSubtreeExcluded(rootPath: string, exclude: string[]): boolean {
+  return isProfileExcluded(`${rootPath}/__sentinel__`, exclude) && isProfileExcluded(`${rootPath}/__sentinel__/__sentinel__`, exclude);
+}
+
+function representativeForbiddenRootCandidates(rootPath: string): string[] {
+  const filenames = ["__sentinel__", "__sentinel__.md", "__sentinel__.json", "__sentinel__.js", "__sentinel__.html"];
+  return [
+    rootPath,
+    ...filenames.map((filename) => `${rootPath}/${filename}`),
+    ...filenames.map((filename) => `${rootPath}/__sentinel__/${filename}`),
+    `${rootPath}/assets/app.js`,
+    `${rootPath}/static/contentIndex.json`,
+  ];
 }
 
 function isProfileExcluded(path: string, exclude: string[]): boolean {
@@ -1579,6 +2123,74 @@ function matchesGlob(path: string, pattern: string): boolean {
     .replaceAll(globstar, ".*");
 
   return new RegExp(`^${regexSource}$`).test(path);
+}
+
+function concreteForbiddenRootCandidates(rootPath: string, includePattern: string): string[] {
+  return includePattern === rootPath || includePattern.startsWith(`${rootPath}/`) || includePattern.startsWith(`${rootPath}**`)
+    ? [includePattern]
+    : [];
+}
+
+function globCandidatesAtOrBelowRoot(rootPath: string, pattern: string): string[] {
+  const rootSegments = rootPath.split("/");
+  const patternSegments = pattern.split("/");
+  const candidates = new Set<string>();
+
+  function addCandidate(candidateSegments: string[], rootIndex: number): void {
+    if (rootIndex !== rootSegments.length) {
+      return;
+    }
+
+    const candidate = candidateSegments.join("/");
+    if ((candidate === rootPath || candidate.startsWith(`${rootPath}/`)) && matchesGlob(candidate, pattern)) {
+      candidates.add(candidate);
+    }
+  }
+
+  function build(patternIndex: number, rootIndex: number, candidateSegments: string[]): void {
+    if (patternIndex === patternSegments.length) {
+      addCandidate(candidateSegments, rootIndex);
+      return;
+    }
+
+    const segment = patternSegments[patternIndex];
+    if (segment === "**") {
+      build(patternIndex + 1, rootIndex, candidateSegments);
+
+      if (rootIndex < rootSegments.length) {
+        build(patternIndex, rootIndex + 1, [...candidateSegments, rootSegments[rootIndex]]);
+        return;
+      }
+
+      build(patternIndex + 1, rootIndex, [...candidateSegments, "__sentinel__"]);
+      build(patternIndex + 1, rootIndex, [...candidateSegments, "__sentinel__", "__sentinel__"]);
+      return;
+    }
+
+    if (rootIndex < rootSegments.length) {
+      if (matchesGlobSegment(rootSegments[rootIndex], segment)) {
+        build(patternIndex + 1, rootIndex + 1, [...candidateSegments, rootSegments[rootIndex]]);
+      }
+      return;
+    }
+
+    const candidateSegment = sampleGlobSegment(segment);
+    if (matchesGlobSegment(candidateSegment, segment)) {
+      build(patternIndex + 1, rootIndex, [...candidateSegments, candidateSegment]);
+    }
+  }
+
+  build(0, 0, []);
+  return [...candidates];
+}
+
+function sampleGlobSegment(segment: string): string {
+  return segment.replace(/\*+/g, "__sentinel__");
+}
+
+function matchesGlobSegment(pathSegment: string, patternSegment: string): boolean {
+  const regexSource = patternSegment.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replaceAll("*", "[^/]*");
+  return new RegExp(`^${regexSource}$`).test(pathSegment);
 }
 
 function toStringArray(value: unknown): string[] {

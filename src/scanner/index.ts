@@ -361,53 +361,15 @@ export function parseMarkdownLinks(input: ScannerInput, options: { lineOffset?: 
       flushHtmlAttributeChunk();
     }
 
-    const referenceLinkPattern = /!?\[([^\]\n]+)\]\[([^\]\n]*)\]/g;
-    for (const match of referenceScanLine.matchAll(referenceLinkPattern)) {
-      if (match.index === undefined) {
-        continue;
-      }
-
-      const raw = line.slice(match.index, match.index + match[0].length);
-      const label = markdownReferenceLabel((match[2] ?? "") === "" ? (match[1] ?? "") : (match[2] ?? ""));
-      if (label === "") {
-        continue;
-      }
-
-      referenceLinks.push({
-        path: input.path,
-        line: lineIndex + 1 + lineOffset,
-        column: match.index + 1,
-        raw,
-        text: match[1] ?? "",
-        label,
-        embed: raw.startsWith("!"),
-      });
-    }
+    referenceLinks.push(
+      ...parseMarkdownReferenceLinks(input.path, line, referenceScanLine, lineIndex + 1 + lineOffset),
+    );
 
     const shortcutReferenceScanLine =
       referenceDefinition === null ? maskMarkdownReferenceLinks(referenceScanLine) : "";
-    const shortcutReferenceLinkPattern = /!?\[([^\]\n]+)\](?![\[(])/g;
-    for (const match of shortcutReferenceScanLine.matchAll(shortcutReferenceLinkPattern)) {
-      if (match.index === undefined) {
-        continue;
-      }
-
-      const raw = line.slice(match.index, match.index + match[0].length);
-      const label = markdownReferenceLabel(match[1] ?? "");
-      if (label === "") {
-        continue;
-      }
-
-      referenceLinks.push({
-        path: input.path,
-        line: lineIndex + 1 + lineOffset,
-        column: match.index + 1,
-        raw,
-        text: match[1] ?? "",
-        label,
-        embed: raw.startsWith("!"),
-      });
-    }
+    referenceLinks.push(
+      ...parseMarkdownShortcutReferenceLinks(input.path, line, shortcutReferenceScanLine, lineIndex + 1 + lineOffset),
+    );
 
     if (isRecognizedListItem && listItem !== null) {
       activeListContexts = replaceMarkdownListContext(activeListContexts, listItem);
@@ -1118,6 +1080,222 @@ function parseMultilineInlineMarkdownLinks(path: string, lines: HtmlAttributeSca
   return links;
 }
 
+function parseMarkdownReferenceLinks(
+  path: string,
+  line: string,
+  scanLine: string,
+  lineNumber: number,
+): PendingMarkdownReferenceLink[] {
+  const links: PendingMarkdownReferenceLink[] = [];
+  let searchIndex = 0;
+
+  while (searchIndex < scanLine.length) {
+    const labelStart = scanLine.indexOf("[", searchIndex);
+    if (labelStart === -1) {
+      break;
+    }
+
+    const labelEnd = findMarkdownLinkLabelEnd(scanLine, labelStart);
+    if (labelEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    if (scanLine[labelEnd + 1] !== "[") {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const referenceLabelStart = labelEnd + 1;
+    const referenceLabelEnd = findMarkdownLinkLabelEnd(scanLine, referenceLabelStart);
+    if (referenceLabelEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const text = line.slice(labelStart + 1, labelEnd);
+    const explicitLabel = line.slice(referenceLabelStart + 1, referenceLabelEnd);
+    const label = markdownReferenceLabel(explicitLabel === "" ? text : explicitLabel);
+    links.push(
+      ...parseNestedMarkdownReferenceImages(path, line, scanLine, lineNumber, labelStart + 1, labelEnd),
+    );
+    if (label !== "") {
+      const rawStart = labelStart > 0 && scanLine[labelStart - 1] === "!" ? labelStart - 1 : labelStart;
+      const raw = line.slice(rawStart, referenceLabelEnd + 1);
+      links.push({
+        path,
+        line: lineNumber,
+        column: rawStart + 1,
+        raw,
+        text,
+        label,
+        embed: raw.startsWith("!"),
+      });
+    }
+
+    searchIndex = referenceLabelEnd + 1;
+  }
+
+  return links;
+}
+
+function parseNestedMarkdownReferenceImages(
+  path: string,
+  line: string,
+  scanLine: string,
+  lineNumber: number,
+  labelContentStart: number,
+  labelContentEnd: number,
+): PendingMarkdownReferenceLink[] {
+  const links: PendingMarkdownReferenceLink[] = [];
+  let searchIndex = labelContentStart;
+
+  while (searchIndex < labelContentEnd) {
+    const imageStart = scanLine.indexOf("![", searchIndex);
+    if (imageStart === -1 || imageStart >= labelContentEnd) {
+      break;
+    }
+
+    const imageLabelStart = imageStart + 1;
+    const imageLabelEnd = findMarkdownLinkLabelEnd(scanLine, imageLabelStart);
+    if (imageLabelEnd === -1 || imageLabelEnd > labelContentEnd || scanLine[imageLabelEnd + 1] !== "[") {
+      searchIndex = imageStart + 2;
+      continue;
+    }
+
+    const referenceLabelStart = imageLabelEnd + 1;
+    const referenceLabelEnd = findMarkdownLinkLabelEnd(scanLine, referenceLabelStart);
+    if (referenceLabelEnd === -1 || referenceLabelEnd > labelContentEnd) {
+      searchIndex = imageLabelEnd + 1;
+      continue;
+    }
+
+    const text = line.slice(imageLabelStart + 1, imageLabelEnd);
+    const explicitLabel = line.slice(referenceLabelStart + 1, referenceLabelEnd);
+    const label = markdownReferenceLabel(explicitLabel === "" ? text : explicitLabel);
+    if (label !== "") {
+      links.push({
+        path,
+        line: lineNumber,
+        column: imageStart + 1,
+        raw: line.slice(imageStart, referenceLabelEnd + 1),
+        text,
+        label,
+        embed: true,
+      });
+    }
+
+    searchIndex = referenceLabelEnd + 1;
+  }
+
+  return links;
+}
+
+function parseMarkdownShortcutReferenceLinks(
+  path: string,
+  line: string,
+  scanLine: string,
+  lineNumber: number,
+): PendingMarkdownReferenceLink[] {
+  const links: PendingMarkdownReferenceLink[] = [];
+  let searchIndex = 0;
+
+  while (searchIndex < scanLine.length) {
+    const labelStart = scanLine.indexOf("[", searchIndex);
+    if (labelStart === -1) {
+      break;
+    }
+
+    const labelEnd = findMarkdownLinkLabelEnd(scanLine, labelStart);
+    if (labelEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const nextCharacter = scanLine[labelEnd + 1];
+    if (nextCharacter === "[" || nextCharacter === "(") {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const text = line.slice(labelStart + 1, labelEnd);
+    const label = markdownReferenceLabel(text);
+    const isImage = labelStart > 0 && scanLine[labelStart - 1] === "!";
+    if (!isImage) {
+      links.push(
+        ...parseNestedMarkdownShortcutImages(path, line, scanLine, lineNumber, labelStart + 1, labelEnd),
+      );
+    }
+    if (label !== "") {
+      const rawStart = isImage ? labelStart - 1 : labelStart;
+      const raw = line.slice(rawStart, labelEnd + 1);
+      links.push({
+        path,
+        line: lineNumber,
+        column: rawStart + 1,
+        raw,
+        text,
+        label,
+        embed: raw.startsWith("!"),
+      });
+    }
+
+    searchIndex = labelEnd + 1;
+  }
+
+  return links;
+}
+
+function parseNestedMarkdownShortcutImages(
+  path: string,
+  line: string,
+  scanLine: string,
+  lineNumber: number,
+  labelContentStart: number,
+  labelContentEnd: number,
+): PendingMarkdownReferenceLink[] {
+  const links: PendingMarkdownReferenceLink[] = [];
+  let searchIndex = labelContentStart;
+
+  while (searchIndex < labelContentEnd) {
+    const imageStart = scanLine.indexOf("![", searchIndex);
+    if (imageStart === -1 || imageStart >= labelContentEnd) {
+      break;
+    }
+
+    const imageLabelStart = imageStart + 1;
+    const imageLabelEnd = findMarkdownLinkLabelEnd(scanLine, imageLabelStart);
+    if (imageLabelEnd === -1 || imageLabelEnd > labelContentEnd) {
+      searchIndex = imageStart + 2;
+      continue;
+    }
+
+    const nextCharacter = scanLine[imageLabelEnd + 1];
+    if (nextCharacter === "[" || nextCharacter === "(") {
+      searchIndex = imageLabelStart + 1;
+      continue;
+    }
+
+    const text = line.slice(imageLabelStart + 1, imageLabelEnd);
+    const label = markdownReferenceLabel(text);
+    if (label !== "") {
+      links.push({
+        path,
+        line: lineNumber,
+        column: imageStart + 1,
+        raw: line.slice(imageStart, imageLabelEnd + 1),
+        text,
+        label,
+        embed: true,
+      });
+    }
+
+    searchIndex = imageLabelEnd + 1;
+  }
+
+  return links;
+}
+
 function parseMarkdownAutolinks(path: string, line: string, scanLine: string, lineNumber: number): MarkdownLink[] {
   const links: MarkdownLink[] = [];
   const autolinkPattern = /<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>\u0000-\u001F]*)>/g;
@@ -1150,7 +1328,6 @@ function parseMarkdownAutolinks(path: string, line: string, scanLine: string, li
 function parseHtmlAttributeLinks(path: string, lines: HtmlAttributeScanLine[]): MarkdownLink[] {
   const links: MarkdownLink[] = [];
   const tagPattern = /<[A-Za-z][A-Za-z0-9:-]*(?:\s+(?:"[^"]*"|'[^']*'|[^'"<>])*)?>/g;
-  const linkAttributePattern = /\b(href|src|srcset|poster|data)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gi;
   const scanContent = lines.map((line) => line.scanLine).join("\n");
   const rawContent = lines.map((line) => line.line).join("\n");
   const lineStarts: number[] = [];
@@ -1167,21 +1344,20 @@ function parseHtmlAttributeLinks(path: string, lines: HtmlAttributeScanLine[]): 
     }
 
     const tag = tagMatch[0];
-    for (const attributeMatch of tag.matchAll(linkAttributePattern)) {
-      if (attributeMatch.index === undefined) {
-        continue;
-      }
-
-      const attributeName = (attributeMatch[1] ?? "").toLowerCase();
-      const attributeValue = decodeHtmlCharacterReferences(attributeMatch[2] ?? attributeMatch[3] ?? attributeMatch[4] ?? "");
+    for (const attribute of parseHtmlResourceAttributes(tag)) {
+      const attributeName = attribute.name.toLowerCase();
+      const comparableAttributeName = htmlResourceAttributeComparableName(attributeName);
+      const attributeValue = decodeHtmlCharacterReferences(attribute.value);
       if (attributeValue.trim() === "") {
         continue;
       }
 
-      const attributeStart = tagMatch.index + attributeMatch.index;
+      const attributeStart = tagMatch.index + attribute.start;
       const location = htmlAttributeLocation(lines, lineStarts, attributeStart);
-      const raw = rawContent.slice(attributeStart, attributeStart + attributeMatch[0].length);
-      const targets = attributeName === "srcset" ? parseSrcsetTargets(attributeValue) : [attributeValue];
+      const raw = rawContent.slice(attributeStart, attributeStart + attribute.length);
+      const targets = isHtmlSrcsetAttribute(comparableAttributeName)
+        ? parseSrcsetTargets(attributeValue)
+        : [attributeValue];
 
       for (const target of targets) {
         links.push({
@@ -1191,13 +1367,130 @@ function parseHtmlAttributeLinks(path: string, lines: HtmlAttributeScanLine[]): 
           raw,
           text: attributeName,
           target,
-          embed: attributeName === "src" || attributeName === "srcset" || attributeName === "poster" || attributeName === "data",
+          embed: isHtmlEmbeddedResourceAttribute(comparableAttributeName),
         });
       }
     }
   }
 
   return links;
+}
+
+type HtmlResourceAttribute = {
+  name: string;
+  value: string;
+  start: number;
+  length: number;
+};
+
+function parseHtmlResourceAttributes(tag: string): HtmlResourceAttribute[] {
+  const attributes: HtmlResourceAttribute[] = [];
+  let index = 1;
+
+  while (index < tag.length && !isHtmlAttributeBoundary(tag[index] ?? "")) {
+    index += 1;
+  }
+
+  while (index < tag.length) {
+    while (index < tag.length && /\s/.test(tag[index] ?? "")) {
+      index += 1;
+    }
+
+    const attributeStart = index;
+    const firstCharacter = tag[index] ?? "";
+    if (firstCharacter === "" || firstCharacter === ">" || firstCharacter === "/") {
+      index += 1;
+      continue;
+    }
+
+    while (index < tag.length && !isHtmlAttributeBoundary(tag[index] ?? "")) {
+      index += 1;
+    }
+
+    const attributeName = tag.slice(attributeStart, index);
+    while (index < tag.length && /\s/.test(tag[index] ?? "")) {
+      index += 1;
+    }
+
+    if ((tag[index] ?? "") !== "=") {
+      continue;
+    }
+
+    index += 1;
+    while (index < tag.length && /\s/.test(tag[index] ?? "")) {
+      index += 1;
+    }
+
+    let value = "";
+    const quote = tag[index] ?? "";
+    if (quote === "\"" || quote === "'") {
+      index += 1;
+      const valueStart = index;
+      while (index < tag.length && tag[index] !== quote) {
+        index += 1;
+      }
+      value = tag.slice(valueStart, index);
+      if ((tag[index] ?? "") === quote) {
+        index += 1;
+      }
+    } else {
+      const valueStart = index;
+      while (index < tag.length && !/[\s>]/.test(tag[index] ?? "")) {
+        index += 1;
+      }
+      value = tag.slice(valueStart, index);
+    }
+
+    if (isHtmlResourceAttributeName(attributeName)) {
+      attributes.push({
+        name: attributeName,
+        value,
+        start: attributeStart,
+        length: index - attributeStart,
+      });
+    }
+  }
+
+  return attributes;
+}
+
+function isHtmlAttributeBoundary(character: string): boolean {
+  return character === "" || /\s/.test(character) || character === "=" || character === "/" || character === ">";
+}
+
+function isHtmlResourceAttributeName(attributeName: string): boolean {
+  const normalizedAttributeName = attributeName.toLowerCase();
+  return (
+    isHtmlResourceAttributeLocalName(normalizedAttributeName) ||
+    isHtmlResourceAttributeLocalName(htmlResourceAttributeComparableName(normalizedAttributeName))
+  );
+}
+
+function htmlResourceAttributeComparableName(attributeName: string): string {
+  if (attributeName.startsWith("data-")) {
+    return attributeName;
+  }
+
+  const namespaceIndex = attributeName.lastIndexOf(":");
+  return namespaceIndex === -1 ? attributeName : attributeName.slice(namespaceIndex + 1);
+}
+
+function isHtmlResourceAttributeLocalName(attributeName: string): boolean {
+  return /^(?:href|src|srcset|poster|data(?:-[A-Za-z0-9_.:-]+)?)$/i.test(attributeName);
+}
+
+function isHtmlSrcsetAttribute(attributeName: string): boolean {
+  return attributeName === "srcset" || (attributeName.startsWith("data-") && attributeName.endsWith("srcset"));
+}
+
+function isHtmlEmbeddedResourceAttribute(attributeName: string): boolean {
+  return (
+    attributeName === "src" ||
+    attributeName === "srcset" ||
+    attributeName === "poster" ||
+    attributeName === "data" ||
+    attributeName.startsWith("data-")
+  );
 }
 
 function parseSrcsetTargets(value: string): string[] {
@@ -1351,13 +1644,18 @@ function findMarkdownInlineDestinationEnd(line: string, startIndex: number): num
 
 function parseMarkdownReferenceDefinition(scanLine: string): MarkdownReferenceDefinition | null {
   const normalizedScanLine = stripMarkdownBlockquoteMarkers(scanLine);
-  const match = /^( {0,3})\[([^\]\n]+)\]:[ \t]*(.*)$/.exec(normalizedScanLine);
-  if (!match) {
+  const indentLength = /^( {0,3})/.exec(normalizedScanLine)?.[0].length ?? 0;
+  if (normalizedScanLine[indentLength] !== "[") {
     return null;
   }
 
-  const label = markdownReferenceLabel(match[2] ?? "");
-  const target = markdownLinkDestination(match[3] ?? "");
+  const labelEnd = findMarkdownLinkLabelEnd(normalizedScanLine, indentLength);
+  if (labelEnd === -1 || normalizedScanLine[labelEnd + 1] !== ":") {
+    return null;
+  }
+
+  const label = markdownReferenceLabel(normalizedScanLine.slice(indentLength + 1, labelEnd));
+  const target = markdownLinkDestination(normalizedScanLine.slice(labelEnd + 2));
   if (label === "" || label.startsWith("^") || target === "") {
     return null;
   }
@@ -1401,6 +1699,9 @@ function maskMarkdownInlineLinks(line: string): string {
 
     const maskStart = labelStart > 0 && line[labelStart - 1] === "!" ? labelStart - 1 : labelStart;
     masked.fill(" ", maskStart, destinationEnd + 1);
+    restoreNestedReferenceImagesInLinkLabel(masked, line, labelStart + 1, labelEnd, {
+      explicitReferenceImages: true,
+    });
     searchIndex = destinationEnd + 1;
   }
 
@@ -1442,7 +1743,90 @@ function maskMarkdownInlineLinkDestinations(line: string): string {
 }
 
 function maskMarkdownReferenceLinks(line: string): string {
-  return line.replace(/!?\[([^\]\n]+)\]\[([^\]\n]*)\]/g, (match) => " ".repeat(match.length));
+  const masked = line.split("");
+  let searchIndex = 0;
+
+  while (searchIndex < line.length) {
+    const labelStart = line.indexOf("[", searchIndex);
+    if (labelStart === -1) {
+      break;
+    }
+
+    const labelEnd = findMarkdownLinkLabelEnd(line, labelStart);
+    if (labelEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    if (line[labelEnd + 1] !== "[") {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const referenceLabelEnd = findMarkdownLinkLabelEnd(line, labelEnd + 1);
+    if (referenceLabelEnd === -1) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
+    const maskStart = labelStart > 0 && line[labelStart - 1] === "!" ? labelStart - 1 : labelStart;
+    masked.fill(" ", maskStart, referenceLabelEnd + 1);
+    restoreNestedReferenceImagesInLinkLabel(masked, line, labelStart + 1, labelEnd, {
+      explicitReferenceImages: false,
+    });
+    searchIndex = referenceLabelEnd + 1;
+  }
+
+  return masked.join("");
+}
+
+function restoreNestedReferenceImagesInLinkLabel(
+  masked: string[],
+  line: string,
+  labelContentStart: number,
+  labelContentEnd: number,
+  options: { explicitReferenceImages: boolean },
+): void {
+  let searchIndex = labelContentStart;
+
+  while (searchIndex < labelContentEnd) {
+    const imageStart = line.indexOf("![", searchIndex);
+    if (imageStart === -1 || imageStart >= labelContentEnd) {
+      break;
+    }
+
+    const imageLabelStart = imageStart + 1;
+    const imageLabelEnd = findMarkdownLinkLabelEnd(line, imageLabelStart);
+    if (imageLabelEnd === -1 || imageLabelEnd > labelContentEnd) {
+      searchIndex = imageStart + 2;
+      continue;
+    }
+
+    const nextCharacter = line[imageLabelEnd + 1];
+    if (nextCharacter === "(") {
+      searchIndex = imageLabelEnd + 1;
+      continue;
+    }
+
+    let imageEnd = imageLabelEnd;
+    if (nextCharacter === "[") {
+      if (!options.explicitReferenceImages) {
+        searchIndex = imageLabelEnd + 1;
+        continue;
+      }
+      const referenceLabelEnd = findMarkdownLinkLabelEnd(line, imageLabelEnd + 1);
+      if (referenceLabelEnd === -1 || referenceLabelEnd > labelContentEnd) {
+        searchIndex = imageLabelEnd + 1;
+        continue;
+      }
+      imageEnd = referenceLabelEnd;
+    }
+
+    for (let index = imageStart; index <= imageEnd; index += 1) {
+      masked[index] = line[index] ?? " ";
+    }
+    searchIndex = imageEnd + 1;
+  }
 }
 
 const HTML_CHARACTER_REFERENCES = new Map<string, string>([

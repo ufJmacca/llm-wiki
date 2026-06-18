@@ -1311,6 +1311,132 @@ ${htmlLine}
     ]);
   });
 
+  it("parses HTML data-* resource attributes", () => {
+    // Arrange
+    const rawUrl = "file:///repo/raw/inputs/source/original.md";
+    const linkUrl = "../raw/inputs/source/original.md";
+    const imageUrl = "../raw/assets/source/original.png";
+    const dataLine = `<div data-url="${rawUrl}" data-href='${linkUrl}' data-src=${imageUrl}></div>`;
+    const srcsetLine = `<img data-srcset="safe.png 1x, ${imageUrl} 2x">`;
+    const lazySrcsetLine = `<img data-lazy-srcset="https://cdn.example/safe.png 1x, ${imageUrl} 2x">`;
+    const content = `# Page
+
+${dataLine}
+${srcsetLine}
+${lazySrcsetLine}
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: dataLine.indexOf("data-url=") + 1,
+        raw: `data-url="${rawUrl}"`,
+        text: "data-url",
+        target: rawUrl,
+        embed: true,
+      },
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: dataLine.indexOf("data-href=") + 1,
+        raw: `data-href='${linkUrl}'`,
+        text: "data-href",
+        target: linkUrl,
+        embed: true,
+      },
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: dataLine.indexOf("data-src=") + 1,
+        raw: `data-src=${imageUrl}`,
+        text: "data-src",
+        target: imageUrl,
+        embed: true,
+      },
+      {
+        path: "curated/page.md",
+        line: 4,
+        column: srcsetLine.indexOf("data-srcset=") + 1,
+        raw: `data-srcset="safe.png 1x, ${imageUrl} 2x"`,
+        text: "data-srcset",
+        target: "safe.png",
+        embed: true,
+      },
+      {
+        path: "curated/page.md",
+        line: 4,
+        column: srcsetLine.indexOf("data-srcset=") + 1,
+        raw: `data-srcset="safe.png 1x, ${imageUrl} 2x"`,
+        text: "data-srcset",
+        target: imageUrl,
+        embed: true,
+      },
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: lazySrcsetLine.indexOf("data-lazy-srcset=") + 1,
+        raw: `data-lazy-srcset="https://cdn.example/safe.png 1x, ${imageUrl} 2x"`,
+        text: "data-lazy-srcset",
+        target: "https://cdn.example/safe.png",
+        embed: true,
+      },
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: lazySrcsetLine.indexOf("data-lazy-srcset=") + 1,
+        raw: `data-lazy-srcset="https://cdn.example/safe.png 1x, ${imageUrl} 2x"`,
+        text: "data-lazy-srcset",
+        target: imageUrl,
+        embed: true,
+      },
+    ]);
+  });
+
+  it("parses namespaced HTML resource attributes by local name", () => {
+    // Arrange
+    const rawUrl = "../raw/inputs/source/original.svg";
+    const svgLine = `<svg><use xlink:href="${rawUrl}" xlink:title="../raw/ignored"></use></svg>`;
+    const content = `# Page
+
+${svgLine}
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: svgLine.indexOf("xlink:href=") + 1,
+        raw: `xlink:href="${rawUrl}"`,
+        text: "xlink:href",
+        target: rawUrl,
+        embed: false,
+      },
+    ]);
+  });
+
+  it("does not parse data-* text inside unrelated HTML attributes", () => {
+    // Arrange
+    const content = `# Page
+
+<div title="example data-url=../../raw/foo" aria-label='data-src=../raw/file'></div>
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([]);
+  });
+
   it("parses multiline HTML href and src attributes", () => {
     // Arrange
     const rawUrl = "file:///repo/raw/inputs/source/original.md";
@@ -1568,9 +1694,46 @@ ${visibleLine}
     ]);
   });
 
+  it("preserves reference-style images nested inside outer Markdown links", () => {
+    // Arrange
+    const visibleLine = "Visible [![raw][raw-ref]](https://example.test/source).";
+    const content = `# Page
+
+${visibleLine}
+
+[raw-ref]: ../../raw/assets/secret.png
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[![raw]") + 1,
+        raw: "[![raw][raw-ref]](https://example.test/source)",
+        text: "![raw][raw-ref]",
+        target: "https://example.test/source",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("![raw]") + 1,
+        raw: "![raw][raw-ref]",
+        text: "raw",
+        target: "../../raw/assets/secret.png",
+        embed: true,
+      },
+    ]);
+  });
+
   it("parses reference-style Markdown links through definitions", () => {
     // Arrange
-    const visibleLine = "Visible [private page][p], ![raw file][raw-ref], [collapsed][], and [shortcut].";
+    const visibleLine =
+      "Visible [private page][p], ![raw file][raw-ref], [collapsed][], [raw [PDF]][], and [shortcut].";
     const content = `# Page
 
 \`[ignored reference][p]\`
@@ -1580,6 +1743,7 @@ ${visibleLine}
 [p]: private.md
 [raw-ref]: <../raw/original.md> "raw"
 [collapsed]: collapsed.md
+[raw [PDF]]: ../raw/balanced.pdf
 [shortcut]: shortcut.md
 `;
 
@@ -1618,11 +1782,159 @@ ${visibleLine}
       {
         path: "curated/page.md",
         line: 5,
+        column: visibleLine.indexOf("[raw [PDF]]") + 1,
+        raw: "[raw [PDF]][]",
+        text: "raw [PDF]",
+        target: "../raw/balanced.pdf",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 5,
         column: visibleLine.indexOf("[shortcut]") + 1,
         raw: "[shortcut]",
         text: "shortcut",
         target: "shortcut.md",
         embed: false,
+      },
+    ]);
+  });
+
+  it("does not fabricate overlapping reference links after consumed labels", () => {
+    // Arrange
+    const visibleLine = "[One][safe][Two][also-safe]";
+    const content = `# Page
+
+${visibleLine}
+
+[safe]: public-one.md
+[also-safe]: public-two.md
+[Two]: ../../raw/assets/secret.png
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[One]") + 1,
+        raw: "[One][safe]",
+        text: "One",
+        target: "public-one.md",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[Two]") + 1,
+        raw: "[Two][also-safe]",
+        text: "Two",
+        target: "public-two.md",
+        embed: false,
+      },
+    ]);
+  });
+
+  it("preserves shortcut images nested inside outer reference links", () => {
+    // Arrange
+    const visibleLine = "[![raw]][outer]";
+    const content = `# Page
+
+${visibleLine}
+
+[raw]: ../../raw/assets/secret.png
+[outer]: https://example.test/source
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: 1,
+        raw: "[![raw]][outer]",
+        text: "![raw]",
+        target: "https://example.test/source",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("![raw]") + 1,
+        raw: "![raw]",
+        text: "raw",
+        target: "../../raw/assets/secret.png",
+        embed: true,
+      },
+    ]);
+  });
+
+  it("preserves shortcut images nested inside bracketed shortcut labels", () => {
+    // Arrange
+    const visibleLine = "[![raw]]";
+    const content = `# Page
+
+${visibleLine}
+
+[raw]: ../../raw/assets/secret.png
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("![raw]") + 1,
+        raw: "![raw]",
+        text: "raw",
+        target: "../../raw/assets/secret.png",
+        embed: true,
+      },
+    ]);
+  });
+
+  it("does not emit explicit image reference labels nested inside outer reference links as shortcuts", () => {
+    // Arrange
+    const visibleLine = "[![raw][raw-ref]][outer]";
+    const content = `# Page
+
+${visibleLine}
+
+[raw-ref]: ../../raw/assets/secret.png
+[outer]: https://example.test/source
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: 1,
+        raw: "[![raw][raw-ref]][outer]",
+        text: "![raw][raw-ref]",
+        target: "https://example.test/source",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("![raw]") + 1,
+        raw: "![raw][raw-ref]",
+        text: "raw",
+        target: "../../raw/assets/secret.png",
+        embed: true,
       },
     ]);
   });

@@ -750,6 +750,43 @@ visibility: private
     });
   });
 
+  it("reports queue items with empty original_path extensions as malformed before raw hash checks", async () => {
+    await withTempWorkspace("llm-wiki-lint-queue-empty-original-extension-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      const queueRecord = JSON.parse(await readGeneratedFile(wikiDir, source.queue_path)) as Record<string, unknown>;
+      const malformedOriginalPath = source.original_path.replace(/original\.[^/]+$/, "original.");
+      await writeFile(
+        resolve(wikiDir, source.queue_path),
+        `${JSON.stringify({ ...queueRecord, original_path: malformedOriginalPath }, null, 2)}\n`,
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expectStableIssueRecords(payload.issues);
+      expect(issueByRuleAndPath(payload.issues, "queue_item_malformed", source.queue_path)).toMatchObject({
+        severity: "error",
+        message: expect.stringContaining("original_path"),
+        fix_hint: "Keep original_path pointed at raw/inputs/YYYY/MM/<source_id>/original.<ext> for the same source ID.",
+        fixable: false,
+      });
+      expect(payload.issues).not.toContainEqual(
+        expect.objectContaining({
+          rule_id: "raw_original_missing",
+          path: malformedOriginalPath,
+        }),
+      );
+    });
+  });
+
   it("reports queue/source-card origin_url provenance drift for URL captures", async () => {
     await withTempWorkspace("llm-wiki-lint-url-origin-mismatch-", async (workspaceDir) => {
       // Arrange
@@ -1867,6 +1904,79 @@ safety:
     });
   });
 
+  it("allows resolved public site routes with raw slugs and extensionless root pages", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-site-routes-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      await writeFile(
+        resolve(wikiDir, ".llm-wiki/profiles/public.yml"),
+        `name: public
+mode: deploy
+include:
+  - curated/topics/page.md
+  - curated/concepts/raw.md
+  - curated/map.md
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+safety:
+  fail_on_private_pages: true
+  fail_on_private_links: true
+  fail_on_raw_links: true
+  fail_on_public_graph_private_nodes: true
+  fail_on_public_search_private_text: true
+`,
+        "utf8",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/concepts/raw.md",
+        { type: "concept", title: "Raw", visibility: "public", source_ids: [source.source_id] },
+        "# Raw\n\nPublic curated route with a raw slug.\n",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/map.md",
+        { type: "page", title: "Map", visibility: "public", source_ids: [source.source_id] },
+        "# Map\n\nPublic root page.\n",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/page.md",
+        { type: "topic", title: "Page", visibility: "public", source_ids: [source.source_id] },
+        `# Page
+
+Links to [Raw](/concepts/raw) and [Map](/map).
+
+<div title="example data-url=../../raw/foo"></div>
+`,
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintSuccess(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.issues).not.toContainEqual(
+        expect.objectContaining({
+          rule_id: "public_raw_link",
+          path: "curated/topics/page.md",
+        }),
+      );
+      expect(payload.data.issues).not.toContainEqual(
+        expect.objectContaining({
+          rule_id: "public_local_file_link",
+          path: "curated/topics/page.md",
+        }),
+      );
+    });
+  });
+
   it("fails public strict lint for Markdown links to raw content and private pages", async () => {
     await withTempWorkspace("llm-wiki-lint-public-markdown-links-", async (workspaceDir) => {
       // Arrange
@@ -2201,6 +2311,168 @@ Links to [raw entity](${encodedRawTarget}), [private entity](..&sol;private&sol;
     });
   });
 
+  it("fails public strict lint for reference-style raw images nested inside outer Markdown links", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-inline-linked-reference-image-raw-link-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      await mkdir(resolve(wikiDir, "raw/assets"), { recursive: true });
+      await writeFile(resolve(wikiDir, "raw/assets/secret.png"), "raw", "utf8");
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/public-topic.md",
+        { type: "topic", title: "Public Topic", visibility: "public", source_ids: [source.source_id] },
+        `# Public Topic
+
+[![raw][raw-ref]](https://example.test/source)
+
+[raw-ref]: ../../raw/assets/secret.png
+`,
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("lint_failed");
+      expectStableIssueRecords(payload.issues);
+      const rawLinkIssues = payload.issues.filter(
+        (issue) => issue.rule_id === "public_raw_link" && issue.path === "curated/topics/public-topic.md",
+      );
+      expect(rawLinkIssues).toHaveLength(1);
+      expect(issueByRuleAndPath(rawLinkIssues, "public_raw_link", "curated/topics/public-topic.md")).toMatchObject({
+        severity: "error",
+        line: expect.any(Number),
+        message: expect.stringContaining("![raw][raw-ref]"),
+        fixable: false,
+      });
+    });
+  });
+
+  it("fails public strict lint for reference-style raw images nested inside outer reference links", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-linked-reference-image-raw-link-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      await mkdir(resolve(wikiDir, "raw/assets"), { recursive: true });
+      await writeFile(resolve(wikiDir, "raw/assets/secret.png"), "raw", "utf8");
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/public-topic.md",
+        { type: "topic", title: "Public Topic", visibility: "public", source_ids: [source.source_id] },
+        `# Public Topic
+
+[![raw][raw-ref]][outer]
+
+[raw-ref]: ../../raw/assets/secret.png
+[outer]: https://example.test/source
+`,
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("lint_failed");
+      expectStableIssueRecords(payload.issues);
+      expect(issueByRuleAndPath(payload.issues, "public_raw_link", "curated/topics/public-topic.md")).toMatchObject({
+        severity: "error",
+        line: expect.any(Number),
+        message: expect.stringContaining("![raw][raw-ref]"),
+        fixable: false,
+      });
+    });
+  });
+
+  it("fails public strict lint for shortcut raw images nested inside outer reference links", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-linked-shortcut-image-raw-link-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      await mkdir(resolve(wikiDir, "raw/assets"), { recursive: true });
+      await writeFile(resolve(wikiDir, "raw/assets/secret.png"), "raw", "utf8");
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/public-topic.md",
+        { type: "topic", title: "Public Topic", visibility: "public", source_ids: [source.source_id] },
+        `# Public Topic
+
+[![raw]][outer]
+
+[raw]: ../../raw/assets/secret.png
+[outer]: https://example.test/source
+`,
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("lint_failed");
+      expectStableIssueRecords(payload.issues);
+      expect(issueByRuleAndPath(payload.issues, "public_raw_link", "curated/topics/public-topic.md")).toMatchObject({
+        severity: "error",
+        line: expect.any(Number),
+        message: expect.stringContaining("![raw]"),
+        fixable: false,
+      });
+    });
+  });
+
+  it("fails public strict lint for shortcut raw images nested inside bracketed shortcut labels", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-bracketed-shortcut-image-raw-link-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      await mkdir(resolve(wikiDir, "raw/assets"), { recursive: true });
+      await writeFile(resolve(wikiDir, "raw/assets/secret.png"), "raw", "utf8");
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/public-topic.md",
+        { type: "topic", title: "Public Topic", visibility: "public", source_ids: [source.source_id] },
+        `# Public Topic
+
+[![raw]]
+
+[raw]: ../../raw/assets/secret.png
+`,
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("lint_failed");
+      expectStableIssueRecords(payload.issues);
+      const rawLinkIssues = payload.issues.filter(
+        (issue) => issue.rule_id === "public_raw_link" && issue.path === "curated/topics/public-topic.md",
+      );
+      expect(rawLinkIssues).toHaveLength(1);
+      expect(issueByRuleAndPath(rawLinkIssues, "public_raw_link", "curated/topics/public-topic.md")).toMatchObject({
+        severity: "error",
+        line: expect.any(Number),
+        message: expect.stringContaining("![raw]"),
+        fixable: false,
+      });
+    });
+  });
+
   it("fails public strict lint for percent-encoded slash Markdown links to raw originals", async () => {
     await withTempWorkspace("llm-wiki-lint-public-encoded-slash-raw-link-", async (workspaceDir) => {
       // Arrange
@@ -2377,6 +2649,43 @@ Links to [raw entity](${encodedRawTarget}), [private entity](..&sol;private&sol;
     });
   });
 
+  it("fails public strict lint for namespaced raw HTML resource links", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-html-namespaced-raw-link-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      const rawTarget = `../../${source.original_path}`;
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/public-topic.md",
+        { type: "topic", title: "Public Topic", visibility: "public", source_ids: [source.source_id] },
+        `# Public Topic
+
+<svg>
+  <use xlink:href="${rawTarget}"></use>
+</svg>
+`,
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("lint_failed");
+      expectStableIssueRecords(payload.issues);
+      expect(issueByRuleAndPath(payload.issues, "public_raw_link", "curated/topics/public-topic.md")).toMatchObject({
+        severity: "error",
+        line: expect.any(Number),
+        message: expect.stringContaining(`xlink:href="${rawTarget}"`),
+        fixable: false,
+      });
+    });
+  });
+
   it("fails public strict lint for raw HTML srcset candidates", async () => {
     await withTempWorkspace("llm-wiki-lint-public-html-srcset-raw-link-", async (workspaceDir) => {
       // Arrange
@@ -2453,6 +2762,51 @@ Links to [raw entity](${encodedRawTarget}), [private entity](..&sol;private&sol;
         expect.arrayContaining([
           expect.stringContaining(`poster="${rawTarget}"`),
           expect.stringContaining(`data="${rawTarget}"`),
+        ]),
+      );
+    });
+  });
+
+  it("fails public strict lint for raw HTML data-* resource links", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-html-data-attr-raw-link-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      const rawTarget = `../../${source.original_path}`;
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/public-topic.md",
+        { type: "topic", title: "Public Topic", visibility: "public", source_ids: [source.source_id] },
+        `# Public Topic
+
+<div data-url="${rawTarget}" data-src='${rawTarget}'></div>
+<a data-href="${rawTarget}">raw original</a>
+<img data-srcset="safe.png 1x, ${rawTarget} 2x" alt="raw original">
+<img data-lazy-srcset="https://cdn.example/safe.png 1x, ${rawTarget} 2x" alt="raw original">
+`,
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("lint_failed");
+      expectStableIssueRecords(payload.issues);
+      const rawLinkIssues = payload.issues.filter(
+        (issue) => issue.rule_id === "public_raw_link" && issue.path === "curated/topics/public-topic.md",
+      );
+      expect(rawLinkIssues).toHaveLength(5);
+      expect(rawLinkIssues.map((issue) => issue.message)).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining(`data-url="${rawTarget}"`),
+          expect.stringContaining(`data-src='${rawTarget}'`),
+          expect.stringContaining(`data-href="${rawTarget}"`),
+          expect.stringContaining(`data-srcset="safe.png 1x, ${rawTarget} 2x"`),
+          expect.stringContaining(`data-lazy-srcset="https://cdn.example/safe.png 1x, ${rawTarget} 2x"`),
         ]),
       );
     });
@@ -3512,6 +3866,52 @@ safety:
       expect(fixedIndex).not.toContain(`| Research Note | queued | ${summaryLink} | |`);
       expect(fixedIndex).not.toContain(source.source_card_path);
       expect(fixedIndex).not.toContain("../raw/");
+    });
+  });
+
+  it("removes stale excluded source-summary rows from public indexes", async () => {
+    await withTempWorkspace("llm-wiki-lint-fix-stale-public-summary-index-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      await writeCuratedPage(
+        wikiDir,
+        `curated/sources/${source.source_id}.md`,
+        { type: "source_summary", title: "Research Note Summary", visibility: "public", source_ids: [source.source_id] },
+        "# Research Note Summary\n\nReviewed public summary.\n",
+      );
+      const summaryLink = `[[sources/${source.source_id}|Research Note Summary]]`;
+      const indexBefore = await readGeneratedFile(wikiDir, "curated/index.md");
+      const staleIndex = indexBefore
+        .replace(/^visibility: private$/m, "visibility: public")
+        .replace("|---|---|---|---|\n", `|---|---|---|---|\n| ${summaryLink} | | | |\n`);
+      await writeFile(resolve(wikiDir, "curated/index.md"), staleIndex, "utf8");
+
+      // Act
+      const staleResult = await runCliBuffered(["lint", "--repo", wikiDir, "--json"]);
+      const stalePayload = parseLintSuccess(staleResult.stdout);
+      const fixResult = await runCliBuffered(["lint", "--repo", wikiDir, "--fix", "--json"]);
+      const fixPayload = parseLintSuccess(fixResult.stdout);
+      const secondResult = await runCliBuffered(["lint", "--repo", wikiDir, "--json"]);
+      const secondPayload = parseLintSuccess(secondResult.stdout);
+
+      // Assert
+      expect(staleResult.exitCode).toBe(0);
+      expect(issueByRuleAndPath(stalePayload.data.issues, "index_stale", "curated/index.md")).toMatchObject({
+        severity: "warning",
+        fixable: true,
+      });
+      expect(fixResult.exitCode).toBe(0);
+      expect(fixPayload.data.fixed_paths).toEqual(["curated/index.md"]);
+      const fixedIndex = await readGeneratedFile(wikiDir, "curated/index.md");
+      expect(fixedIndex).toMatch(/^visibility: public$/m);
+      expect(fixedIndex).not.toContain(summaryLink);
+      expect(fixedIndex).not.toContain("| Research Note Summary |");
+      expect(fixedIndex).not.toContain(source.source_card_path);
+      expect(fixedIndex).not.toContain("../raw/");
+      expect(secondResult.exitCode).toBe(0);
+      expect(secondPayload.data.issues.map((issue) => issue.rule_id)).not.toContain("index_stale");
     });
   });
 

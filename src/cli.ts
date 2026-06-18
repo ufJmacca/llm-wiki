@@ -12,6 +12,7 @@ import { registerInitCommand } from "./commands/init.js";
 import { registerLintCommand } from "./commands/lint.js";
 import { registerLogCommand } from "./commands/log.js";
 import { registerQueueCommand } from "./commands/queue.js";
+import { registerSnapshotCommand } from "./commands/snapshot.js";
 import { registerStatusCommand } from "./commands/status.js";
 
 export type CliIo = {
@@ -76,6 +77,7 @@ function createProgram(io: CliIo): Command {
   registerQueueCommand(program, io);
   registerLogCommand(program, io);
   registerStatusCommand(program, io);
+  registerSnapshotCommand(program, io);
 
   return program;
 }

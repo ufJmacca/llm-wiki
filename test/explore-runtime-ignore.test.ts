@@ -59,6 +59,15 @@ function isExitCode(error: unknown, code: number): boolean {
   );
 }
 
+function restoreEnvValue(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+    return;
+  }
+
+  process.env[key] = value;
+}
+
 describe("explore runtime ignore rules", () => {
   it("repairs nested Quartz ignore negations that expose the copied runtime tree", async () => {
     await withTempWorkspace("llm-wiki-explore-runtime-ignore-", async (workspaceDir) => {
@@ -76,6 +85,50 @@ describe("explore runtime ignore rules", () => {
       const quartzGitignore = await readFile(resolve(wikiDir, "quartz/.gitignore"), "utf8");
 
       // Assert
+      expect(result.exitCode).toBe(0);
+      expect(payload.warnings).toEqual(
+        expect.arrayContaining(["Repaired nested generated Quartz runtime ignore rule: quartz/.gitignore"]),
+      );
+      expect(quartzGitignore.trimEnd().endsWith("quartz/")).toBe(true);
+      expect(await gitIgnoresPath(wikiDir, "quartz/quartz/build.ts")).toBe(true);
+    });
+  });
+
+  it("repairs copied runtime ignores when inherited Git environment points at another worktree", async () => {
+    await withTempWorkspace("llm-wiki-explore-runtime-ignore-env-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const originalGitEnv = {
+        GIT_DIR: process.env.GIT_DIR,
+        GIT_WORK_TREE: process.env.GIT_WORK_TREE,
+        GIT_INDEX_FILE: process.env.GIT_INDEX_FILE,
+      };
+      await execFileAsync("git", ["init"], { cwd: workspaceDir });
+      await writeFile(resolve(workspaceDir, ".gitignore"), "quartz/quartz/\n", "utf8");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz"), { recursive: true });
+      await writeFile(resolve(wikiDir, "quartz/.gitignore"), "!quartz/\n!quartz/**\n", "utf8");
+      expect(await gitIgnoresPath(wikiDir, "quartz/quartz/build.ts")).toBe(false);
+
+      let result!: Awaited<ReturnType<typeof runCliBuffered>>;
+      let payload!: { warnings: string[] };
+      try {
+        process.env.GIT_DIR = resolve(workspaceDir, ".git");
+        process.env.GIT_WORK_TREE = workspaceDir;
+        process.env.GIT_INDEX_FILE = resolve(workspaceDir, "inherited.index");
+
+        // Act
+        result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+        payload = JSON.parse(result.stdout[0] ?? "{}") as { warnings: string[] };
+      } finally {
+        restoreEnvValue("GIT_DIR", originalGitEnv.GIT_DIR);
+        restoreEnvValue("GIT_WORK_TREE", originalGitEnv.GIT_WORK_TREE);
+        restoreEnvValue("GIT_INDEX_FILE", originalGitEnv.GIT_INDEX_FILE);
+      }
+
+      // Assert
+      const quartzGitignore = await readFile(resolve(wikiDir, "quartz/.gitignore"), "utf8");
       expect(result.exitCode).toBe(0);
       expect(payload.warnings).toEqual(
         expect.arrayContaining(["Repaired nested generated Quartz runtime ignore rule: quartz/.gitignore"]),

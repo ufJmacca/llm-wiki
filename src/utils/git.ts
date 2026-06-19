@@ -184,7 +184,7 @@ async function runGit(
   }
 }
 
-function gitCommandEnv(extraEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+export function gitCommandEnv(extraEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env = { ...process.env };
 
   for (const key of REPOSITORY_SCOPING_GIT_ENV) {

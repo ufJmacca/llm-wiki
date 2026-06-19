@@ -2,7 +2,7 @@
 
 `llm-wiki` is a local-first CLI for creating a Git-backed, Obsidian-compatible Markdown wiki that can later grow into the full LLM Wiki workflow described in the PRD.
 
-The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, `llm-wiki add-url`, and the local upload daemon capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki log`, `llm-wiki lint`, `llm-wiki index rebuild`, `llm-wiki search`, `llm-wiki nav`, `llm-wiki explore init/sync/serve/open/build`, and `llm-wiki deploy github-pages` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
+The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, `llm-wiki add-url`, and the local upload daemon capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki log`, `llm-wiki lint`, `llm-wiki index rebuild`, `llm-wiki search`, `llm-wiki nav`, `llm-wiki explore init/sync/serve/open/build`, `llm-wiki deploy github-pages`, and `llm-wiki upload init --target github` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
 
 ## Development
 
@@ -30,7 +30,9 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/commands/search.ts` and `src/commands/nav.ts` own offline search and Markdown graph/navigation command behavior.
 - `src/commands/explore.ts` owns Quartz Explorer runtime initialization and profile sync commands.
 - `src/commands/deploy.ts` owns deploy command routing for GitHub Pages.
+- `src/commands/upload.ts` owns remote upload scaffold command routing.
 - `src/deploy/` owns generated deploy workflows, deploy profiles, and local deploy preflight checks.
+- `src/uploadScaffold/` owns generated remote upload backend templates, docs, and form configuration.
 - `src/sourceCapture/` owns deterministic source IDs, hashing, metadata, duplicate detection, and raw writes.
 - `src/daemon/` owns the local multipart upload API and optional upload commit hook.
 - `src/scanner/` normalizes repository Markdown, queue, profile, raw, and log state for lint and cache rebuild workflows.
@@ -81,6 +83,7 @@ llm-wiki deploy github-pages init
 llm-wiki deploy github-pages check
 llm-wiki deploy github-pages build-local
 llm-wiki deploy github-pages status
+llm-wiki upload init --target github
 llm-wiki daemon
 git status
 ```
@@ -122,6 +125,7 @@ llm-wiki deploy github-pages init --repo my-wiki --custom-domain docs.example.co
 llm-wiki deploy github-pages check --repo my-wiki --json
 llm-wiki deploy github-pages build-local --repo my-wiki --json
 llm-wiki deploy github-pages status --repo my-wiki --json
+llm-wiki upload init --target github --repo my-wiki --json
 llm-wiki daemon --repo my-wiki --json
 ```
 
@@ -129,7 +133,7 @@ llm-wiki daemon --repo my-wiki --json
 - `--json` prints stable envelopes shaped as `{ ok, command, repo, data, warnings }` on success or `{ ok, command, repo, error, issues }` on failure.
 - `--quiet` suppresses human success output only. Human errors and JSON output are still printed.
 
-`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add`, `add-text`, `add-url`, and upload API responses return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. `explore init` writes isolated Quartz runtime files, `explore sync` materializes profile-selected Markdown into generated Quartz content, `explore serve` starts the local Quartz script after sync, `explore open` prints the recorded local URL, `explore build` runs public sync, strict public lint, and the Quartz build script, `daemon` starts the local upload API, and `deploy github-pages` generates the Pages workflow/profile pair, validates deploy readiness, and runs the local preflight sequence that mirrors CI. Full health reporting is deferred to the status slice.
+`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add`, `add-text`, `add-url`, and upload API responses return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. `explore init` writes isolated Quartz runtime files, `explore sync` materializes profile-selected Markdown into generated Quartz content, `explore serve` starts the local Quartz script after sync, `explore open` prints the recorded local URL, `explore build` runs public sync, strict public lint, and the Quartz build script, `daemon` starts the local upload API, `deploy github-pages` generates the Pages workflow/profile pair, validates deploy readiness, and runs the local preflight sequence that mirrors CI, and `upload init --target github` generates a remote upload scaffold without implementing a hosted service. Full health reporting is deferred to the status slice.
 
 ## Quartz Explorer
 
@@ -200,6 +204,12 @@ Every upload request must also set the `x-llm-wiki-upload-token` header to the p
 Successful responses return `{ ok: true, data }` where `data` includes `status`, `source_id`, `source_kind`, `queue_path`, `source_card_path`, `original_path`, `created_paths`, and `commit`. Duplicate uploads return `status: duplicate` with the existing source paths and no new created paths. The daemon does not serve raw originals or static repository files; public Explorer profiles still exclude raw source cards and raw originals.
 
 Uploads are not committed by default. Pass `--commit-uploads` to `llm-wiki daemon` or `llm-wiki explore serve --with-daemon` to run an explicit Git add/commit after successful new uploads. Git failures are returned as upload errors instead of being hidden.
+
+## Remote Upload Scaffold
+
+`llm-wiki upload init --target github` generates a remote upload scaffold for a future authenticated backend. It does not start or deploy a hosted service. The generated files include `.llm-wiki/upload/github.yml`, `.llm-wiki/upload/forms/remote-github.json`, `docs/remote-upload-github.md`, and `upload/github/serverless/**` templates.
+
+The scaffold is private and PR-first by default: authentication hooks are required, rate limiting is enabled, file size and type limits are documented in generated config, secrets are represented only as environment variables, and uploaded content is described as queued private raw input that must enter the wiki through a GitHub pull request rather than a direct commit or publication path.
 
 ## Queue and Log
 

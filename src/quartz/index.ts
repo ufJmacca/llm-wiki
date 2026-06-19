@@ -19,6 +19,7 @@ import {
   type ExploreProfileName,
   type WikiProfile,
 } from "../profiles/index.js";
+import { gitCommandEnv } from "../utils/git.js";
 import { validateTextFileWriteInsideRoot, writeTextFileInsideRoot, type ScaffoldEntry } from "../utils/fs.js";
 
 export type QuartzInstallResult = {
@@ -253,10 +254,6 @@ export async function syncQuartzContent(
 
   const publicLike = isPublicLikeProfile(profileName);
   const preserveContentRoot = options.preserveContentRoot === true;
-  if (publicLike && !preserveContentRoot) {
-    await clearQuartzContent(repoRoot);
-    await removeQuartzManifests(repoRoot);
-  }
 
   const scan = await scanWikiRepository(repoRoot);
   const profileResult = await readWikiProfile(repoRoot, profileName);
@@ -277,6 +274,10 @@ export async function syncQuartzContent(
   const warnings = await ensureQuartzContentIgnored(repoRoot);
   if (publicLike) {
     await assertPublicSyncIsSafe(repoRoot, scan, profile, selection.markdown, selection.matchedMarkdown);
+    if (!preserveContentRoot) {
+      await clearQuartzContent(repoRoot);
+      await removeQuartzManifests(repoRoot);
+    }
   } else if (!preserveContentRoot) {
     await clearQuartzContent(repoRoot);
     await removeQuartzManifests(repoRoot);
@@ -1688,7 +1689,7 @@ async function gitCheckIgnore(repoRoot: string, path: string): Promise<boolean |
   }
 
   return new Promise((resolveCheck, rejectCheck) => {
-    execFile("git", ["check-ignore", "-q", "--", path], { cwd: repoRoot }, (error) => {
+    execFile("git", ["check-ignore", "-q", "--", path], { cwd: repoRoot, env: gitCommandEnv() }, (error) => {
       if (!error) {
         resolveCheck(true);
         return;
@@ -1713,7 +1714,7 @@ async function gitCheckIgnore(repoRoot: string, path: string): Promise<boolean |
 
 async function isGitWorkTree(repoRoot: string): Promise<boolean> {
   return new Promise((resolveCheck, rejectCheck) => {
-    execFile("git", ["rev-parse", "--is-inside-work-tree"], { cwd: repoRoot }, (error, stdout = "") => {
+    execFile("git", ["rev-parse", "--is-inside-work-tree"], { cwd: repoRoot, env: gitCommandEnv() }, (error, stdout = "") => {
       if (!error) {
         resolveCheck(stdout.trim() === "true");
         return;
@@ -1847,7 +1848,7 @@ async function runNpmInstall(repoRoot: string): Promise<QuartzInstallResult> {
   const cwd = resolve(repoRoot, "quartz");
 
   return new Promise((resolveInstall, rejectInstall) => {
-    execFile("npm", ["install"], { cwd }, (error, stdout = "", stderr = "") => {
+    execFile(npmCommand(), ["install"], { cwd }, (error, stdout = "", stderr = "") => {
       if (error) {
         rejectInstall(
           new QuartzOperationError({
@@ -1870,6 +1871,10 @@ async function runNpmInstall(repoRoot: string): Promise<QuartzInstallResult> {
       });
     });
   });
+}
+
+function npmCommand(): "npm" | "npm.cmd" {
+  return process.platform === "win32" ? "npm.cmd" : "npm";
 }
 
 function quartzRuntimeEntries(): ScaffoldEntry[] {

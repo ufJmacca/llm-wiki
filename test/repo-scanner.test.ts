@@ -65,4 +65,26 @@ describe("repository scanner", () => {
       expect(scan.profiles).toEqual([]);
     });
   });
+
+  it("skips node_modules directories below generated scaffold paths", async () => {
+    await withTempWorkspace("llm-wiki-repo-scan-nested-node-modules-", async (workspaceDir) => {
+      await mkdir(resolve(workspaceDir, "curated/topics"), { recursive: true });
+      await mkdir(resolve(workspaceDir, "upload/github/serverless/node_modules/example-package"), { recursive: true });
+      await writeFile(
+        resolve(workspaceDir, "curated/topics/live-page.md"),
+        "---\ntype: topic\ntitle: Live Page\nvisibility: private\nsource_ids: []\n---\n\n# Live Page\n",
+        "utf8",
+      );
+      await writeFile(
+        resolve(workspaceDir, "upload/github/serverless/node_modules/example-package/README.md"),
+        "# Dependency README\n\nThis dependency Markdown must not be scanned as wiki content.\n",
+        "utf8",
+      );
+
+      const scan = await scanWikiRepository(workspaceDir);
+
+      expect(scan.files.map((file) => file.path)).toEqual(["curated/topics/live-page.md"]);
+      expect(scan.markdown.map((file) => file.path)).toEqual(["curated/topics/live-page.md"]);
+    });
+  });
 });

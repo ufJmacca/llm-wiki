@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "node:child_process";
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { runCli } from "../src/cli.js";
 import { parseInitJson, readGeneratedFile, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
@@ -16,6 +16,11 @@ const childProcessMocks = vi.hoisted(() => ({
 }));
 const execFileMock = childProcessMocks.execFile;
 const spawnMock = childProcessMocks.spawn;
+const originalGitEnv = {
+  GIT_DIR: process.env.GIT_DIR,
+  GIT_WORK_TREE: process.env.GIT_WORK_TREE,
+  GIT_INDEX_FILE: process.env.GIT_INDEX_FILE,
+};
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -196,6 +201,33 @@ function uploadCommitGitCalls(): unknown[][] {
   });
 }
 
+function setInheritedGitEnv(workspaceDir: string): void {
+  process.env.GIT_DIR = resolve(workspaceDir, "inherited.git");
+  process.env.GIT_WORK_TREE = resolve(workspaceDir, "inherited-work-tree");
+  process.env.GIT_INDEX_FILE = resolve(workspaceDir, "inherited.index");
+}
+
+function restoreEnvValue(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+    return;
+  }
+
+  process.env[key] = value;
+}
+
+function expectScrubbedGitOptions(options: unknown, cwd: string): void {
+  expect(options).toMatchObject({
+    cwd,
+    env: expect.any(Object),
+  });
+
+  const env = (options as { env: NodeJS.ProcessEnv }).env;
+  expect(env).not.toHaveProperty("GIT_DIR");
+  expect(env).not.toHaveProperty("GIT_WORK_TREE");
+  expect(env).not.toHaveProperty("GIT_INDEX_FILE");
+}
+
 async function waitFor<T>(
   read: () => Promise<T>,
   matches: (value: T) => boolean,
@@ -225,6 +257,12 @@ describe("explore serve local upload daemon integration", () => {
   beforeEach(() => {
     execFileMock.mockReset();
     spawnMock.mockReset();
+  });
+
+  afterEach(() => {
+    restoreEnvValue("GIT_DIR", originalGitEnv.GIT_DIR);
+    restoreEnvValue("GIT_WORK_TREE", originalGitEnv.GIT_WORK_TREE);
+    restoreEnvValue("GIT_INDEX_FILE", originalGitEnv.GIT_INDEX_FILE);
   });
 
   it("starts a localhost upload daemon when requested and closes it with the Explorer process", async () => {
@@ -334,6 +372,7 @@ describe("explore serve local upload daemon integration", () => {
       await initializeWiki(wikiDir);
       await initializeQuartzRuntime(wikiDir);
       await markQuartzDependenciesInstalled(wikiDir);
+      setInheritedGitEnv(workspaceDir);
 
       // Act
       const serveResult = runCli([
@@ -409,8 +448,14 @@ describe("explore serve local upload daemon integration", () => {
       expect(commitCalls).toHaveLength(2);
       expect(commitCalls[0]).toEqual([
         "git",
-        expect.arrayContaining(["add", "--", upload.data.original_path, upload.data.source_card_path, upload.data.queue_path]),
-        { cwd: wikiDir },
+        expect.arrayContaining([
+          "add",
+          "--",
+          upload.data.original_path,
+          upload.data.source_card_path,
+          upload.data.queue_path,
+        ]),
+        expect.any(Object),
         expect.any(Function),
       ]);
       expect(commitCalls[1]).toEqual([
@@ -424,9 +469,11 @@ describe("explore serve local upload daemon integration", () => {
           upload.data.source_card_path,
           upload.data.queue_path,
         ]),
-        { cwd: wikiDir },
+        expect.any(Object),
         expect.any(Function),
       ]);
+      expectScrubbedGitOptions(commitCalls[0]?.[2], wikiDir);
+      expectScrubbedGitOptions(commitCalls[1]?.[2], wikiDir);
 
       quartz.close();
       await expect(serveResult).resolves.toBe(0);

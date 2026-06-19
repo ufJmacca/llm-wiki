@@ -429,7 +429,12 @@ export const defaultContentPageLayout = {
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toEqual([]);
       expect(execFile).toHaveBeenCalledTimes(1);
-      expect(execFile).toHaveBeenCalledWith("npm", ["install"], { cwd: resolve(wikiDir, "quartz") }, expect.any(Function));
+      expect(execFile).toHaveBeenCalledWith(
+        process.platform === "win32" ? "npm.cmd" : "npm",
+        ["install"],
+        { cwd: resolve(wikiDir, "quartz") },
+        expect.any(Function),
+      );
       expect(payload.data.install).toEqual({
         attempted: true,
         ok: true,

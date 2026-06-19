@@ -18,6 +18,7 @@ import { registerNavCommand } from "./commands/nav.js";
 import { registerQueueCommand } from "./commands/queue.js";
 import { registerSearchCommand } from "./commands/search.js";
 import { registerStatusCommand } from "./commands/status.js";
+import { registerUploadCommand } from "./commands/upload.js";
 
 export type CliIo = {
   stdout: (message: string) => void;
@@ -86,6 +87,7 @@ function createProgram(io: CliIo): Command {
   registerStatusCommand(program, io);
   registerSearchCommand(program, io);
   registerNavCommand(program, io);
+  registerUploadCommand(program, io);
 
   return program;
 }

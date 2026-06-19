@@ -953,7 +953,7 @@ visibility: private
       await mkdir(resolve(wikiDir, "curated/topics/node_modules"), { recursive: true });
       await writeFile(
         resolve(wikiDir, "curated/topics/node_modules/no-frontmatter.md"),
-        "# Node Modules Directory Page\n\nThis page should still be scanned.\n",
+        "# Node Modules Directory Page\n\nThis dependency-shaped path should be skipped.\n",
         "utf8",
       );
       await writeFile(
@@ -1009,10 +1009,9 @@ visibility: private
         severity: "error",
         fixable: false,
       });
-      expect(issueByRuleAndPath(payload.issues, "curated_frontmatter_missing", "curated/topics/node_modules/no-frontmatter.md")).toMatchObject({
-        severity: "error",
-        fixable: false,
-      });
+      expect(payload.issues.some((issue) => issue.path === "curated/topics/node_modules/no-frontmatter.md")).toBe(
+        false,
+      );
       expect(issueByRuleAndPath(payload.issues, "frontmatter_malformed", "curated/topics/malformed-frontmatter.md")).toMatchObject({
         severity: "error",
         path: "curated/topics/malformed-frontmatter.md",
@@ -1190,6 +1189,31 @@ visibility: private
       expect(issueByRuleAndPath(payload.issues, "profile_missing", ".llm-wiki/profiles/public.yml")).toMatchObject({
         severity: "error",
         message: expect.stringContaining("public"),
+        fixable: false,
+      });
+    });
+  });
+
+  it("reports duplicate requested profile files during strict lint", async () => {
+    await withTempWorkspace("llm-wiki-lint-profile-duplicate-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const publicProfile = await readFile(resolve(wikiDir, ".llm-wiki/profiles/public.yml"), "utf8");
+      await writeFile(resolve(wikiDir, ".llm-wiki/profiles/public.yaml"), publicProfile, "utf8");
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expectStableIssueRecords(payload.issues);
+      expect(issueByRuleAndPath(payload.issues, "profile_duplicate", ".llm-wiki/profiles/public.yml")).toMatchObject({
+        severity: "error",
+        message: "Duplicate profile files found for public: .llm-wiki/profiles/public.yml, .llm-wiki/profiles/public.yaml.",
+        fix_hint: "Keep exactly one profile file for each name; remove either the .yml or .yaml variant before syncing Quartz content.",
         fixable: false,
       });
     });
@@ -1912,6 +1936,61 @@ safety:
         line: expect.any(Number),
         fixable: false,
       });
+    });
+  });
+
+  it("ignores escaped Markdown link openers during public strict lint", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-escaped-markdown-opener-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      await writeFile(
+        resolve(wikiDir, ".llm-wiki/profiles/public.yml"),
+        `name: public
+mode: deploy
+include:
+  - curated/public-literals.md
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+safety:
+  fail_on_private_pages: true
+  fail_on_private_links: true
+  fail_on_raw_links: true
+`,
+        "utf8",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/public-literals.md",
+        { type: "page", title: "Public Literals", visibility: "public", source_ids: [source.source_id] },
+        `# Public Literals
+
+Literal syntax: \\[raw original](../${source.original_path}) and \\[private](private/hidden.md).
+`,
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintSuccess(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.issues).not.toContainEqual(
+        expect.objectContaining({
+          rule_id: "public_raw_link",
+          path: "curated/public-literals.md",
+        }),
+      );
+      expect(payload.data.issues).not.toContainEqual(
+        expect.objectContaining({
+          rule_id: "public_private_link",
+          path: "curated/public-literals.md",
+        }),
+      );
     });
   });
 
@@ -3438,6 +3517,60 @@ safety:
     });
   });
 
+  it("does not match public index table headers as raw source-card metadata leaks", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-index-header-source-title-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await captureSource(wikiDir, workspaceDir, "Source", "# Source\n\nPrivate raw note.\n");
+      await captureSource(wikiDir, workspaceDir, "Status", "# Status\n\nPrivate raw note.\n");
+      await writeFile(
+        resolve(wikiDir, ".llm-wiki/profiles/public.yml"),
+        `name: public
+mode: deploy
+include:
+  - curated/index.md
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+safety:
+  fail_on_private_pages: true
+  fail_on_private_links: true
+  fail_on_raw_links: true
+  fail_on_public_graph_private_nodes: true
+  fail_on_public_search_private_text: true
+`,
+        "utf8",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/index.md",
+        { type: "index", title: "Index", visibility: "public", source_ids: [] },
+        `# Index
+
+## Sources
+
+| Source | Status | Summary | Key pages |
+|---|---|---|---|
+`,
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintSuccess(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.issues).not.toContainEqual(
+        expect.objectContaining({
+          rule_id: "public_raw_source_metadata_leak",
+        }),
+      );
+    });
+  });
+
   it("filters private curated pages out of deterministic public index fixes", async () => {
     await withTempWorkspace("llm-wiki-lint-fix-public-index-private-pages-", async (workspaceDir) => {
       // Arrange
@@ -3475,7 +3608,7 @@ safety:
     });
   });
 
-  it("does not add excluded source summaries to public indexes", async () => {
+  it("omits reviewed public source summaries from public index rows excluded by default public profile", async () => {
     await withTempWorkspace("llm-wiki-lint-fix-public-summary-index-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
@@ -3508,10 +3641,12 @@ safety:
       const summaryLink = `[[sources/${source.source_id}|Research Note Summary]]`;
       expect(fixedIndex).toContain("[[topics/public-page|Public Page]]");
       expect(fixedIndex).not.toContain(summaryLink);
-      expect(fixedIndex).not.toContain("Research Note Summary");
       expect(fixedIndex).not.toContain(`| Research Note | queued | ${summaryLink} | |`);
       expect(fixedIndex).not.toContain(source.source_card_path);
       expect(fixedIndex).not.toContain("../raw/");
+      const syncResult = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "public", "--json"]);
+      expect(syncResult.exitCode).toBe(0);
+      expect(syncResult.stderr).toEqual([]);
     });
   });
 
@@ -3589,6 +3724,57 @@ safety:
       expect(fixedIndex).not.toContain(`| [[../${source.source_card_path}|Research Note]] | queued |  | |`);
       expect(secondResult.exitCode).toBe(0);
       expect(secondPayload.data.issues.map((issue) => issue.rule_id)).not.toContain("index_stale");
+    });
+  });
+
+  it("fixes stale generated index rows and links when entries are removed", async () => {
+    await withTempWorkspace("llm-wiki-lint-fix-extra-index-entries-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/removed-page.md",
+        { type: "topic", title: "Removed Page", visibility: "private", source_ids: [source.source_id] },
+        "# Removed Page\n\nGrounded page.\n",
+      );
+      const initialFixResult = await runCliBuffered(["lint", "--repo", wikiDir, "--fix", "--json"]);
+      expect(initialFixResult.exitCode).toBe(0);
+      await rm(resolve(wikiDir, "curated/topics/removed-page.md"));
+
+      const staleSourceRow =
+        "| [[../raw/inputs/2026/06/src_2026_06_17_removed_deadbeef/_source.md|Removed Source]] | queued |  | |";
+      const indexWithRemovedPage = await readGeneratedFile(wikiDir, "curated/index.md");
+      await writeFile(
+        resolve(wikiDir, "curated/index.md"),
+        indexWithRemovedPage.replace("|---|---|---|---|\n", `|---|---|---|---|\n${staleSourceRow}\n`),
+        "utf8",
+      );
+
+      // Act
+      const staleResult = await runCliBuffered(["lint", "--repo", wikiDir, "--json"]);
+      const stalePayload = parseLintFailure(staleResult.stdout);
+      const fixResult = await runCliBuffered(["lint", "--repo", wikiDir, "--fix", "--json"]);
+      const fixPayload = parseLintSuccess(fixResult.stdout);
+      const secondResult = await runCliBuffered(["lint", "--repo", wikiDir, "--json"]);
+      const secondPayload = parseLintSuccess(secondResult.stdout);
+
+      // Assert
+      expect(staleResult.exitCode).toBe(1);
+      expect(issueByRuleAndPath(stalePayload.issues, "index_stale", "curated/index.md")).toMatchObject({
+        severity: "warning",
+        fixable: true,
+      });
+      expect(fixResult.exitCode).toBe(0);
+      expect(fixPayload.data.fixed_paths).toEqual(["curated/index.md"]);
+      const fixedIndex = await readGeneratedFile(wikiDir, "curated/index.md");
+      expect(fixedIndex).toContain(`| [[../${source.source_card_path}|Research Note]] | queued |  | |`);
+      expect(fixedIndex).not.toContain("[[topics/removed-page|Removed Page]]");
+      expect(fixedIndex).not.toContain("Removed Source");
+      expect(secondResult.exitCode).toBe(0);
+      expect(secondPayload.data.issues.map((issue) => issue.rule_id)).not.toContain("index_stale");
+      expect(secondPayload.data.issues.map((issue) => issue.rule_id)).not.toContain("wikilink_broken");
     });
   });
 
@@ -3731,6 +3917,51 @@ safety:
       expect(await readGeneratedFile(wikiDir, "curated/index.md")).toContain(`[[../${source.source_card_path}|Alpha \\| Beta]]`);
       expect(secondResult.exitCode).toBe(0);
       expect(secondPayload.data.issues).toEqual([]);
+    });
+  });
+
+  it("normalizes generated index labels with line breaks and control characters", async () => {
+    await withTempWorkspace("llm-wiki-lint-index-label-normalization-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const sourcePath = resolve(workspaceDir, "Source Weird.md");
+      await writeFile(sourcePath, "# Source Weird\n\nRaw observation.\n", "utf8");
+      const capture = await captureFileSource({
+        repoRoot: wikiDir,
+        sourcePath,
+        title: "Alpha\nBeta\t| Gamma",
+        now: new Date("2026-06-17T11:28:42.778Z"),
+        command: "llm-wiki add Source Weird.md --title Alpha Beta | Gamma",
+      });
+      expect(capture.ok).toBe(true);
+      if (!capture.ok) {
+        throw new Error(capture.error.message);
+      }
+      const source = capture.value.source;
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/weird-label.md",
+        { type: "topic", title: "Topic\nLabel\u0007 | One", visibility: "private", source_ids: [source.source_id] },
+        "# Topic Label\n\nGrounded page.\n",
+      );
+
+      // Act
+      const fixResult = await runCliBuffered(["lint", "--repo", wikiDir, "--fix", "--json"]);
+      const fixPayload = parseLintSuccess(fixResult.stdout);
+      const secondResult = await runCliBuffered(["lint", "--repo", wikiDir, "--json"]);
+      const secondPayload = parseLintSuccess(secondResult.stdout);
+
+      // Assert
+      expect(fixResult.exitCode).toBe(0);
+      expect(fixPayload.data.fixed_paths).toEqual(["curated/index.md"]);
+      const fixedIndex = await readGeneratedFile(wikiDir, "curated/index.md");
+      expect(fixedIndex).toContain(`[[../${source.source_card_path}|Alpha Beta \\| Gamma]]`);
+      expect(fixedIndex).toContain("[[topics/weird-label|Topic Label \\| One]]");
+      expect(fixedIndex).not.toContain("Alpha\nBeta");
+      expect(fixedIndex).not.toContain("\u0007");
+      expect(secondResult.exitCode).toBe(0);
+      expect(secondPayload.data.issues.map((issue) => issue.rule_id)).not.toContain("index_stale");
     });
   });
 });

@@ -104,8 +104,15 @@ function parseSourceCardFrontmatter<T>(content: string): T {
   return parse(frontmatter?.[1] ?? "") as T;
 }
 
-function mockFetchResponse(body: string, init: ResponseInit = {}): ReturnType<typeof vi.fn> {
-  const fetchMock = vi.fn(async () => new Response(body, init));
+function mockFetchResponse(body: string, init: ResponseInit = {}, responseUrl?: string): ReturnType<typeof vi.fn> {
+  const fetchMock = vi.fn(async () => {
+    const response = new Response(body, init);
+    if (responseUrl !== undefined) {
+      Object.defineProperty(response, "url", { value: responseUrl });
+    }
+
+    return response;
+  });
   globalThis.fetch = fetchMock as unknown as typeof fetch;
 
   return fetchMock;
@@ -266,6 +273,46 @@ describe("URL source capture", () => {
         origin: "url",
         origin_url: url,
       });
+    });
+  });
+
+  it("derives fallback metadata from the final fetched URL after redirects", async () => {
+    await withTempWorkspace("llm-wiki-add-url-redirect-title-", async (workspaceDir) => {
+      // Arrange
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(capturedAt));
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const url = "https://short.example.test/x";
+      const finalUrl = "https://docs.example.test/articles/final-article.md";
+      const content = "Redirected article body.\n";
+      const sourceId = expectedSourceId("final-article", content);
+      const fetchMock = mockFetchResponse(
+        content,
+        {
+          status: 200,
+          headers: { "content-type": "text/markdown" },
+        },
+        finalUrl,
+      );
+      await initializeWiki(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["add-url", url, "--repo", wikiDir, "--json"]);
+      const payload = parseJsonEnvelope<SourceCaptureData>(result.stdout);
+      const queueItem = JSON.parse(await readGeneratedFile(wikiDir, payload.data.source.queue_path)) as {
+        origin_url: string;
+      };
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(fetchMock).toHaveBeenCalledWith(url);
+      expect(payload.data.source).toMatchObject({
+        source_id: sourceId,
+        title: "final-article",
+        origin_url: finalUrl,
+      });
+      expect(queueItem.origin_url).toBe(finalUrl);
     });
   });
 

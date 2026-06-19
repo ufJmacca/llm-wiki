@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { lstat, open, readdir, realpath, rm, rmdir } from "node:fs/promises";
-import { basename, extname, isAbsolute, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, relative, resolve } from "node:path";
 
 import { stringify } from "yaml";
 
 import { appendRuntimeLogEntry, validateRuntimeLogAppendTarget } from "../runtime/log.js";
+import { scanMarkdownDocument } from "../scanner/index.js";
 import {
   validateBinaryFileNoOverwriteInsideRoot,
   writeBinaryFileNoOverwriteInsideRoot,
@@ -117,6 +118,11 @@ type CaptureInput = {
   command: string;
 };
 
+type FetchedUrlText = {
+  url: string;
+  text: string;
+};
+
 type QueueJson = {
   kind: SourceKind;
   source_id: string;
@@ -130,6 +136,18 @@ type QueueJson = {
   visibility: "private";
   path: string;
   original_path: string;
+};
+
+type SourceCardDuplicateMetadata = {
+  source_id: string;
+  title: string;
+  source_kind: SourceKind;
+  origin: string;
+  origin_url?: string | null;
+  captured_at: string;
+  content_hash: string;
+  status: QueueStatus;
+  visibility: "private";
 };
 
 export async function captureFileSource(
@@ -242,15 +260,15 @@ export async function prepareUrlSource(
     return fetched;
   }
 
-  const title = normalizeTitle(options.title, deriveUrlTitle(normalizedUrl.value));
+  const title = normalizeTitle(options.title, deriveUrlTitle(fetched.value.url));
   if (!title.ok) {
     return title;
   }
 
   return ok({
-    url: normalizedUrl.value,
+    url: fetched.value.url,
     title: title.value,
-    text: fetched.value,
+    text: fetched.value.text,
   });
 }
 
@@ -508,17 +526,18 @@ async function findDuplicateSource(
   contentHash: string,
 ): Promise<Result<CapturedSource | null, SourceCaptureError>> {
   const queueDir = resolve(repoRoot, "raw", "queue");
-  let queueFiles: string[];
+  let queueFiles: string[] = [];
   let repoRealPath: string;
-  let queueRealPath: string;
+  let queueRealPath: string | null = null;
 
   try {
+    repoRealPath = await realpath(resolve(repoRoot));
     const queueStat = await lstat(queueDir);
     if (queueStat.isSymbolicLink() || !queueStat.isDirectory()) {
       return err(queueScanFailed());
     }
 
-    [repoRealPath, queueRealPath] = await Promise.all([realpath(resolve(repoRoot)), realpath(queueDir)]);
+    queueRealPath = await realpath(queueDir);
     if (!isInsidePath(repoRealPath, queueRealPath)) {
       return err(queueScanFailed());
     }
@@ -526,10 +545,11 @@ async function findDuplicateSource(
     queueFiles = await readdir(queueDir);
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
-      return ok(null);
+      repoRealPath = await realpath(resolve(repoRoot));
+      queueFiles = [];
+    } else {
+      return err(queueScanFailed());
     }
-
-    return err(queueScanFailed());
   }
 
   for (const queueFile of queueFiles.sort()) {
@@ -554,30 +574,99 @@ async function findDuplicateSource(
       continue;
     }
 
-    return ok({
-      source_id: queueItem.source_id,
-      title: queueItem.title,
-      source_kind: queueItem.source_kind,
-      origin: queueItem.origin,
-      ...(typeof queueItem.origin_url === "string" ? { origin_url: queueItem.origin_url } : {}),
-      captured_at: typeof queueItem.captured_at === "string" ? queueItem.captured_at : "",
-      content_hash: contentHash,
-      visibility: "private",
-      queue_status: queueItem.status,
-      original_path: queueItem.original_path,
-      source_card_path: queueItem.path,
-      queue_path: `raw/queue/${queueFile}`,
-    });
+    const duplicate = await validateQueueDuplicate(repoRoot, repoRealPath, queueFile, queueItem, contentHash);
+    if (duplicate !== null) {
+      return ok(duplicate);
+    }
   }
 
-  return ok(null);
+  return findDuplicateSourceCard(repoRoot, repoRealPath, contentHash);
+}
+
+async function validateQueueDuplicate(
+  repoRoot: string,
+  repoRealPath: string,
+  queueFile: string,
+  queueItem: QueueJson,
+  contentHash: string,
+): Promise<CapturedSource | null> {
+  const sourceCardPath = resolveRepositoryRelativePath(repoRoot, queueItem.path);
+  const originalPath = resolveRepositoryRelativePath(repoRoot, queueItem.original_path);
+  if (sourceCardPath === null || originalPath === null) {
+    return null;
+  }
+
+  const sourceCardRelativePath = toRepositoryPath(repoRoot, sourceCardPath);
+  const sourceCardContent = await readFileForDuplicate(repoRealPath, repoRealPath, sourceCardPath);
+  if (sourceCardContent === null) {
+    return null;
+  }
+
+  const sourceCard = parseDuplicateSourceCard(sourceCardRelativePath, sourceCardContent.toString("utf8"), contentHash);
+  if (sourceCard === null || !queueDuplicateMatchesSourceCard(queueItem, sourceCard)) {
+    return null;
+  }
+
+  const originalContent = await readFileForDuplicate(repoRealPath, repoRealPath, originalPath);
+  if (originalContent === null || `sha256:${sha256Hex(originalContent)}` !== contentHash) {
+    return null;
+  }
+
+  return {
+    source_id: queueItem.source_id,
+    title: queueItem.title,
+    source_kind: queueItem.source_kind,
+    origin: queueItem.origin,
+    ...(typeof queueItem.origin_url === "string" ? { origin_url: queueItem.origin_url } : {}),
+    captured_at: queueItem.captured_at,
+    content_hash: contentHash,
+    visibility: "private",
+    queue_status: queueItem.status,
+    original_path: toRepositoryPath(repoRoot, originalPath),
+    source_card_path: sourceCardRelativePath,
+    queue_path: `raw/queue/${queueFile}`,
+  };
+}
+
+function resolveRepositoryRelativePath(repoRoot: string, path: string): string | null {
+  if (path.includes("\0") || isAbsolute(path)) {
+    return null;
+  }
+
+  const repoPath = resolve(repoRoot);
+  const resolvedPath = resolve(repoPath, path);
+  const relativePath = relative(repoPath, resolvedPath);
+  if (relativePath === "" || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+    return null;
+  }
+
+  return resolvedPath;
+}
+
+function queueDuplicateMatchesSourceCard(queueItem: QueueJson, sourceCard: SourceCardDuplicateMetadata): boolean {
+  const queueOriginUrl = queueItem.origin_url ?? null;
+  const sourceCardOriginUrl = sourceCard.origin_url ?? null;
+  return (
+    queueItem.source_id === sourceCard.source_id &&
+    queueItem.title === sourceCard.title &&
+    queueItem.source_kind === sourceCard.source_kind &&
+    queueItem.origin === sourceCard.origin &&
+    queueOriginUrl === sourceCardOriginUrl &&
+    queueItem.captured_at === sourceCard.captured_at &&
+    queueItem.status === sourceCard.status &&
+    queueItem.visibility === sourceCard.visibility
+  );
 }
 
 async function readQueueFileForDuplicate(
   repoRealPath: string,
-  queueRealPath: string,
+  queueRealPath: string | null,
   queuePath: string,
 ): Promise<string | null> {
+  if (queueRealPath === null) {
+    return null;
+  }
+
   try {
     const queueFileStat = await lstat(queuePath);
     if (queueFileStat.isSymbolicLink() || !queueFileStat.isFile()) {
@@ -597,6 +686,194 @@ async function readQueueFileForDuplicate(
       }
 
       return await file.readFile("utf8");
+    } finally {
+      await file.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+async function findDuplicateSourceCard(
+  repoRoot: string,
+  repoRealPath: string,
+  contentHash: string,
+): Promise<Result<CapturedSource | null, SourceCaptureError>> {
+  const rawInputsDir = resolve(repoRoot, "raw", "inputs");
+  let rawInputsRealPath: string;
+  let sourceCardPaths: string[];
+
+  try {
+    const rawInputsStat = await lstat(rawInputsDir);
+    if (rawInputsStat.isSymbolicLink() || !rawInputsStat.isDirectory()) {
+      return ok(null);
+    }
+
+    rawInputsRealPath = await realpath(rawInputsDir);
+    if (!isInsidePath(repoRealPath, rawInputsRealPath)) {
+      return ok(null);
+    }
+
+    sourceCardPaths = await listSourceCardPaths(repoRealPath, rawInputsRealPath, rawInputsDir);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return ok(null);
+    }
+
+    return ok(null);
+  }
+
+  for (const sourceCardPath of sourceCardPaths) {
+    const sourceCardRelativePath = toRepositoryPath(repoRoot, sourceCardPath);
+    const sourceCardContent = await readFileForDuplicate(repoRealPath, rawInputsRealPath, sourceCardPath);
+    if (sourceCardContent === null) {
+      continue;
+    }
+
+    const sourceCard = parseDuplicateSourceCard(sourceCardRelativePath, sourceCardContent.toString("utf8"), contentHash);
+    if (sourceCard === null) {
+      continue;
+    }
+
+    const originalPath = await findMatchingOriginalPath(repoRoot, repoRealPath, sourceCardPath, contentHash);
+    if (originalPath === null) {
+      continue;
+    }
+
+    return ok({
+      source_id: sourceCard.source_id,
+      title: sourceCard.title,
+      source_kind: sourceCard.source_kind,
+      origin: sourceCard.origin,
+      ...(typeof sourceCard.origin_url === "string" ? { origin_url: sourceCard.origin_url } : {}),
+      captured_at: sourceCard.captured_at,
+      content_hash: contentHash,
+      visibility: "private",
+      queue_status: sourceCard.status,
+      original_path: originalPath,
+      source_card_path: sourceCardRelativePath,
+      queue_path: `raw/queue/${sourceCard.source_id}.json`,
+    });
+  }
+
+  return ok(null);
+}
+
+async function listSourceCardPaths(
+  repoRealPath: string,
+  rawInputsRealPath: string,
+  rawInputsDir: string,
+): Promise<string[]> {
+  const sourceCardPaths: string[] = [];
+
+  async function visit(directoryPath: string): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await readdir(directoryPath);
+    } catch {
+      return;
+    }
+
+    for (const entry of entries.sort()) {
+      const entryPath = resolve(directoryPath, entry);
+      let entryStat: Stats;
+      let entryRealPath: string;
+      try {
+        entryStat = await lstat(entryPath);
+        if (entryStat.isSymbolicLink()) {
+          continue;
+        }
+
+        entryRealPath = await realpath(entryPath);
+      } catch {
+        continue;
+      }
+
+      if (!isInsidePath(repoRealPath, entryRealPath) || !isInsidePath(rawInputsRealPath, entryRealPath)) {
+        continue;
+      }
+
+      if (entryStat.isDirectory()) {
+        await visit(entryPath);
+        continue;
+      }
+
+      if (entryStat.isFile() && entry === "_source.md") {
+        sourceCardPaths.push(entryPath);
+      }
+    }
+  }
+
+  await visit(rawInputsDir);
+
+  return sourceCardPaths.sort((left, right) => left.localeCompare(right));
+}
+
+async function findMatchingOriginalPath(
+  repoRoot: string,
+  repoRealPath: string,
+  sourceCardPath: string,
+  contentHash: string,
+): Promise<string | null> {
+  const sourceDir = dirname(sourceCardPath);
+  let sourceDirRealPath: string;
+  let entries: string[];
+
+  try {
+    const sourceDirStat = await lstat(sourceDir);
+    if (sourceDirStat.isSymbolicLink() || !sourceDirStat.isDirectory()) {
+      return null;
+    }
+
+    sourceDirRealPath = await realpath(sourceDir);
+    if (!isInsidePath(repoRealPath, sourceDirRealPath)) {
+      return null;
+    }
+
+    entries = await readdir(sourceDir);
+  } catch {
+    return null;
+  }
+
+  for (const entry of entries.sort()) {
+    if (!/^original\.[^/]+$/.test(entry)) {
+      continue;
+    }
+
+    const originalPath = resolve(sourceDir, entry);
+    const originalContent = await readFileForDuplicate(repoRealPath, sourceDirRealPath, originalPath);
+    if (originalContent !== null && `sha256:${sha256Hex(originalContent)}` === contentHash) {
+      return toRepositoryPath(repoRoot, originalPath);
+    }
+  }
+
+  return null;
+}
+
+async function readFileForDuplicate(
+  repoRealPath: string,
+  parentRealPath: string,
+  path: string,
+): Promise<Buffer | null> {
+  try {
+    const fileStat = await lstat(path);
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
+      return null;
+    }
+
+    const fileRealPath = await realpath(path);
+    if (!isInsidePath(repoRealPath, fileRealPath) || !isInsidePath(parentRealPath, fileRealPath)) {
+      return null;
+    }
+
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const openedFileStat = await file.stat();
+      if (!openedFileStat.isFile()) {
+        return null;
+      }
+
+      return await file.readFile();
     } finally {
       await file.close();
     }
@@ -681,6 +958,46 @@ function isValidDuplicateQueueItem(value: unknown, contentHash: string): value i
   );
 }
 
+function parseDuplicateSourceCard(
+  path: string,
+  content: string,
+  contentHash: string,
+): SourceCardDuplicateMetadata | null {
+  const scan = scanMarkdownDocument({ path, content });
+  if (scan.frontmatter === undefined || scan.issues.some((issue) => issue.severity === "error")) {
+    return null;
+  }
+
+  if (!isValidDuplicateSourceCard(scan.frontmatter, contentHash)) {
+    return null;
+  }
+
+  return scan.frontmatter;
+}
+
+function isValidDuplicateSourceCard(
+  value: unknown,
+  contentHash: string,
+): value is SourceCardDuplicateMetadata {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return (
+    value.type === "raw_source" &&
+    value.content_hash === contentHash &&
+    isSourceId(value.source_id) &&
+    isNonEmptyString(value.title) &&
+    isSourceKind(value.source_kind) &&
+    isNonEmptyString(value.origin) &&
+    (value.source_kind !== "url" || isNonEmptyString(value.origin_url)) &&
+    (value.source_kind === "url" || value.origin_url === undefined || typeof value.origin_url === "string" || value.origin_url === null) &&
+    isNonEmptyString(value.captured_at) &&
+    isQueueStatus(value.status) &&
+    value.visibility === "private"
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -702,6 +1019,10 @@ function isSourceId(value: unknown): value is string {
     typeof value === "string" &&
     /^src_\d{4}_\d{2}_\d{2}_[a-z0-9]+(?:[_-][a-z0-9]+)*_[a-f0-9]{12}$/.test(value)
   );
+}
+
+function toRepositoryPath(repoRoot: string, path: string): string {
+  return relative(resolve(repoRoot), path).replaceAll("\\", "/");
 }
 
 async function validateCaptureDestinations(
@@ -819,7 +1140,7 @@ function normalizeCaptureUrl(url: string): Result<string, SourceCaptureError> {
   return ok(parsedUrl.href);
 }
 
-async function fetchUrlText(url: string): Promise<Result<string, SourceCaptureError>> {
+async function fetchUrlText(url: string): Promise<Result<FetchedUrlText, SourceCaptureError>> {
   let response: Response;
 
   try {
@@ -833,11 +1154,13 @@ async function fetchUrlText(url: string): Promise<Result<string, SourceCaptureEr
     });
   }
 
+  const fetchedUrl = response.url || url;
+
   if (!response.ok) {
     return err({
       code: "URL_FETCH_FAILED",
-      message: `URL fetch returned HTTP ${response.status} for ${url}`,
-      path: url,
+      message: `URL fetch returned HTTP ${response.status} for ${fetchedUrl}`,
+      path: fetchedUrl,
       hint: "Fetchable URLs must return a successful HTTP status.",
     });
   }
@@ -847,7 +1170,7 @@ async function fetchUrlText(url: string): Promise<Result<string, SourceCaptureEr
     return err({
       code: "URL_UNSUPPORTED_RESPONSE",
       message: `URL response content type is not supported: ${contentType}`,
-      path: url,
+      path: fetchedUrl,
       hint: "Capture URLs that return text, Markdown, HTML, XML, or JSON content.",
     });
   }
@@ -858,8 +1181,8 @@ async function fetchUrlText(url: string): Promise<Result<string, SourceCaptureEr
   } catch {
     return err({
       code: "URL_FETCH_FAILED",
-      message: `Could not read URL response: ${url}`,
-      path: url,
+      message: `Could not read URL response: ${fetchedUrl}`,
+      path: fetchedUrl,
       hint: "Check that the URL returns readable text content, then try again.",
     });
   }
@@ -867,13 +1190,16 @@ async function fetchUrlText(url: string): Promise<Result<string, SourceCaptureEr
   if (text.trim().length === 0) {
     return err({
       code: "URL_EMPTY_RESPONSE",
-      message: `URL response was empty: ${url}`,
-      path: url,
+      message: `URL response was empty: ${fetchedUrl}`,
+      path: fetchedUrl,
       hint: "Capture a URL that returns non-empty text content.",
     });
   }
 
-  return ok(text);
+  return ok({
+    url: fetchedUrl,
+    text,
+  });
 }
 
 function invalidUrl(): SourceCaptureError {

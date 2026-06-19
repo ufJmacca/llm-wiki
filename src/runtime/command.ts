@@ -85,7 +85,7 @@ export async function runRuntimeCommand<CommandName extends string, Data>(
     if (options.json) {
       config.io.stdout(JSON.stringify(envelope));
     } else {
-      config.io.stderr(`Error: ${envelope.error.message}`);
+      config.io.stderr(`Error: ${envelope.error.message}\nHint: ${envelope.error.hint}`);
     }
 
     throw new CommanderError(1, `llm-wiki.${config.command}`, envelope.error.message);

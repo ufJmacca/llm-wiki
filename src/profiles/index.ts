@@ -11,6 +11,8 @@ export type WikiProfile = {
   requestedName: ExploreProfileName;
   sourceName: string;
   path: string;
+  baseUrl: string | null;
+  customDomain: string | null;
   include: string[];
   exclude: string[];
   includePrivate: boolean;
@@ -107,6 +109,8 @@ export async function readWikiProfile(
     requestedName: profileName,
     sourceName,
     path: profilePath,
+    baseUrl: profileBaseUrl(scan.profile),
+    customDomain: profileCustomDomain(scan.profile),
     include: toStringArray(scan.profile.include),
     exclude: toStringArray(scan.profile.exclude),
     includePrivate: profileIncludePrivate(scan.profile),
@@ -185,6 +189,14 @@ function profileRequiredVisibility(profile: Record<string, unknown>): string | n
   }
 
   return null;
+}
+
+function profileBaseUrl(profile: Record<string, unknown>): string | null {
+  return typeof profile.base_url === "string" && profile.base_url.trim() !== "" ? profile.base_url.trim() : null;
+}
+
+function profileCustomDomain(profile: Record<string, unknown>): string | null {
+  return typeof profile.custom_domain === "string" && profile.custom_domain.trim() !== "" ? profile.custom_domain.trim() : null;
 }
 
 function isVisibilityEligible(file: RepoMarkdownFile, profile: WikiProfile): boolean {

@@ -2,7 +2,7 @@
 
 `llm-wiki` is a local-first CLI for creating a Git-backed, Obsidian-compatible Markdown wiki that can later grow into the full LLM Wiki workflow described in the PRD.
 
-The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, and `llm-wiki add-url` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki log`, `llm-wiki lint`, `llm-wiki index rebuild`, `llm-wiki search`, `llm-wiki nav`, and `llm-wiki explore init/sync` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
+The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, and `llm-wiki add-url` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki log`, `llm-wiki lint`, `llm-wiki index rebuild`, `llm-wiki search`, `llm-wiki nav`, `llm-wiki explore init/sync/build`, and `llm-wiki deploy github-pages` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
 
 ## Development
 
@@ -28,6 +28,8 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/commands/lint.ts` and `src/commands/index.ts` own executable lint checks and rebuildable cache generation.
 - `src/commands/search.ts` and `src/commands/nav.ts` own offline search and Markdown graph/navigation command behavior.
 - `src/commands/explore.ts` owns Quartz Explorer runtime initialization and profile sync commands.
+- `src/commands/deploy.ts` owns deploy command routing for GitHub Pages.
+- `src/deploy/` owns generated deploy workflows, deploy profiles, and local deploy preflight checks.
 - `src/sourceCapture/` owns deterministic source IDs, hashing, metadata, duplicate detection, and raw writes.
 - `src/scanner/` normalizes repository Markdown, queue, profile, raw, and log state for lint and cache rebuild workflows.
 - `src/lint/` owns raw hash, source-card, queue, log, index, wikilink, provenance, and public-profile leak rules.
@@ -72,6 +74,10 @@ llm-wiki explore sync --profile local
 llm-wiki explore serve --profile local
 llm-wiki explore open
 llm-wiki explore build --profile public
+llm-wiki deploy github-pages init
+llm-wiki deploy github-pages check
+llm-wiki deploy github-pages build-local
+llm-wiki deploy github-pages status
 git status
 ```
 
@@ -106,13 +112,18 @@ llm-wiki explore sync --repo my-wiki --profile local --json
 llm-wiki explore serve --repo my-wiki --profile local --json
 llm-wiki explore open --repo my-wiki --json
 llm-wiki explore build --repo my-wiki --profile public --json
+llm-wiki deploy github-pages init --repo my-wiki --json
+llm-wiki deploy github-pages init --repo my-wiki --custom-domain docs.example.com --json
+llm-wiki deploy github-pages check --repo my-wiki --json
+llm-wiki deploy github-pages build-local --repo my-wiki --json
+llm-wiki deploy github-pages status --repo my-wiki --json
 ```
 
 - `--repo <path>` may point at a wiki root or any descendant directory containing `.llm-wiki/config.yml` above it.
 - `--json` prints stable envelopes shaped as `{ ok, command, repo, data, warnings }` on success or `{ ok, command, repo, error, issues }` on failure.
 - `--quiet` suppresses human success output only. Human errors and JSON output are still printed.
 
-`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. `explore init` writes isolated Quartz runtime files, `explore sync` materializes profile-selected Markdown into generated Quartz content, `explore serve` starts the local Quartz script after sync, `explore open` prints the recorded local URL, and `explore build` runs public sync, strict public lint, and the Quartz build script. Full health reporting is deferred to the status slice.
+`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. `explore init` writes isolated Quartz runtime files, `explore sync` materializes profile-selected Markdown into generated Quartz content, `explore serve` starts the local Quartz script after sync, `explore open` prints the recorded local URL, and `explore build` runs public sync, strict public lint, and the Quartz build script. `deploy github-pages` generates the Pages workflow/profile pair, validates deploy readiness, and runs the local preflight sequence that mirrors CI. Full health reporting is deferred to the status slice.
 
 ## Quartz Explorer
 
@@ -135,6 +146,14 @@ cd quartz && npm install
 `llm-wiki explore open` reads the recorded Explorer state and prints the current URL. JSON output is stable as `{ url, opened }`; `opened` is currently `false` because the command avoids launching a platform browser process.
 
 `llm-wiki explore build --profile public` runs public sync, strict public lint, then `npm run build` from `quartz/`. Static builds accept only `public` and `github-pages` profiles, and the build stops before sync if a local or review profile is requested. The build also stops before Quartz runs if strict public lint has error-severity issues or dependencies are missing.
+
+## GitHub Pages Deploy
+
+`llm-wiki deploy github-pages init` writes `.github/workflows/llm-wiki-pages.yml`, `.llm-wiki/profiles/github-pages.yml`, and refreshes `.llm-wiki/profiles/public.yml` with fail-closed public defaults. Without `--custom-domain`, the command infers the Pages base URL from the GitHub `origin` remote. With `--custom-domain docs.example.com`, it uses `https://docs.example.com`.
+
+The generated workflow uses least required Pages permissions (`contents: read`, `pages: write`, `id-token: write`), supports `workflow_dispatch`, sets up Node 22, installs the `llm-wiki` CLI without requiring root npm project files, installs Quartz dependencies under `quartz/`, runs GitHub Pages profile sync, strict public lint, Quartz build, uploads `quartz/public`, and deploys through the official Pages actions.
+
+`llm-wiki deploy github-pages check` validates the workflow, deploy profiles, Quartz runtime dependencies, and strict public preflight. `build-local` runs the same public sync, strict lint, and Quartz build sequence locally. `status` reports readiness without failing on incomplete setup and prints setup instructions such as installing Quartz dependencies and enabling GitHub Pages with Source: GitHub Actions.
 
 ## Source Capture
 
@@ -238,6 +257,5 @@ The following PRD features are not implemented in this foundation slice:
 - `ingest` task orchestration and validation.
 - Full Quartz browser feature wiring beyond the generated runtime defaults.
 - `upload` workflows, local daemon, remote API, and browser upload form.
-- `GitHub Pages deploy`, including deploy profile initialization, local preflight, generated Pages workflow, and Pages status checks.
 
-Until those features land, the supported product behavior is repo initialization, raw source capture, queue/log/lint/index control-plane commands, offline search/navigation over local Markdown, and Quartz init/sync/serve/open/build workflows.
+Until those features land, the supported product behavior is repo initialization, raw source capture, queue/log/lint/index control-plane commands, offline search/navigation over local Markdown, Quartz init/sync/serve/open/build workflows, and GitHub Pages deploy workflow generation/preflight.

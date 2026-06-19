@@ -1,16 +1,45 @@
-import { type Command } from "commander";
+import { CommanderError, type Command } from "commander";
 
 import type { CliIo } from "../cli.js";
+import { buildQuartzExplorer } from "../quartz/build.js";
 import { initializeQuartzRuntime, QuartzOperationError, syncQuartzContent } from "../quartz/index.js";
-import { addRuntimeOptions, runRuntimeCommand, type RawRuntimeCommandOptions } from "../runtime/command.js";
+import {
+  DEFAULT_EXPLORER_HOST,
+  DEFAULT_EXPLORER_PORT,
+  serveQuartzExplorer,
+  type QuartzServeReadyResult,
+} from "../quartz/server.js";
+import { readExplorerState } from "../quartz/state.js";
+import {
+  addRuntimeOptions,
+  runRuntimeCommand,
+  type RawRuntimeCommandOptions,
+  type RuntimeCommandOptions,
+} from "../runtime/command.js";
 import { RuntimeCommandError } from "../runtime/errors.js";
-import type { RuntimeSuccessEnvelope } from "../runtime/envelope.js";
+import {
+  buildRuntimeCommandFailureEnvelope,
+  buildRuntimeFailureEnvelope,
+  buildRuntimeSuccessEnvelope,
+  type RuntimeSuccessEnvelope,
+} from "../runtime/envelope.js";
+import { resolveWikiRoot } from "../runtime/repo.js";
 
 type RawExploreInitOptions = RawRuntimeCommandOptions & {
   install?: unknown;
 };
 
 type RawExploreSyncOptions = RawRuntimeCommandOptions & {
+  profile?: unknown;
+};
+
+type RawExploreServeOptions = RawRuntimeCommandOptions & {
+  profile?: unknown;
+  host?: unknown;
+  port?: unknown;
+};
+
+type RawExploreBuildOptions = RawRuntimeCommandOptions & {
   profile?: unknown;
 };
 
@@ -58,6 +87,134 @@ export function registerExploreCommand(program: Command, io: CliIo): void {
       formatHuman: (envelope) => formatHumanExploreSync(envelope),
     });
   });
+
+  addRuntimeOptions(
+    explore
+      .command("serve")
+      .description("Sync and serve the Quartz Explorer locally")
+      .option("--profile <profile>", "sync profile: local, review, public, or github-pages", "local")
+      .option("--host <host>", "host interface for the local Explorer server", DEFAULT_EXPLORER_HOST)
+      .option("--port <port>", "port for the local Explorer server", String(DEFAULT_EXPLORER_PORT)),
+  ).action(async (rawOptions: RawExploreServeOptions) => {
+    await runExploreServeCommand(rawOptions, io);
+  });
+
+  addRuntimeOptions(
+    explore
+      .command("open")
+      .description("Print the current Quartz Explorer URL"),
+  ).action(async (rawOptions: RawRuntimeCommandOptions) => {
+    await runRuntimeCommand({
+      command: "explore.open",
+      rawOptions,
+      io,
+      run: async ({ repo }) => {
+        const stateResult = await readExplorerState(repo.rootDir);
+        if (!stateResult.ok) {
+          throw new RuntimeCommandError({
+            code: stateResult.error.code,
+            message: stateResult.error.message,
+            path: stateResult.error.path,
+            hint: stateResult.error.hint,
+          });
+        }
+
+        return {
+          data: {
+            url: stateResult.value.url,
+            opened: false,
+          },
+          warnings: [],
+        };
+      },
+      formatHuman: (envelope) => envelope.data.url,
+    });
+  });
+
+  addRuntimeOptions(
+    explore
+      .command("build")
+      .description("Sync, lint, and build Quartz output for a profile")
+      .option("--profile <profile>", "build profile: public or github-pages", "public"),
+  ).action(async (rawOptions: RawExploreBuildOptions) => {
+    await runRuntimeCommand({
+      command: "explore.build",
+      rawOptions,
+      io,
+      run: async ({ repo }) => {
+        try {
+          return await buildQuartzExplorer(repo.rootDir, typeof rawOptions.profile === "string" ? rawOptions.profile : "public");
+        } catch (error) {
+          throw toRuntimeCommandError(error, "explore build");
+        }
+      },
+      formatHuman: (envelope) => formatHumanExploreBuild(envelope),
+    });
+  });
+}
+
+async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: CliIo): Promise<void> {
+  const options = normalizeRuntimeOptions(rawOptions);
+  const resolvedRepo = await resolveWikiRoot({ repoPath: options.repo });
+
+  if (!resolvedRepo.ok) {
+    const envelope = buildRuntimeFailureEnvelope("explore.serve", resolvedRepo.error);
+    if (options.json) {
+      io.stdout(JSON.stringify(envelope));
+    } else {
+      io.stderr(`Error: ${envelope.error.message}`);
+    }
+
+    throw new CommanderError(1, "llm-wiki.explore.serve", envelope.error.message);
+  }
+
+  let readyEmitted = false;
+  try {
+    await serveQuartzExplorer(resolvedRepo.value.rootDir, {
+      profile: typeof rawOptions.profile === "string" ? rawOptions.profile : "local",
+      host: typeof rawOptions.host === "string" ? rawOptions.host : DEFAULT_EXPLORER_HOST,
+      port: normalizePort(rawOptions.port),
+      onReady: (readyResult, warnings) => {
+        readyEmitted = true;
+        if (options.json) {
+          io.stdout(
+            JSON.stringify(
+              buildRuntimeSuccessEnvelope("explore.serve", resolvedRepo.value.rootDir, readyResult, warnings),
+            ),
+          );
+          return;
+        }
+
+        if (!options.quiet) {
+          io.stdout(formatHumanExploreServeReady(readyResult));
+        }
+      },
+    });
+  } catch (error) {
+    const commandError = toRuntimeCommandError(error, "explore serve");
+    const envelope = buildRuntimeCommandFailureEnvelope("explore.serve", commandError, resolvedRepo.value.rootDir);
+    if (readyEmitted) {
+      if (!options.json) {
+        io.stderr(`Error: ${envelope.error.message}`);
+      }
+
+      throw new CommanderError(1, "llm-wiki.explore.serve", envelope.error.message);
+    }
+
+    if (options.json) {
+      io.stdout(JSON.stringify(envelope));
+    } else {
+      io.stderr(`Error: ${envelope.error.message}`);
+    }
+
+    throw new CommanderError(1, "llm-wiki.explore.serve", envelope.error.message);
+  }
+
+  if (readyEmitted) {
+    return;
+  }
+
+  throw new CommanderError(1, "llm-wiki.explore.serve", "Quartz Explorer did not report a startup URL.");
 }
 
 function toRuntimeCommandError(error: unknown, command: string): RuntimeCommandError {
@@ -80,6 +237,14 @@ function toRuntimeCommandError(error: unknown, command: string): RuntimeCommandE
     path: ".",
     hint: `Fix the repository data or permissions, then rerun llm-wiki ${command}.`,
   });
+}
+
+function normalizeRuntimeOptions(rawOptions: RawRuntimeCommandOptions): RuntimeCommandOptions {
+  return {
+    repo: typeof rawOptions.repo === "string" ? rawOptions.repo : undefined,
+    json: rawOptions.json === true,
+    quiet: rawOptions.quiet === true,
+  };
 }
 
 function formatHumanExploreInit(
@@ -111,5 +276,39 @@ function formatHumanExploreSync(
     `Materialized Markdown: ${envelope.data.materialized_paths.length}`,
     `Generated review pages: ${envelope.data.generated_paths.length}`,
     `Manifest: ${envelope.data.manifest_path}`,
+  ].join("\n");
+}
+
+function normalizePort(rawPort: unknown): number {
+  const value = typeof rawPort === "string" ? Number(rawPort) : DEFAULT_EXPLORER_PORT;
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new RuntimeCommandError({
+      code: "EXPLORE_PORT_INVALID",
+      message: `Invalid Explorer port: ${String(rawPort)}.`,
+      path: "--port",
+      hint: "Use an integer port from 1 through 65535.",
+    });
+  }
+
+  return value;
+}
+
+function formatHumanExploreServeReady(result: QuartzServeReadyResult): string {
+  return [
+    "Quartz Explorer serving",
+    `Profile: ${result.profile}`,
+    `URL: ${result.url}`,
+    `State: ${result.state_path}`,
+  ].join("\n");
+}
+
+function formatHumanExploreBuild(
+  envelope: RuntimeSuccessEnvelope<"explore.build", Awaited<ReturnType<typeof buildQuartzExplorer>>["data"]>,
+): string {
+  return [
+    "Quartz Explorer built",
+    `Profile: ${envelope.data.profile}`,
+    `Output: ${envelope.data.output_path}`,
+    `Manifest: ${envelope.data.sync.manifest_path}`,
   ].join("\n");
 }

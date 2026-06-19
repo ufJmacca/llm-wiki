@@ -34,7 +34,7 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/index/` owns generated `.llm-wiki/cache/*` files built from source Markdown and raw state.
 - `src/search/` and `src/nav/` own local Markdown search scoring, source relation lookup, wikilink navigation, orphan reporting, and graph JSON.
 - `src/profiles/` owns profile YAML loading and profile-based Markdown selection.
-- `src/quartz/` owns generated Quartz runtime placeholders, profile materialization, static review pages, and manifests.
+- `src/quartz/` owns generated Quartz runtime files, profile materialization, static review pages, and manifests.
 - `src/runtime/queue.ts` and `src/runtime/log.ts` own queue/source-card consistency and runtime log parsing/appending.
 - `src/scaffold/` plans and writes generated wiki files.
 - `src/scaffold/templates/` contains reusable scaffold template content.
@@ -69,6 +69,9 @@ llm-wiki nav orphans
 llm-wiki nav graph --json
 llm-wiki explore init
 llm-wiki explore sync --profile local
+llm-wiki explore serve --profile local
+llm-wiki explore open
+llm-wiki explore build --profile public
 git status
 ```
 
@@ -100,17 +103,20 @@ llm-wiki nav orphans --repo my-wiki --json
 llm-wiki nav graph --repo my-wiki --json
 llm-wiki explore init --repo my-wiki --json
 llm-wiki explore sync --repo my-wiki --profile local --json
+llm-wiki explore serve --repo my-wiki --profile local --json
+llm-wiki explore open --repo my-wiki --json
+llm-wiki explore build --repo my-wiki --profile public --json
 ```
 
 - `--repo <path>` may point at a wiki root or any descendant directory containing `.llm-wiki/config.yml` above it.
 - `--json` prints stable envelopes shaped as `{ ok, command, repo, data, warnings }` on success or `{ ok, command, repo, error, issues }` on failure.
 - `--quiet` suppresses human success output only. Human errors and JSON output are still printed.
 
-`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. `explore init` writes isolated Quartz placeholder runtime files, and `explore sync` materializes profile-selected Markdown into generated Quartz content. Full health reporting is deferred to the status slice.
+`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. `explore init` writes isolated Quartz runtime files, `explore sync` materializes profile-selected Markdown into generated Quartz content, `explore serve` starts the local Quartz script after sync, `explore open` prints the recorded local URL, and `explore build` runs public sync, strict public lint, and the Quartz build script. Full health reporting is deferred to the status slice.
 
-## Quartz Explorer Init and Sync
+## Quartz Explorer
 
-`llm-wiki explore init` creates an isolated `quartz/` runtime directory with package, config, layout, and LLM Wiki component placeholders. It does not install dependencies by default. Human output prints the exact install command:
+`llm-wiki explore init` creates an isolated `quartz/` runtime directory with package, config, layout, LLM Wiki component placeholders, and an npm postinstall hook that copies the installed Quartz source tree into the local runtime layout. It also upgrades the generated placeholder package/config/layout files from earlier Explorer runtimes while leaving custom runtime files unchanged. It does not install dependencies by default. Human output prints the exact install command:
 
 ```bash
 cd quartz && npm install
@@ -119,6 +125,16 @@ cd quartz && npm install
 Pass `--install` to run that install command from the generated `quartz/` directory.
 
 `llm-wiki explore sync --profile local|review|public|github-pages` rebuilds `quartz/content/` from live Markdown and writes a profile manifest under `.llm-wiki/cache/quartz-manifest.<profile>.json`. Local and review profiles include curated Markdown, raw source cards, and generated static review pages such as the source queue; raw originals are excluded for every profile. Public and GitHub Pages syncs are public-like: they run strict leak checks before writing content, materialize only public-safe Markdown, and never copy raw source cards or raw originals.
+
+`llm-wiki explore serve --profile local` runs sync first, requires installed Quartz dependencies and the copied Quartz runtime source layout, binds the Quartz serve script to `127.0.0.1` by default, forwards a separate free Quartz `--wsPort`, prints the generated curated index URL after Quartz reports that it is listening, and records the current URL plus watched wiki inputs in `.llm-wiki/cache/explorer-state.json`. Serve watch mode tracks curated pages, raw source cards, raw queue JSON, profiles, and config changes. JSON mode emits the startup success envelope only after that readiness signal remains stable, with the URL and Quartz command marked `status: "running"`. Missing dependencies fail with `QUARTZ_DEPENDENCIES_MISSING` and the exact recovery command:
+
+```bash
+cd quartz && npm install
+```
+
+`llm-wiki explore open` reads the recorded Explorer state and prints the current URL. JSON output is stable as `{ url, opened }`; `opened` is currently `false` because the command avoids launching a platform browser process.
+
+`llm-wiki explore build --profile public` runs public sync, strict public lint, then `npm run build` from `quartz/`. Static builds accept only `public` and `github-pages` profiles, and the build stops before sync if a local or review profile is requested. The build also stops before Quartz runs if strict public lint has error-severity issues or dependencies are missing.
 
 ## Source Capture
 
@@ -182,7 +198,7 @@ Current lint rules detect raw source hash drift, malformed source cards, queue/s
 - `.llm-wiki/config.yml` records scaffold options, paths, raw immutability, curated write policy, and privacy defaults.
 - `.llm-wiki/schema.yml` documents required frontmatter and supported page types.
 - `.llm-wiki/profiles/local.yml`, `.llm-wiki/profiles/review.yml`, and `.llm-wiki/profiles/public.yml` define future Explorer/profile selection rules.
-- `quartz/content/`, `quartz/public/`, and `quartz/.quartz-cache/` are generated Explorer outputs ignored by the wiki scaffold.
+- `quartz/content/`, `quartz/public/`, `quartz/.quartz-cache/`, and `quartz/quartz/` are generated Explorer/runtime outputs ignored by the wiki scaffold.
 - `AGENTS.md` is always generated as the canonical instruction file.
 - `CODEX.md` is generated only with `--agent codex`.
 - `CLAUDE.md` is generated only with `--agent claude`.
@@ -213,15 +229,15 @@ Agent-specific files are thin pointers:
 
 ## Quartz Ready Flag
 
-`--quartz-ready` is accepted but currently a no-op for `init`. It is recorded in CLI output so callers can express intent, but it does not create a `quartz/` runtime, install Quartz, or change scaffold bytes. Use `llm-wiki explore init` to create Quartz runtime placeholders.
+`--quartz-ready` is accepted but currently a no-op for `init`. It is recorded in CLI output so callers can express intent, but it does not create a `quartz/` runtime, install Quartz, or change scaffold bytes. Use `llm-wiki explore init` to create the Quartz runtime.
 
 ## Deferred Features
 
 The following PRD features are not implemented in this foundation slice:
 
 - `ingest` task orchestration and validation.
-- `Quartz serve/build runtime`, including `explore serve`, browser search, backlinks, and graph UI.
+- Full Quartz browser feature wiring beyond the generated runtime defaults.
 - `upload` workflows, local daemon, remote API, and browser upload form.
 - `GitHub Pages deploy`, including deploy profile initialization, local preflight, generated Pages workflow, and Pages status checks.
 
-Until those features land, the supported product behavior is repo initialization, raw source capture, queue/log/lint/index control-plane commands, offline search/navigation over local Markdown, and Quartz placeholder init/profile sync.
+Until those features land, the supported product behavior is repo initialization, raw source capture, queue/log/lint/index control-plane commands, offline search/navigation over local Markdown, and Quartz init/sync/serve/open/build workflows.

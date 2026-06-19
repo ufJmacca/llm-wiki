@@ -81,6 +81,7 @@ const SKIPPED_ROOTS = [
   "quartz/content",
   "quartz/node_modules",
   "quartz/public",
+  "quartz/quartz",
 ];
 
 export async function scanWikiRepository(

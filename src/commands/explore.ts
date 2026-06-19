@@ -1,6 +1,13 @@
 import { CommanderError, type Command } from "commander";
 
 import type { CliIo } from "../cli.js";
+import {
+  DEFAULT_DAEMON_PORT,
+  startUploadDaemon,
+  uploadDaemonReady,
+  UploadDaemonError,
+  type UploadDaemonReady,
+} from "../daemon/index.js";
 import { buildQuartzExplorer } from "../quartz/build.js";
 import { initializeQuartzRuntime, QuartzOperationError, syncQuartzContent } from "../quartz/index.js";
 import {
@@ -37,6 +44,9 @@ type RawExploreServeOptions = RawRuntimeCommandOptions & {
   profile?: unknown;
   host?: unknown;
   port?: unknown;
+  withDaemon?: unknown;
+  daemonPort?: unknown;
+  commitUploads?: unknown;
 };
 
 type RawExploreBuildOptions = RawRuntimeCommandOptions & {
@@ -94,7 +104,10 @@ export function registerExploreCommand(program: Command, io: CliIo): void {
       .description("Sync and serve the Quartz Explorer locally")
       .option("--profile <profile>", "sync profile: local, review, public, or github-pages", "local")
       .option("--host <host>", "host interface for the local Explorer server", DEFAULT_EXPLORER_HOST)
-      .option("--port <port>", "port for the local Explorer server", String(DEFAULT_EXPLORER_PORT)),
+      .option("--port <port>", "port for the local Explorer server", String(DEFAULT_EXPLORER_PORT))
+      .option("--with-daemon", "start the local raw upload daemon with Explorer", false)
+      .option("--daemon-port <port>", "port for the local upload daemon", String(DEFAULT_DAEMON_PORT))
+      .option("--commit-uploads", "commit uploaded source artifacts after capture", false),
   ).action(async (rawOptions: RawExploreServeOptions) => {
     await runExploreServeCommand(rawOptions, io);
   });
@@ -169,24 +182,34 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
   }
 
   let readyEmitted = false;
+  let uploadDaemon: Awaited<ReturnType<typeof startUploadDaemon>> | undefined;
   try {
+    if (rawOptions.withDaemon === true) {
+      uploadDaemon = await startUploadDaemon({
+        repoRoot: resolvedRepo.value.rootDir,
+        port: normalizeDaemonPort(rawOptions.daemonPort),
+        commitUploads: rawOptions.commitUploads === true,
+      });
+    }
+
     await serveQuartzExplorer(resolvedRepo.value.rootDir, {
       profile: typeof rawOptions.profile === "string" ? rawOptions.profile : "local",
       host: typeof rawOptions.host === "string" ? rawOptions.host : DEFAULT_EXPLORER_HOST,
       port: normalizePort(rawOptions.port),
       onReady: (readyResult, warnings) => {
         readyEmitted = true;
+        const data = withDaemonReady(readyResult, uploadDaemon);
         if (options.json) {
           io.stdout(
             JSON.stringify(
-              buildRuntimeSuccessEnvelope("explore.serve", resolvedRepo.value.rootDir, readyResult, warnings),
+              buildRuntimeSuccessEnvelope("explore.serve", resolvedRepo.value.rootDir, data, warnings),
             ),
           );
           return;
         }
 
         if (!options.quiet) {
-          io.stdout(formatHumanExploreServeReady(readyResult));
+          io.stdout(formatHumanExploreServeReady(data));
         }
       },
     });
@@ -208,6 +231,8 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
     }
 
     throw new CommanderError(1, "llm-wiki.explore.serve", envelope.error.message);
+  } finally {
+    await uploadDaemon?.close();
   }
 
   if (readyEmitted) {
@@ -231,12 +256,35 @@ function toRuntimeCommandError(error: unknown, command: string): RuntimeCommandE
     });
   }
 
+  if (error instanceof UploadDaemonError) {
+    return new RuntimeCommandError({
+      code: error.code,
+      message: error.message,
+      path: error.path,
+      hint: error.hint,
+    });
+  }
+
   return new RuntimeCommandError({
     code: "EXPLORE_FAILED",
     message: error instanceof Error ? error.message : String(error),
     path: ".",
     hint: `Fix the repository data or permissions, then rerun llm-wiki ${command}.`,
   });
+}
+
+function withDaemonReady(
+  readyResult: QuartzServeReadyResult,
+  daemon: Awaited<ReturnType<typeof startUploadDaemon>> | undefined,
+): QuartzServeReadyResult | (QuartzServeReadyResult & { daemon: UploadDaemonReady }) {
+  if (daemon === undefined) {
+    return readyResult;
+  }
+
+  return {
+    ...readyResult,
+    daemon: uploadDaemonReady(daemon),
+  };
 }
 
 function normalizeRuntimeOptions(rawOptions: RawRuntimeCommandOptions): RuntimeCommandOptions {
@@ -293,13 +341,35 @@ function normalizePort(rawPort: unknown): number {
   return value;
 }
 
-function formatHumanExploreServeReady(result: QuartzServeReadyResult): string {
-  return [
+function normalizeDaemonPort(rawPort: unknown): number {
+  const value = typeof rawPort === "string" ? Number(rawPort) : DEFAULT_DAEMON_PORT;
+  if (!Number.isInteger(value) || value < 0 || value > 65535) {
+    throw new RuntimeCommandError({
+      code: "DAEMON_PORT_INVALID",
+      message: `Invalid daemon port: ${String(rawPort)}.`,
+      path: "--daemon-port",
+      hint: "Use an integer port from 0 through 65535.",
+    });
+  }
+
+  return value;
+}
+
+function formatHumanExploreServeReady(result: QuartzServeReadyResult | (QuartzServeReadyResult & { daemon: UploadDaemonReady })): string {
+  const lines = [
     "Quartz Explorer serving",
     `Profile: ${result.profile}`,
     `URL: ${result.url}`,
     `State: ${result.state_path}`,
-  ].join("\n");
+  ];
+
+  if ("daemon" in result) {
+    lines.push(`Upload endpoint: ${result.daemon.url}${result.daemon.upload_path}`);
+    lines.push(`Upload token header: x-llm-wiki-upload-token: ${result.daemon.upload_token}`);
+    lines.push(`Commit uploads: ${result.daemon.commit_uploads ? "enabled" : "disabled"}`);
+  }
+
+  return lines.join("\n");
 }
 
 function formatHumanExploreBuild(

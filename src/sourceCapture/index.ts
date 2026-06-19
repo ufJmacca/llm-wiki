@@ -75,10 +75,32 @@ export type CaptureTextSourceOptions = {
   command?: string;
 };
 
+export type CaptureUploadedFileSourceOptions = {
+  repoRoot: string;
+  fileName: string;
+  content: Buffer;
+  title?: string;
+  now?: Date;
+  command?: string;
+};
+
 export type CaptureUrlSourceOptions = {
   repoRoot: string;
   url: string;
   title?: string;
+  now?: Date;
+  command?: string;
+};
+
+export type PreparedUrlSource = {
+  url: string;
+  title: string;
+  text: string;
+};
+
+export type CapturePreparedUrlSourceOptions = {
+  repoRoot: string;
+  source: PreparedUrlSource;
   now?: Date;
   command?: string;
 };
@@ -170,9 +192,46 @@ export async function captureTextSource(
   });
 }
 
+export async function captureUploadedFileSource(
+  options: CaptureUploadedFileSourceOptions,
+): Promise<Result<SourceCaptureSuccess, SourceCaptureError>> {
+  const safeFileName = basename(options.fileName.trim() || "upload.bin");
+  const title = normalizeTitle(options.title, basename(safeFileName, extname(safeFileName)));
+  if (!title.ok) {
+    return title;
+  }
+
+  return captureSource({
+    repoRoot: options.repoRoot,
+    title: title.value,
+    sourceKind: "file",
+    origin: `upload:${safeFileName}`,
+    originalExtension: normalizeOriginalExtension(extname(safeFileName), "bin"),
+    content: options.content,
+    now: options.now ?? new Date(),
+    command: options.command ?? `llm-wiki daemon upload ${safeFileName}`,
+  });
+}
+
 export async function captureUrlSource(
   options: CaptureUrlSourceOptions,
 ): Promise<Result<SourceCaptureSuccess, SourceCaptureError>> {
+  const prepared = await prepareUrlSource(options);
+  if (!prepared.ok) {
+    return prepared;
+  }
+
+  return capturePreparedUrlSource({
+    repoRoot: options.repoRoot,
+    source: prepared.value,
+    now: options.now,
+    command: options.command ?? `llm-wiki add-url ${prepared.value.url}`,
+  });
+}
+
+export async function prepareUrlSource(
+  options: Pick<CaptureUrlSourceOptions, "url" | "title">,
+): Promise<Result<PreparedUrlSource, SourceCaptureError>> {
   const normalizedUrl = normalizeCaptureUrl(options.url);
   if (!normalizedUrl.ok) {
     return normalizedUrl;
@@ -188,16 +247,26 @@ export async function captureUrlSource(
     return title;
   }
 
+  return ok({
+    url: normalizedUrl.value,
+    title: title.value,
+    text: fetched.value,
+  });
+}
+
+export async function capturePreparedUrlSource(
+  options: CapturePreparedUrlSourceOptions,
+): Promise<Result<SourceCaptureSuccess, SourceCaptureError>> {
   return captureSource({
     repoRoot: options.repoRoot,
-    title: title.value,
+    title: options.source.title,
     sourceKind: "url",
     origin: "url",
-    originUrl: normalizedUrl.value,
+    originUrl: options.source.url,
     originalExtension: "md",
-    content: Buffer.from(fetched.value, "utf8"),
+    content: Buffer.from(options.source.text, "utf8"),
     now: options.now ?? new Date(),
-    command: options.command ?? `llm-wiki add-url ${normalizedUrl.value}`,
+    command: options.command ?? `llm-wiki add-url ${options.source.url}`,
   });
 }
 

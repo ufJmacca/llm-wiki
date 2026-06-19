@@ -36,7 +36,9 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/lint/` owns raw hash, source-card, queue, log, index, wikilink, provenance, and public-profile leak rules.
 - `src/index/` owns generated `.llm-wiki/cache/*` files built from source Markdown and raw state.
 - `src/search/` and `src/nav/` own local Markdown search scoring, source relation lookup, wikilink navigation, orphan reporting, and graph JSON.
+- `src/providers/` owns explicit provider proposal execution and safe proposal application.
 - `src/runtime/queue.ts` and `src/runtime/log.ts` own queue/source-card consistency and runtime log parsing/appending.
+- `src/runtime/config.ts` owns runtime provider config loading and env-var secret checks.
 - `src/scaffold/` plans and writes generated wiki files.
 - `src/scaffold/templates/` contains reusable scaffold template content.
 - `src/utils/` contains filesystem, Git, and result helpers.
@@ -59,8 +61,10 @@ llm-wiki queue show <source_id>
 llm-wiki queue set-status <source_id> ingesting
 llm-wiki ingest <source_id>
 llm-wiki ingest <source_id> --validate
+llm-wiki ingest <source_id> --provider local
 llm-wiki query "What does this source prove?" --save curated/questions/source-proof.md
 llm-wiki query "What does this source prove?" --save curated/questions/source-proof.md --validate
+llm-wiki query "What does this source prove?" --save curated/questions/source-proof.md --provider local
 llm-wiki log
 llm-wiki lint
 llm-wiki lint --fix
@@ -93,8 +97,10 @@ llm-wiki queue show <source_id> --repo my-wiki --json
 llm-wiki queue set-status <source_id> ingesting --repo my-wiki --json
 llm-wiki ingest <source_id> --repo my-wiki --json
 llm-wiki ingest <source_id> --repo my-wiki --validate --json
+llm-wiki ingest <source_id> --repo my-wiki --provider local --json
 llm-wiki query "What does this source prove?" --repo my-wiki --save curated/questions/source-proof.md --json
 llm-wiki query "What does this source prove?" --repo my-wiki --save curated/questions/source-proof.md --validate --json
+llm-wiki query "What does this source prove?" --repo my-wiki --save curated/questions/source-proof.md --provider local --json
 llm-wiki log --repo my-wiki --json
 llm-wiki lint --repo my-wiki --json
 llm-wiki lint --repo my-wiki --profile public --strict --json
@@ -147,11 +153,40 @@ When the wiki has Git enabled, `ingest` recommends `git switch -c ingest/<source
 
 `llm-wiki ingest <source_id> --validate` checks that the agent created `curated/sources/<source_id>.md`, updated `curated/index.md`, appended an ingest log entry, kept `source_ids` on edited curated pages, and left raw originals unchanged. The queue item moves to `ingested` only after validation passes.
 
+`llm-wiki ingest <source_id> --provider <name>` is optional and never used unless requested explicitly. The configured provider must return structured file proposals under `curated/`; proposals are validated on a temporary copy with the same ingest validation gates before any files are applied. Rejected provider output does not change queue status or raw originals.
+
 ## Query Tasks
 
-`llm-wiki query "<question>" --save curated/questions/<slug>.md` loads `AGENTS.md`, `curated/index.md`, relevant curated pages, source summaries, `source_ids`, and linked context, then prints an agent task prompt. The CLI does not call an LLM provider or invent an answer.
+`llm-wiki query "<question>" --save curated/questions/<slug>.md` loads `AGENTS.md`, `curated/index.md`, relevant curated pages, source summaries, `source_ids`, and linked context, then prints an agent task prompt. Without `--provider`, the CLI does not call an LLM provider or invent an answer.
 
 After an agent writes the saved question page, `llm-wiki query "<question>" --save curated/questions/<slug>.md --validate` checks that the page has `type: question`, title, visibility, source references where sources are available, explicit open questions for missing provenance, an index entry, and a compatible `query` entry in `curated/log.md`.
+
+`llm-wiki query "<question>" --save curated/questions/<slug>.md --provider <name>` is optional explicit provider mode. It requires `--save`; provider proposals may only write the saved question page, `curated/index.md`, and `curated/log.md`, and must pass the same saved-query validation before being applied.
+
+## Provider Proposal Mode
+
+Provider mode is configured under `.llm-wiki/config.yml` and is unavailable unless a command includes `--provider <name>`.
+
+```yaml
+providers:
+  local:
+    type: http
+    endpoint: "http://127.0.0.1:8787/propose"
+    api_key_env: LLM_WIKI_PROVIDER_API_KEY
+    model: example-model
+```
+
+Secrets are referenced only by environment variable name. Literal secret fields such as `api_key`, `access_token`, `client_secret`, `password`, `token`, or `secret` are rejected. Missing env vars, malformed config, provider request failures, malformed output, raw-path proposals, and validation failures all exit non-zero without applying proposed edits.
+
+Providers must return:
+
+```json
+{
+  "files": [
+    { "path": "curated/index.md", "content": "..." }
+  ]
+}
+```
 
 ## Search and Navigation
 

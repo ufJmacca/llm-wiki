@@ -2,7 +2,7 @@
 
 `llm-wiki` is a local-first CLI for creating a Git-backed, Obsidian-compatible Markdown wiki that can later grow into the full LLM Wiki workflow described in the PRD.
 
-The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, and `llm-wiki add-url` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki ingest`, `llm-wiki log`, `llm-wiki lint`, `llm-wiki index rebuild`, `llm-wiki search`, and `llm-wiki nav` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
+The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, and `llm-wiki add-url` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki ingest`, `llm-wiki query`, `llm-wiki log`, `llm-wiki lint`, `llm-wiki index rebuild`, `llm-wiki search`, and `llm-wiki nav` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
 
 ## Development
 
@@ -26,6 +26,7 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/commands/add.ts`, `src/commands/addText.ts`, and `src/commands/addUrl.ts` own source capture command behavior.
 - `src/commands/queue.ts` and `src/commands/log.ts` own queue inspection, status transitions, and parsed runtime log output.
 - `src/commands/ingest.ts` owns ingest task prompt generation, optional branch creation, and validation-driven completion.
+- `src/commands/query.ts` owns query task prompt generation and validation of durable saved question pages.
 - `src/commands/lint.ts` and `src/commands/index.ts` own executable lint checks and rebuildable cache generation.
 - `src/commands/search.ts` and `src/commands/nav.ts` own offline search and Markdown graph/navigation command behavior.
 - `src/agentTasks/` owns deterministic agent prompt/task assembly.
@@ -58,6 +59,8 @@ llm-wiki queue show <source_id>
 llm-wiki queue set-status <source_id> ingesting
 llm-wiki ingest <source_id>
 llm-wiki ingest <source_id> --validate
+llm-wiki query "What does this source prove?" --save curated/questions/source-proof.md
+llm-wiki query "What does this source prove?" --save curated/questions/source-proof.md --validate
 llm-wiki log
 llm-wiki lint
 llm-wiki lint --fix
@@ -90,6 +93,8 @@ llm-wiki queue show <source_id> --repo my-wiki --json
 llm-wiki queue set-status <source_id> ingesting --repo my-wiki --json
 llm-wiki ingest <source_id> --repo my-wiki --json
 llm-wiki ingest <source_id> --repo my-wiki --validate --json
+llm-wiki query "What does this source prove?" --repo my-wiki --save curated/questions/source-proof.md --json
+llm-wiki query "What does this source prove?" --repo my-wiki --save curated/questions/source-proof.md --validate --json
 llm-wiki log --repo my-wiki --json
 llm-wiki lint --repo my-wiki --json
 llm-wiki lint --repo my-wiki --profile public --strict --json
@@ -106,7 +111,7 @@ llm-wiki nav graph --repo my-wiki --json
 - `--json` prints stable envelopes shaped as `{ ok, command, repo, data, warnings }` on success or `{ ok, command, repo, error, issues }` on failure.
 - `--quiet` suppresses human success output only. Human errors and JSON output are still printed.
 
-`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `ingest` returns a generated agent task prompt or validation result. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. Full health reporting is deferred to the status slice.
+`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `ingest` and `query` return generated agent task prompts or validation results. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. Full health reporting is deferred to the status slice.
 
 ## Source Capture
 
@@ -141,6 +146,12 @@ Duplicate content returns the existing source metadata with `status: duplicate` 
 When the wiki has Git enabled, `ingest` recommends `git switch -c ingest/<source_id>`. Pass `--create-branch` to create that branch explicitly.
 
 `llm-wiki ingest <source_id> --validate` checks that the agent created `curated/sources/<source_id>.md`, updated `curated/index.md`, appended an ingest log entry, kept `source_ids` on edited curated pages, and left raw originals unchanged. The queue item moves to `ingested` only after validation passes.
+
+## Query Tasks
+
+`llm-wiki query "<question>" --save curated/questions/<slug>.md` loads `AGENTS.md`, `curated/index.md`, relevant curated pages, source summaries, `source_ids`, and linked context, then prints an agent task prompt. The CLI does not call an LLM provider or invent an answer.
+
+After an agent writes the saved question page, `llm-wiki query "<question>" --save curated/questions/<slug>.md --validate` checks that the page has `type: question`, title, visibility, source references where sources are available, explicit open questions for missing provenance, an index entry, and a compatible `query` entry in `curated/log.md`.
 
 ## Search and Navigation
 
@@ -218,4 +229,4 @@ The following PRD features are not implemented in this foundation slice:
 - `upload` workflows, local daemon, remote API, and browser upload form.
 - `GitHub Pages deploy`, including deploy profile initialization, local preflight, generated Pages workflow, and Pages status checks.
 
-Until those features land, the supported product behavior is repo initialization, raw source capture, ingest task scaffolding and validation, queue/log/lint/index control-plane commands, and offline search/navigation over local Markdown.
+Until those features land, the supported product behavior is repo initialization, raw source capture, ingest and query task scaffolding and validation, queue/log/lint/index control-plane commands, and offline search/navigation over local Markdown.

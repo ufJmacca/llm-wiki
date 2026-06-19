@@ -13,6 +13,7 @@ import { registerInitCommand } from "./commands/init.js";
 import { registerLintCommand } from "./commands/lint.js";
 import { registerLogCommand } from "./commands/log.js";
 import { registerNavCommand } from "./commands/nav.js";
+import { registerQueryCommand } from "./commands/query.js";
 import { registerQueueCommand } from "./commands/queue.js";
 import { registerSearchCommand } from "./commands/search.js";
 import { registerStatusCommand } from "./commands/status.js";
@@ -82,6 +83,7 @@ function createProgram(io: CliIo): Command {
   registerStatusCommand(program, io);
   registerSearchCommand(program, io);
   registerNavCommand(program, io);
+  registerQueryCommand(program, io);
 
   return program;
 }

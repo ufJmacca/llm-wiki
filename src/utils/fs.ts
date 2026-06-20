@@ -19,6 +19,18 @@ export type ScaffoldWriteReport = {
   skipped: string[];
 };
 
+export type BinaryWriteErrorCode =
+  | "DESTINATION_EXISTS"
+  | "DESTINATION_PARENT_UNSAFE"
+  | "DESTINATION_PATH_UNSAFE";
+
+export type BinaryWriteError = {
+  code: BinaryWriteErrorCode;
+  message: string;
+  path: string;
+  hint: string;
+};
+
 type TargetState =
   | { exists: false }
   | { exists: true; isDirectory: true; entries: string[] }
@@ -120,6 +132,99 @@ export async function writeScaffold(
   return ok(report);
 }
 
+export async function writeBinaryFileNoOverwriteInsideRoot(
+  rootDir: string,
+  relativePath: string,
+  content: Uint8Array,
+): Promise<Result<void, BinaryWriteError>> {
+  const normalizedPath = normalizeContainedRelativePath(relativePath);
+  if (!normalizedPath.ok) {
+    return normalizedPath;
+  }
+
+  const rootPath = resolve(rootDir);
+  const absolutePath = resolve(rootPath, normalizedPath.value);
+  const relativeToRoot = relative(rootPath, absolutePath);
+  if (relativeToRoot === "" || relativeToRoot.startsWith("..") || isAbsolute(relativeToRoot)) {
+    return err(destinationPathUnsafe(relativePath));
+  }
+
+  try {
+    const rootRealPath = await realpath(rootPath);
+    const parentReady = await ensureContainedParentDirectory(rootPath, rootRealPath, normalizedPath.value);
+    if (!parentReady.ok) {
+      return parentReady;
+    }
+
+    const destinationState = await readDestinationState(rootRealPath, normalizedPath.value, absolutePath);
+    if (!destinationState.ok) {
+      return destinationState;
+    }
+
+    const file = await open(
+      absolutePath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o666,
+    );
+
+    try {
+      await file.writeFile(content);
+    } finally {
+      await file.close();
+    }
+  } catch (error) {
+    if (isNodeError(error) && error.code === "EEXIST") {
+      return err(destinationExists(normalizedPath.value));
+    }
+
+    return err({
+      code: "DESTINATION_PARENT_UNSAFE",
+      message: error instanceof Error ? error.message : String(error),
+      path: normalizedPath.value,
+      hint: "Capture writes must stay inside the wiki repository and must not follow symlinks.",
+    });
+  }
+
+  return ok(undefined);
+}
+
+export async function validateBinaryFileNoOverwriteInsideRoot(
+  rootDir: string,
+  relativePath: string,
+): Promise<Result<void, BinaryWriteError>> {
+  const target = await validateContainedWriteTarget(rootDir, relativePath);
+  if (!target.ok) {
+    return target;
+  }
+
+  if (!target.value.parentExists) {
+    return ok(undefined);
+  }
+
+  return readDestinationState(target.value.rootRealPath, target.value.normalizedPath, target.value.absolutePath);
+}
+
+export async function validateAppendFileInsideRoot(
+  rootDir: string,
+  relativePath: string,
+): Promise<Result<void, BinaryWriteError>> {
+  const target = await validateContainedWriteTarget(rootDir, relativePath);
+  if (!target.ok) {
+    return target;
+  }
+
+  if (!target.value.parentExists) {
+    return err(
+      destinationParentUnsafe(
+        target.value.normalizedPath,
+        `destination parent does not exist: ${target.value.parentRelativePath}`,
+      ),
+    );
+  }
+
+  return readAppendDestinationState(target.value.rootRealPath, target.value.normalizedPath, target.value.absolutePath);
+}
+
 async function validateWritableScaffoldPaths(
   rootPath: string,
   rootRealPath: string,
@@ -171,6 +276,284 @@ function validateScaffoldEntries(rootPath: string, entries: readonly ScaffoldEnt
   }
 
   return ok(undefined);
+}
+
+function normalizeContainedRelativePath(path: string): Result<string, BinaryWriteError> {
+  if (path.trim() === "") {
+    return err(destinationPathUnsafe(path));
+  }
+
+  if (path.includes("\0")) {
+    return err(destinationPathUnsafe(path));
+  }
+
+  if (isAbsolute(path)) {
+    return err(destinationPathUnsafe(path));
+  }
+
+  if (path.includes("\\")) {
+    return err(destinationPathUnsafe(path));
+  }
+
+  if (hasTraversalSegment(path)) {
+    return err(destinationPathUnsafe(path));
+  }
+
+  return ok(posix.normalize(path).replace(/\/+$/, ""));
+}
+
+async function ensureContainedParentDirectory(
+  rootPath: string,
+  rootRealPath: string,
+  relativePath: string,
+): Promise<Result<void, BinaryWriteError>> {
+  const segments = relativePath.split("/").slice(0, -1);
+  let currentPath = rootPath;
+  let currentRelativePath = "";
+
+  for (const segment of segments) {
+    currentRelativePath = currentRelativePath === "" ? segment : `${currentRelativePath}/${segment}`;
+    currentPath = resolve(currentPath, segment);
+
+    const relativeToRoot = relative(rootPath, currentPath);
+    if (relativeToRoot === "" || relativeToRoot.startsWith("..") || isAbsolute(relativeToRoot)) {
+      return err(destinationPathUnsafe(relativePath));
+    }
+
+    const existingParent = await readParentDirectoryState(rootRealPath, currentRelativePath, currentPath);
+    if (!existingParent.ok) {
+      if (existingParent.error.code !== "DESTINATION_PARENT_UNSAFE") {
+        return existingParent;
+      }
+
+      try {
+        await mkdir(currentPath);
+      } catch (error) {
+        if (!isNodeError(error) || error.code !== "EEXIST") {
+          return err(destinationParentUnsafe(relativePath, error instanceof Error ? error.message : String(error)));
+        }
+      }
+
+      const createdParent = await readParentDirectoryState(rootRealPath, currentRelativePath, currentPath);
+      if (!createdParent.ok) {
+        return createdParent;
+      }
+    }
+  }
+
+  return ok(undefined);
+}
+
+async function readParentDirectoryState(
+  rootRealPath: string,
+  relativePath: string,
+  absolutePath: string,
+): Promise<Result<void, BinaryWriteError>> {
+  try {
+    const pathStat = await lstat(absolutePath);
+    if (pathStat.isSymbolicLink()) {
+      return err(destinationParentUnsafe(relativePath, `destination parent is a symlink: ${relativePath}`));
+    }
+
+    if (!pathStat.isDirectory()) {
+      return err(destinationParentUnsafe(relativePath, `destination parent is not a directory: ${relativePath}`));
+    }
+
+    const resolvedPath = await realpath(absolutePath);
+    if (!isInsideRealPath(rootRealPath, resolvedPath)) {
+      return err(destinationPathUnsafe(relativePath));
+    }
+
+    return ok(undefined);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return err(destinationParentUnsafe(relativePath, `destination parent does not exist: ${relativePath}`));
+    }
+
+    return err(destinationParentUnsafe(relativePath, error instanceof Error ? error.message : String(error)));
+  }
+}
+
+async function readDestinationState(
+  rootRealPath: string,
+  relativePath: string,
+  absolutePath: string,
+): Promise<Result<void, BinaryWriteError>> {
+  try {
+    const resolvedParentPath = await realpath(dirname(absolutePath));
+    if (!isInsideRealPath(rootRealPath, resolvedParentPath)) {
+      return err(destinationPathUnsafe(relativePath));
+    }
+  } catch (error) {
+    return err(destinationParentUnsafe(relativePath, error instanceof Error ? error.message : String(error)));
+  }
+
+  try {
+    const pathStat = await lstat(absolutePath);
+    if (pathStat.isSymbolicLink() || pathStat.isFile() || pathStat.isDirectory()) {
+      return err(destinationExists(relativePath));
+    }
+
+    return err(destinationExists(relativePath));
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return ok(undefined);
+    }
+
+    return err(destinationParentUnsafe(relativePath, error instanceof Error ? error.message : String(error)));
+  }
+}
+
+type ContainedWriteTarget = {
+  rootRealPath: string;
+  normalizedPath: string;
+  absolutePath: string;
+  parentExists: boolean;
+  parentRelativePath: string;
+};
+
+async function validateContainedWriteTarget(
+  rootDir: string,
+  relativePath: string,
+): Promise<Result<ContainedWriteTarget, BinaryWriteError>> {
+  const normalizedPath = normalizeContainedRelativePath(relativePath);
+  if (!normalizedPath.ok) {
+    return normalizedPath;
+  }
+
+  const rootPath = resolve(rootDir);
+  const absolutePath = resolve(rootPath, normalizedPath.value);
+  const relativeToRoot = relative(rootPath, absolutePath);
+  if (relativeToRoot === "" || relativeToRoot.startsWith("..") || isAbsolute(relativeToRoot)) {
+    return err(destinationPathUnsafe(relativePath));
+  }
+
+  try {
+    const rootRealPath = await realpath(rootPath);
+    const parentState = await validateContainedParentDirectoryPlan(rootPath, rootRealPath, normalizedPath.value);
+    if (!parentState.ok) {
+      return parentState;
+    }
+
+    return ok({
+      rootRealPath,
+      normalizedPath: normalizedPath.value,
+      absolutePath,
+      parentExists: parentState.value.exists,
+      parentRelativePath: parentState.value.relativePath,
+    });
+  } catch (error) {
+    return err(destinationParentUnsafe(normalizedPath.value, error instanceof Error ? error.message : String(error)));
+  }
+}
+
+async function validateContainedParentDirectoryPlan(
+  rootPath: string,
+  rootRealPath: string,
+  relativePath: string,
+): Promise<Result<{ exists: boolean; relativePath: string }, BinaryWriteError>> {
+  const segments = relativePath.split("/").slice(0, -1);
+  let currentPath = rootPath;
+  let currentRelativePath = "";
+  let parentExists = true;
+
+  for (const segment of segments) {
+    currentRelativePath = currentRelativePath === "" ? segment : `${currentRelativePath}/${segment}`;
+    currentPath = resolve(currentPath, segment);
+
+    const relativeToRoot = relative(rootPath, currentPath);
+    if (relativeToRoot === "" || relativeToRoot.startsWith("..") || isAbsolute(relativeToRoot)) {
+      return err(destinationPathUnsafe(relativePath));
+    }
+
+    if (!parentExists) {
+      continue;
+    }
+
+    try {
+      const pathStat = await lstat(currentPath);
+      if (pathStat.isSymbolicLink()) {
+        return err(destinationParentUnsafe(currentRelativePath, `destination parent is a symlink: ${currentRelativePath}`));
+      }
+
+      if (!pathStat.isDirectory()) {
+        return err(
+          destinationParentUnsafe(currentRelativePath, `destination parent is not a directory: ${currentRelativePath}`),
+        );
+      }
+
+      const resolvedPath = await realpath(currentPath);
+      if (!isInsideRealPath(rootRealPath, resolvedPath)) {
+        return err(destinationPathUnsafe(currentRelativePath));
+      }
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") {
+        parentExists = false;
+        continue;
+      }
+
+      return err(destinationParentUnsafe(currentRelativePath, error instanceof Error ? error.message : String(error)));
+    }
+  }
+
+  return ok({ exists: parentExists, relativePath: currentRelativePath || "." });
+}
+
+async function readAppendDestinationState(
+  rootRealPath: string,
+  relativePath: string,
+  absolutePath: string,
+): Promise<Result<void, BinaryWriteError>> {
+  try {
+    const pathStat = await lstat(absolutePath);
+    if (pathStat.isSymbolicLink()) {
+      return err(destinationParentUnsafe(relativePath, `destination file is a symlink: ${relativePath}`));
+    }
+
+    if (!pathStat.isFile()) {
+      return err(destinationParentUnsafe(relativePath, `destination is not a regular file: ${relativePath}`));
+    }
+
+    const resolvedPath = await realpath(absolutePath);
+    if (!isInsideRealPath(rootRealPath, resolvedPath)) {
+      return err(destinationPathUnsafe(relativePath));
+    }
+
+    return ok(undefined);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return ok(undefined);
+    }
+
+    return err(destinationParentUnsafe(relativePath, error instanceof Error ? error.message : String(error)));
+  }
+}
+
+function destinationPathUnsafe(path: string): BinaryWriteError {
+  return {
+    code: "DESTINATION_PATH_UNSAFE",
+    message: `Destination path must be a relative path inside the wiki repository: ${path}`,
+    path,
+    hint: "Use a normalized relative path without traversal segments.",
+  };
+}
+
+function destinationExists(path: string): BinaryWriteError {
+  return {
+    code: "DESTINATION_EXISTS",
+    message: `Capture destination already exists and will not be overwritten: ${path}`,
+    path,
+    hint: "Raw originals are immutable; choose a new source ID or inspect the existing capture.",
+  };
+}
+
+function destinationParentUnsafe(path: string, message: string): BinaryWriteError {
+  return {
+    code: "DESTINATION_PARENT_UNSAFE",
+    message,
+    path,
+    hint: "Capture writes must stay inside the wiki repository and must not follow symlinks.",
+  };
 }
 
 function normalizeScaffoldPath(path: string): string {

@@ -170,4 +170,22 @@ describe("core wiki scaffold templates", () => {
     expect(log).toContain("- git_branch:");
     expect(log).toContain("- git_commit:");
   });
+
+  it("keeps source card templates and Dataview dashboards on the runtime raw source schema", () => {
+    // Arrange
+    const plannedEntries = new Map(
+      planWikiScaffold({ ...defaultOptions, dataview: true }).map((entry) => [entry.path, entry.content]),
+    );
+
+    // Act
+    const sourceCard = plannedEntries.get(".llm-wiki/templates/source-card.md");
+    const ingestionQueueDashboard = plannedEntries.get("curated/dashboards/ingestion-queue.md");
+
+    // Assert
+    expect(sourceCard).toContain("type: raw_source");
+    expect(sourceCard).toContain("source_kind:");
+    expect(sourceCard).not.toMatch(/^kind:/m);
+    expect(ingestionQueueDashboard).toContain("TABLE source_kind, status, captured_at, tags");
+    expect(ingestionQueueDashboard).toContain('WHERE type = "raw_source" AND status != "ingested"');
+  });
 });

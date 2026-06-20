@@ -1443,6 +1443,58 @@ safety:
     });
   });
 
+  it("fails public strict when selected internal config files are skipped by normal scans", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-skipped-config-selected-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await writeFile(
+        resolve(wikiDir, ".llm-wiki/profiles/public.yml"),
+        `name: public
+mode: deploy
+include:
+  - .llm-wiki/**
+exclude:
+  - .llm-wiki/cache
+  - .llm-wiki/cache/**
+  - .llm-wiki/templates/**
+visibility:
+  include_private: false
+  required_value: public
+safety:
+  fail_on_private_pages: true
+  fail_on_private_links: true
+  fail_on_raw_links: true
+  fail_on_public_graph_private_nodes: true
+  fail_on_public_search_private_text: true
+`,
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("lint_failed");
+      expectStableIssueRecords(payload.issues);
+      expect(issueByRuleAndPath(payload.issues, "public_non_markdown_file_selected", ".llm-wiki/config.yml")).toMatchObject({
+        severity: "error",
+        path: ".llm-wiki/config.yml",
+        message: expect.stringContaining("non-Markdown"),
+        fixable: false,
+      });
+      expect(issueByRuleAndPath(payload.issues, "public_non_markdown_file_selected", ".llm-wiki/schema.yml")).toMatchObject({
+        severity: "error",
+        path: ".llm-wiki/schema.yml",
+        message: expect.stringContaining("non-Markdown"),
+        fixable: false,
+      });
+    });
+  });
+
   it("fails public strict when skipped cache files are selected", async () => {
     await withTempWorkspace("llm-wiki-lint-public-cache-selected-", async (workspaceDir) => {
       // Arrange
@@ -1796,6 +1848,61 @@ safety:
         severity: "error",
         line: expect.any(Number),
         message: expect.stringContaining("[B](b.md)"),
+        fixable: false,
+      });
+      expect(issueByRuleAndPath(payload.issues, "public_graph_private_node_leak", "curated/topics/a.md")).toMatchObject({
+        severity: "error",
+        line: expect.any(Number),
+        fixable: false,
+      });
+    });
+  });
+
+  it("fails public strict lint for public Markdown links to internal config files skipped by normal scans", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-skipped-config-link-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      await writeFile(
+        resolve(wikiDir, ".llm-wiki/profiles/public.yml"),
+        `name: public
+mode: deploy
+include:
+  - curated/topics/a.md
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+safety:
+  fail_on_private_pages: true
+  fail_on_private_links: true
+  fail_on_raw_links: true
+  fail_on_public_graph_private_nodes: true
+  fail_on_public_search_private_text: true
+`,
+        "utf8",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/a.md",
+        { type: "topic", title: "Public A", visibility: "public", source_ids: [source.source_id] },
+        "# Public A\n\nLinks to [internal config](../../.llm-wiki/config.yml).\n",
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("lint_failed");
+      expectStableIssueRecords(payload.issues);
+      expect(issueByRuleAndPath(payload.issues, "public_private_link", "curated/topics/a.md")).toMatchObject({
+        severity: "error",
+        line: expect.any(Number),
+        message: expect.stringContaining("[internal config](../../.llm-wiki/config.yml)"),
         fixable: false,
       });
       expect(issueByRuleAndPath(payload.issues, "public_graph_private_node_leak", "curated/topics/a.md")).toMatchObject({

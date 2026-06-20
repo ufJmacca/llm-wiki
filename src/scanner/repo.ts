@@ -55,6 +55,7 @@ export type SourceCard = RepoMarkdownFile & {
 export type RepoScan = {
   rootDir: string;
   files: RepoFile[];
+  linkableFilePaths: string[];
   markdown: RepoMarkdownFile[];
   curatedPages: RepoMarkdownFile[];
   sourceCards: SourceCard[];
@@ -81,13 +82,14 @@ const SKIPPED_ROOTS = [
   "quartz/node_modules",
   "quartz/public",
 ];
+const SKIPPED_FILES = new Set([".llm-wiki/config.yml"]);
 
 export async function scanWikiRepository(
   rootDir: string,
   options: ScanWikiRepositoryOptions = {},
 ): Promise<RepoScan> {
   const mode = options.mode ?? "full";
-  const filePaths = await listInputFiles(rootDir, {
+  const { filePaths, linkableFilePaths } = await listInputFiles(rootDir, {
     includeFile: mode === "liveMarkdown" ? isLiveMarkdownFilePath : undefined,
   });
   const files: RepoFile[] = [];
@@ -162,6 +164,7 @@ export async function scanWikiRepository(
   return {
     rootDir,
     files: sortByPath(files),
+    linkableFilePaths: [...linkableFilePaths].sort(),
     markdown: sortByPath(markdown),
     curatedPages: sortByPath(markdown.filter((file) => file.path.startsWith("curated/"))),
     sourceCards: sortByPath(sourceCards),
@@ -174,7 +177,8 @@ export async function scanWikiRepository(
 }
 
 export async function listRepositoryFilePaths(rootDir: string): Promise<string[]> {
-  return listInputFiles(rootDir);
+  const { filePaths } = await listInputFiles(rootDir);
+  return filePaths;
 }
 
 function isMarkdownPath(path: string): boolean {
@@ -234,15 +238,24 @@ type ListInputFilesOptions = {
   includeFile?: (path: string) => boolean;
 };
 
-async function listInputFiles(rootDir: string, options: ListInputFilesOptions = {}): Promise<string[]> {
+async function listInputFiles(
+  rootDir: string,
+  options: ListInputFilesOptions = {},
+): Promise<{ filePaths: string[]; linkableFilePaths: string[] }> {
   const paths: string[] = [];
+  const linkableFilePaths: string[] = [];
 
   async function visit(relativeDir: string): Promise<void> {
     const absoluteDir = resolve(rootDir, relativeDir);
     const entries = await readdir(absoluteDir);
     for (const entry of entries.sort()) {
       const path = joinRelativePath(relativeDir, entry);
-      if (shouldSkipPath(path)) {
+      if (SKIPPED_FILES.has(path)) {
+        linkableFilePaths.push(path);
+        continue;
+      }
+
+      if (shouldSkipRoot(path)) {
         continue;
       }
 
@@ -267,10 +280,10 @@ async function listInputFiles(rootDir: string, options: ListInputFilesOptions = 
   }
 
   await visit("");
-  return paths.sort();
+  return { filePaths: paths.sort(), linkableFilePaths: linkableFilePaths.sort() };
 }
 
-function shouldSkipPath(path: string): boolean {
+function shouldSkipRoot(path: string): boolean {
   return SKIPPED_ROOTS.some((skippedRoot) => path === skippedRoot || path.startsWith(`${skippedRoot}/`));
 }
 

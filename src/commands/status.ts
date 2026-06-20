@@ -1,12 +1,13 @@
-import type { Command } from "commander";
+import { CommanderError, type Command } from "commander";
 
 import type { CliIo } from "../cli.js";
-import { addRuntimeOptions, runRuntimeCommand, type RawRuntimeCommandOptions } from "../runtime/command.js";
-import { WIKI_CONFIG_RELATIVE_PATH } from "../runtime/repo.js";
-
-type StatusData = {
-  configPath: typeof WIKI_CONFIG_RELATIVE_PATH;
-};
+import {
+  addRuntimeOptions,
+  runRuntimeCommand,
+  type RawRuntimeCommandOptions,
+  type RuntimeCommandOptions,
+} from "../runtime/command.js";
+import { getWikiStatus, type StatusData } from "../runtime/status.js";
 
 export function registerStatusCommand(program: Command, io: CliIo): void {
   addRuntimeOptions(
@@ -18,13 +19,96 @@ export function registerStatusCommand(program: Command, io: CliIo): void {
       command: "status",
       rawOptions,
       io,
-      run: async () => ({
-        data: {
-          configPath: WIKI_CONFIG_RELATIVE_PATH,
-        },
-      }),
-      formatHuman: (envelope) =>
-        ["LLM Wiki status", `Repo: ${envelope.repo}`, `Config: ${envelope.data.configPath}`].join("\n"),
+      run: async ({ repo, options }) => {
+        try {
+          return {
+            data: await getWikiStatus(repo.rootDir),
+          };
+        } catch (error) {
+          throwStatusScanError(io, repo.rootDir, error, options);
+        }
+      },
+      formatHuman: (envelope) => formatHumanStatus(envelope.repo, envelope.data),
     });
   });
+}
+
+function throwStatusScanError(io: CliIo, repoRoot: string, error: unknown, options: RuntimeCommandOptions): never {
+  const detail = error instanceof Error ? error.message : String(error);
+  const message = "Status failed while scanning repository.";
+  const envelope = {
+    ok: false,
+    command: "status" as const,
+    repo: repoRoot,
+    error: {
+      code: "status_failed" as const,
+      message,
+      hint: "Fix unreadable or invalid wiki files, then rerun llm-wiki status.",
+    },
+    issues: [
+      {
+        severity: "error" as const,
+        code: "status_scan_failed",
+        message: `${message} ${detail}`,
+        path: ".",
+        hint: "Fix unreadable Markdown, JSON, profile, or runtime files before rerunning status.",
+      },
+    ],
+  };
+
+  if (options.json) {
+    io.stdout(JSON.stringify(envelope));
+  } else {
+    io.stderr(`Error: ${envelope.error.message}`);
+    if (!options.quiet) {
+      io.stderr(envelope.issues[0]?.message ?? message);
+    }
+  }
+
+  throw new CommanderError(1, "llm-wiki.status", envelope.error.message);
+}
+
+function formatHumanStatus(repo: string, data: StatusData): string {
+  return [
+    "LLM Wiki status",
+    `Repo: ${repo}`,
+    `Config: ${formatConfigStatus(data)}`,
+    ...formatConfigErrorLines(data),
+    `Health: ${data.health.state}`,
+    `Lint: ${data.lint.counts.error} errors, ${data.lint.counts.warning} warnings`,
+    `Queue: ${data.queue.counts.total} total, ${data.queue.counts.queued} queued, ${data.queue.counts.ingesting} ingesting, ${data.queue.counts.ingested} ingested, ${data.queue.counts.blocked} blocked`,
+    `Git: ${formatGitStatus(data)}`,
+    `Profiles: ${data.profiles.valid}/${data.profiles.total} valid`,
+    `Explorer: ${data.explorer.ready ? "ready" : data.explorer.initialized ? "initialized" : "not initialized"}`,
+  ].join("\n");
+}
+
+function formatConfigErrorLines(data: StatusData): string[] {
+  return data.config.errors.map((error) => `Config error: ${error.message}`);
+}
+
+function formatConfigStatus(data: StatusData): string {
+  if (data.config.valid) {
+    return data.config.git_enabled ? "valid, Git enabled" : "valid, Git disabled";
+  }
+
+  return `${data.config.errors.length} config error(s)`;
+}
+
+function formatGitStatus(data: StatusData): string {
+  if (data.git.enabled === null) {
+    return "unknown until config is fixed";
+  }
+
+  if (!data.git.enabled && !data.git.repository) {
+    return "disabled";
+  }
+
+  const state = [
+    data.git.branch === null ? "branch unknown" : `branch ${data.git.branch}`,
+    data.git.head === null ? "head unknown" : `head ${data.git.head}`,
+    data.git.dirty === null ? "dirty unknown" : data.git.dirty ? "dirty" : "clean",
+  ].join(", ");
+
+  return data.git.errors.length === 0 ? state : `${state}, ${data.git.errors.length} git error(s)`;
 }

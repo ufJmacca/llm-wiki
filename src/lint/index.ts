@@ -79,6 +79,7 @@ const PUBLIC_FORBIDDEN_SKIPPED_PROFILE_ROOTS = [
     ],
   },
 ] as const;
+const PUBLIC_SKIPPED_NON_MARKDOWN_PROFILE_PATHS = [".llm-wiki/config.yml"] as const;
 
 export async function lintWiki(repoRoot: string, options: LintOptions = {}): Promise<LintResult> {
   const scan = await scanWikiRepository(repoRoot);
@@ -791,7 +792,11 @@ function publicProfileIssues(scan: RepoScan, profileName: string, linkIndex: Lin
   const exclude = toStringArray(profile.scan.profile.exclude);
   const configuredRequiredVisibility = profileRequiredVisibility(profile.scan.profile);
   const requiredVisibility = "public";
-  const selectedPaths = new Set(scan.files.map((file) => file.path).filter((path) => matchesProfile(path, include, exclude)));
+  const selectedPaths = new Set([
+    ...scan.files.map((file) => file.path).filter((path) => matchesProfile(path, include, exclude)),
+    ...scan.linkableFilePaths.filter((path) => matchesProfile(path, include, exclude)),
+    ...selectedSkippedNonMarkdownProfilePaths(include, exclude),
+  ]);
   const markdownByPath = linkIndex.markdownByPath;
   const issues: LintIssue[] = [];
 
@@ -1397,7 +1402,7 @@ function publicProfileLinkResolutions(scan: RepoScan, page: RepoMarkdownFile, li
 }
 
 export function createLinkResolutionIndex(scan: RepoScan): LinkResolutionIndex {
-  const filePaths = new Set(scan.files.map((file) => file.path));
+  const filePaths = new Set([...scan.files.map((file) => file.path), ...scan.linkableFilePaths]);
   const markdownByPath = new Map<string, RepoMarkdownFile>();
   const markdownByTitle = new Map<string, RepoMarkdownFile>();
   const markdownByBasename = new Map<string, RepoMarkdownFile>();
@@ -1553,6 +1558,10 @@ function selectedForbiddenSkippedProfileRoots(include: string[], exclude: string
       ? [root.path]
       : [],
   );
+}
+
+function selectedSkippedNonMarkdownProfilePaths(include: string[], exclude: string[]): string[] {
+  return PUBLIC_SKIPPED_NON_MARKDOWN_PROFILE_PATHS.filter((path) => matchesProfile(path, include, exclude));
 }
 
 function concreteForbiddenRootCandidates(rootPath: string, include: string[]): string[] {

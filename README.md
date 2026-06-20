@@ -2,7 +2,7 @@
 
 `llm-wiki` is a local-first CLI for creating a Git-backed, Obsidian-compatible Markdown wiki that can later grow into the full LLM Wiki workflow described in the PRD.
 
-The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, and `llm-wiki add-url` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki log`, `llm-wiki lint`, `llm-wiki index rebuild`, `llm-wiki status`, `llm-wiki snapshot`, `llm-wiki search`, and `llm-wiki nav` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
+The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, and `llm-wiki add-url` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki ingest`, `llm-wiki log`, `llm-wiki lint`, `llm-wiki index rebuild`, `llm-wiki status`, `llm-wiki snapshot`, `llm-wiki search`, and `llm-wiki nav` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
 
 ## Development
 
@@ -25,8 +25,11 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/commands/init.ts` owns the first supported `llm-wiki init` command behavior.
 - `src/commands/add.ts`, `src/commands/addText.ts`, and `src/commands/addUrl.ts` own source capture command behavior.
 - `src/commands/queue.ts` and `src/commands/log.ts` own queue inspection, status transitions, and parsed runtime log output.
+- `src/commands/ingest.ts` owns ingest task prompt generation, optional branch creation, and validation-driven completion.
 - `src/commands/lint.ts` and `src/commands/index.ts` own executable lint checks and rebuildable cache generation.
 - `src/commands/search.ts` and `src/commands/nav.ts` own offline search and Markdown graph/navigation command behavior.
+- `src/agentTasks/` owns deterministic agent prompt/task assembly.
+- `src/validation/` owns workflow-specific validation gates before state transitions.
 - `src/commands/status.ts` and `src/commands/snapshot.ts` own runtime health reporting and lint-gated Git snapshots.
 - `src/sourceCapture/` owns deterministic source IDs, hashing, metadata, duplicate detection, and raw writes.
 - `src/scanner/` normalizes repository Markdown, queue, profile, raw, and log state for lint and cache rebuild workflows.
@@ -55,6 +58,8 @@ llm-wiki add-url https://example.com/research-note --title "Fetched Note"
 llm-wiki queue
 llm-wiki queue show <source_id>
 llm-wiki queue set-status <source_id> ingesting
+llm-wiki ingest <source_id>
+llm-wiki ingest <source_id> --validate
 llm-wiki log
 llm-wiki lint
 llm-wiki lint --fix
@@ -87,6 +92,8 @@ llm-wiki add-url https://example.com/research-note --repo my-wiki --title "Fetch
 llm-wiki queue --repo my-wiki --json
 llm-wiki queue show <source_id> --repo my-wiki --json
 llm-wiki queue set-status <source_id> ingesting --repo my-wiki --json
+llm-wiki ingest <source_id> --repo my-wiki --json
+llm-wiki ingest <source_id> --repo my-wiki --validate --json
 llm-wiki log --repo my-wiki --json
 llm-wiki lint --repo my-wiki --json
 llm-wiki lint --repo my-wiki --profile public --strict --json
@@ -108,7 +115,7 @@ llm-wiki snapshot --repo my-wiki --json
 
 `snapshot` runs lint before touching Git. It refuses to commit while error-severity lint issues exist, and malformed or unreadable config fails with an actionable config error before Git preflight. When lint passes, it stages the repository, creates a `chore: snapshot llm-wiki state` commit, falls back to the built-in llm-wiki Git identity when local Git identity is missing, and reports the commit SHA plus post-commit Git state.
 
-`add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files.
+`add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `ingest` returns a generated agent task prompt or validation result. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files.
 
 ## Source Capture
 
@@ -135,6 +142,14 @@ Duplicate content returns the existing source metadata with `status: duplicate` 
 `llm-wiki queue set-status <source_id> <status>` supports explicit validated transitions: `queued -> ingesting`, `ingesting -> ingested`, `ingesting -> blocked`, and `blocked -> queued`. It mirrors the status and `updated_at` timestamp into both the queue JSON and `_source.md`, updates the source card body status line, and appends a parseable `ingest` entry to `curated/log.md`.
 
 `llm-wiki log` parses runtime entries from `curated/log.md` while ignoring the seeded entry-format template and fenced examples. JSON output includes parsed entries, scanner issues, and counts.
+
+## Ingest Tasks
+
+`llm-wiki ingest <source_id>` loads the queue item, raw source card, immutable original path, text originals when safe to inline, `AGENTS.md`, `curated/index.md`, and related pages discovered through search/navigation. It prints a task prompt with required curated outputs, raw immutability rules, and the follow-up validation command. Queued sources move to `ingesting`; already-ingesting sources keep their status.
+
+When the wiki has Git enabled, `ingest` recommends `git switch -c ingest/<source_id>`. Pass `--create-branch` to create that branch explicitly.
+
+`llm-wiki ingest <source_id> --validate` checks that the agent created `curated/sources/<source_id>.md`, updated `curated/index.md`, appended an ingest log entry, kept `source_ids` on edited curated pages, and left raw originals unchanged. The queue item moves to `ingested` only after validation passes.
 
 ## Search and Navigation
 
@@ -208,9 +223,8 @@ Agent-specific files are thin pointers:
 
 The following PRD features are not implemented in this foundation slice:
 
-- `ingest` task orchestration and validation.
 - `Quartz runtime`, including `explore init`, `explore sync`, `explore serve`, browser search, backlinks, and graph UI.
 - `upload` workflows, local daemon, remote API, and browser upload form.
 - `GitHub Pages deploy`, including deploy profile initialization, local preflight, generated Pages workflow, and Pages status checks.
 
-Until those features land, the supported product behavior is repo initialization plus local source capture, queue/log inspection, lint/index rebuild, status reporting, Git snapshots, and offline search/navigation over local Markdown.
+Until those features land, the supported product behavior is repo initialization plus local source capture, ingest task scaffolding and validation, queue/log inspection, lint/index rebuild, status reporting, Git snapshots, and offline search/navigation over local Markdown.

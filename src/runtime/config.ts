@@ -1,3 +1,6 @@
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
+
 import { parse } from "yaml";
 
 import { readTextFileInsideRoot } from "../utils/fs.js";
@@ -23,6 +26,18 @@ export type ProviderConfigError = {
   message: string;
   path: string;
   hint: string;
+};
+
+export type WikiConfigIssue = {
+  severity: "error";
+  code: "wiki_config_unreadable" | "wiki_config_invalid";
+  message: string;
+  path: typeof WIKI_CONFIG_RELATIVE_PATH;
+  hint: string;
+};
+
+export type WikiGitConfig = {
+  gitEnabled: boolean;
 };
 
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -133,6 +148,41 @@ export async function loadProviderConfig(
   });
 }
 
+export async function readWikiGitConfig(repoRoot: string): Promise<Result<WikiGitConfig, WikiConfigIssue>> {
+  let source: string;
+  try {
+    source = await readFile(resolve(repoRoot, WIKI_CONFIG_RELATIVE_PATH), "utf8");
+  } catch (error) {
+    return err({
+      severity: "error",
+      code: "wiki_config_unreadable",
+      message: `Could not read ${WIKI_CONFIG_RELATIVE_PATH}: ${formatConfigError(error)}`,
+      path: WIKI_CONFIG_RELATIVE_PATH,
+      hint: "Ensure .llm-wiki/config.yml is readable and was created by llm-wiki init.",
+    });
+  }
+
+  let config: unknown;
+  try {
+    config = parse(source) as unknown;
+  } catch (error) {
+    return err({
+      severity: "error",
+      code: "wiki_config_invalid",
+      message: `Could not parse ${WIKI_CONFIG_RELATIVE_PATH}: ${formatConfigError(error)}`,
+      path: WIKI_CONFIG_RELATIVE_PATH,
+      hint: "Fix the YAML syntax in .llm-wiki/config.yml or recreate it with llm-wiki init.",
+    });
+  }
+
+  const gitConfig = configGitEnabled(config);
+  if (!gitConfig.ok) {
+    return gitConfig;
+  }
+
+  return ok({ gitEnabled: gitConfig.value });
+}
+
 function invalidProvider(providerName: string, message: string): Result<never, ProviderConfigError> {
   return err({
     code: "PROVIDER_CONFIG_INVALID",
@@ -140,6 +190,47 @@ function invalidProvider(providerName: string, message: string): Result<never, P
     path: `${WIKI_CONFIG_RELATIVE_PATH}:providers.${providerName}`,
     hint: "Configure providers as type: http, endpoint: <url>, api_key_env: ENV_VAR_NAME, and optional model.",
   });
+}
+
+function configGitEnabled(config: unknown): Result<boolean, WikiConfigIssue> {
+  const configRecord = asRecord(config);
+  if (configRecord === null) {
+    return err({
+      severity: "error",
+      code: "wiki_config_invalid",
+      message: `Invalid ${WIKI_CONFIG_RELATIVE_PATH}: config root must be a mapping.`,
+      path: WIKI_CONFIG_RELATIVE_PATH,
+      hint: "Recreate .llm-wiki/config.yml with llm-wiki init or restore the generated mapping structure.",
+    });
+  }
+
+  const features = configRecord.features;
+  if (!("features" in configRecord)) {
+    return ok(false);
+  }
+
+  const featuresRecord = asRecord(features);
+  if (featuresRecord === null) {
+    return err({
+      severity: "error",
+      code: "wiki_config_invalid",
+      message: `Invalid ${WIKI_CONFIG_RELATIVE_PATH}: features must be a mapping when present.`,
+      path: WIKI_CONFIG_RELATIVE_PATH,
+      hint: "Set features to a YAML mapping such as features: { git: true } or recreate the config with llm-wiki init.",
+    });
+  }
+
+  if ("git" in featuresRecord && typeof featuresRecord.git !== "boolean") {
+    return err({
+      severity: "error",
+      code: "wiki_config_invalid",
+      message: `Invalid ${WIKI_CONFIG_RELATIVE_PATH}: features.git must be a boolean when present.`,
+      path: WIKI_CONFIG_RELATIVE_PATH,
+      hint: "Set features.git to true or false in .llm-wiki/config.yml.",
+    });
+  }
+
+  return ok(featuresRecord.git === true);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -212,4 +303,12 @@ function isHttpUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function formatConfigError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message.replace(/\s+/g, " ").trim();
+  }
+
+  return String(error);
 }

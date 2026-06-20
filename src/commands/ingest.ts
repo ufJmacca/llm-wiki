@@ -4,6 +4,12 @@ import { CommanderError, type Command } from "commander";
 
 import type { CliIo } from "../cli.js";
 import { buildIngestTask, type IngestTask } from "../agentTasks/ingest.js";
+import {
+  applyProviderProposalsWithValidation,
+  requestProviderFileProposals,
+  validateProposalsOnTemporaryRepo,
+} from "../providers/index.js";
+import { loadProviderConfig, type HttpProviderConfig, type ProviderConfigError } from "../runtime/config.js";
 import { addRuntimeOptions, type RawRuntimeCommandOptions, type RuntimeCommandOptions } from "../runtime/command.js";
 import { buildRuntimeFailureEnvelope, buildRuntimeSuccessEnvelope, type RuntimeIssue } from "../runtime/envelope.js";
 import { RuntimeCommandError } from "../runtime/errors.js";
@@ -17,6 +23,7 @@ type RawIngestOptions = RawRuntimeCommandOptions & {
   validate?: unknown;
   taskOut?: unknown;
   createBranch?: unknown;
+  provider?: unknown;
 };
 
 type IngestGitData = {
@@ -51,7 +58,30 @@ type IngestValidationData = {
   };
 };
 
-type IngestData = IngestTaskData | IngestValidationData;
+type IngestProviderData = {
+  mode: "provider";
+  provider: {
+    name: string;
+    model: string | null;
+  };
+  source: {
+    source_id: string;
+    status: "ingested";
+  };
+  proposals: {
+    applied_paths: string[];
+  };
+  validation: {
+    passed: true;
+    issues: [];
+  };
+  queue: {
+    previous_status: QueueStatus;
+    status: "ingested";
+  };
+};
+
+type IngestData = IngestTaskData | IngestValidationData | IngestProviderData;
 
 type IngestStateSnapshot = {
   sourceCardPath: string;
@@ -69,7 +99,8 @@ export function registerIngestCommand(program: Command, io: CliIo): void {
       .argument("<source_id>", "source ID to ingest")
       .option("--validate", "validate completed ingest output and mark source ingested", false)
       .option("--task-out <path>", "write the generated task prompt to a repository-relative path")
-      .option("--create-branch", "create the recommended ingest branch when Git is enabled", false),
+      .option("--create-branch", "create the recommended ingest branch when Git is enabled", false)
+      .option("--provider <name>", "execute an explicitly configured provider and apply validated file proposals"),
   ).action(async (sourceId: string, rawOptions: RawIngestOptions) => {
     await runIngestCommand(sourceId, rawOptions, io);
   });
@@ -93,7 +124,9 @@ async function runIngestCommand(sourceId: string, rawOptions: RawIngestOptions, 
   try {
     const data = rawOptions.validate === true
       ? await validateAndCompleteIngest(resolvedRepo.value.rootDir, sourceId)
-      : await createIngestTask(resolvedRepo.value.rootDir, sourceId, rawOptions);
+      : typeof rawOptions.provider === "string"
+        ? await executeProviderIngest(resolvedRepo.value.rootDir, sourceId, rawOptions.provider)
+        : await createIngestTask(resolvedRepo.value.rootDir, sourceId, rawOptions);
     const envelope = buildRuntimeSuccessEnvelope("ingest", resolvedRepo.value.rootDir, data, []);
 
     if (options.json) {
@@ -145,6 +178,63 @@ async function runIngestCommand(sourceId: string, rawOptions: RawIngestOptions, 
 
     throw new CommanderError(1, "llm-wiki.ingest", envelope.error.message);
   }
+}
+
+async function executeProviderIngest(
+  repoRoot: string,
+  sourceId: string,
+  providerName: string,
+): Promise<IngestProviderData> {
+  const task = await buildIngestTask({
+    repoRoot,
+    sourceId,
+  });
+  if (!task.ok) {
+    throw new RuntimeCommandError({
+      code: task.error.code,
+      message: task.error.message,
+      hint: task.error.hint,
+      path: task.error.path,
+    });
+  }
+
+  ensureIngestTaskCanStart(task.value);
+  const provider = await resolveProviderConfig(repoRoot, providerName);
+  const proposals = await requestProviderFileProposals({
+    kind: "ingest",
+    provider,
+    task: task.value,
+  });
+
+  await validateProposalsOnTemporaryRepo(repoRoot, proposals, async (tempRepoRoot) => {
+    const validation = await validateIngestReadiness(tempRepoRoot, sourceId);
+    if (!validation.passed) {
+      throw new IngestValidationFailedError(validation.issues);
+    }
+  });
+
+  const { appliedPaths, validation: completed } = await applyProviderProposalsWithValidation(
+    repoRoot,
+    proposals,
+    async () => validateAndCompleteIngest(repoRoot, sourceId),
+  );
+
+  return {
+    mode: "provider",
+    provider: publicProviderData(provider),
+    source: {
+      source_id: sourceId,
+      status: "ingested",
+    },
+    proposals: {
+      applied_paths: appliedPaths,
+    },
+    validation: {
+      passed: true,
+      issues: [],
+    },
+    queue: completed.queue,
+  };
 }
 
 async function createIngestTask(
@@ -483,6 +573,31 @@ function queueRuntimeError(code: string, message: string, hint: string, path: st
   });
 }
 
+async function resolveProviderConfig(repoRoot: string, providerName: string): Promise<HttpProviderConfig> {
+  const provider = await loadProviderConfig(repoRoot, providerName);
+  if (!provider.ok) {
+    throw providerConfigRuntimeError(provider.error);
+  }
+
+  return provider.value;
+}
+
+function providerConfigRuntimeError(error: ProviderConfigError): RuntimeCommandError {
+  return new RuntimeCommandError({
+    code: error.code,
+    message: error.message,
+    hint: error.hint,
+    path: error.path,
+  });
+}
+
+function publicProviderData(provider: HttpProviderConfig): IngestProviderData["provider"] {
+  return {
+    name: provider.name,
+    model: provider.model,
+  };
+}
+
 class IngestValidationFailedError extends Error {
   readonly issues: IngestValidationIssue[];
 
@@ -540,6 +655,16 @@ function formatHumanIngest(data: IngestData): string {
       "Ingest validation passed",
       `Source ID: ${data.source.source_id}`,
       `Status: ${data.queue.previous_status} -> ${data.queue.status}`,
+    ].join("\n");
+  }
+
+  if (data.mode === "provider") {
+    return [
+      `Provider ingest applied: ${data.provider.name}`,
+      `Source ID: ${data.source.source_id}`,
+      `Status: ${data.queue.previous_status} -> ${data.queue.status}`,
+      "Applied paths:",
+      ...data.proposals.applied_paths.map((path) => `- ${path}`),
     ].join("\n");
   }
 

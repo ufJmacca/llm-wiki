@@ -66,6 +66,12 @@ export type RepoScan = {
   log: RepoLogFile | null;
 };
 
+export type RepoScanMode = "full" | "liveMarkdown";
+
+export type ScanWikiRepositoryOptions = {
+  mode?: RepoScanMode;
+};
+
 const SKIPPED_ROOTS = [
   ".git",
   ".llm-wiki/cache",
@@ -78,8 +84,14 @@ const SKIPPED_ROOTS = [
 ];
 const SKIPPED_FILES = new Set([".llm-wiki/config.yml"]);
 
-export async function scanWikiRepository(rootDir: string): Promise<RepoScan> {
-  const { filePaths, linkableFilePaths } = await listInputFiles(rootDir);
+export async function scanWikiRepository(
+  rootDir: string,
+  options: ScanWikiRepositoryOptions = {},
+): Promise<RepoScan> {
+  const mode = options.mode ?? "full";
+  const { filePaths, linkableFilePaths } = await listInputFiles(rootDir, {
+    includeFile: mode === "liveMarkdown" ? isLiveMarkdownFilePath : undefined,
+  });
   const files: RepoFile[] = [];
   const markdown: RepoMarkdownFile[] = [];
   const queueFiles: RepoQueueFile[] = [];
@@ -164,8 +176,17 @@ export async function scanWikiRepository(rootDir: string): Promise<RepoScan> {
   };
 }
 
+export async function listRepositoryFilePaths(rootDir: string): Promise<string[]> {
+  const { filePaths } = await listInputFiles(rootDir);
+  return filePaths;
+}
+
 function isMarkdownPath(path: string): boolean {
   return extname(path).toLowerCase() === ".md";
+}
+
+function isLiveMarkdownFilePath(path: string): boolean {
+  return isMarkdownPath(path) && isLiveMarkdownPath(path);
 }
 
 function isQueueJsonPath(path: string): boolean {
@@ -213,7 +234,14 @@ function toSourceCard(file: RepoMarkdownFile): SourceCard {
   };
 }
 
-async function listInputFiles(rootDir: string): Promise<{ filePaths: string[]; linkableFilePaths: string[] }> {
+type ListInputFilesOptions = {
+  includeFile?: (path: string) => boolean;
+};
+
+async function listInputFiles(
+  rootDir: string,
+  options: ListInputFilesOptions = {},
+): Promise<{ filePaths: string[]; linkableFilePaths: string[] }> {
   const paths: string[] = [];
   const linkableFilePaths: string[] = [];
 
@@ -243,7 +271,10 @@ async function listInputFiles(rootDir: string): Promise<{ filePaths: string[]; l
       }
 
       if (pathStat.isFile()) {
-        paths.push(toPosixPath(relative(rootDir, absolutePath)));
+        const relativePath = toPosixPath(relative(rootDir, absolutePath));
+        if (options.includeFile?.(relativePath) ?? true) {
+          paths.push(relativePath);
+        }
       }
     }
   }

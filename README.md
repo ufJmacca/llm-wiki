@@ -2,7 +2,7 @@
 
 `llm-wiki` is a local-first CLI for creating a Git-backed, Obsidian-compatible Markdown wiki that can later grow into the full LLM Wiki workflow described in the PRD.
 
-The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, and `llm-wiki add-url` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki log`, `llm-wiki lint`, `llm-wiki index rebuild`, `llm-wiki status`, and `llm-wiki snapshot` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
+The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, and `llm-wiki add-url` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki log`, `llm-wiki lint`, `llm-wiki index rebuild`, `llm-wiki status`, `llm-wiki snapshot`, `llm-wiki search`, and `llm-wiki nav` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
 
 ## Development
 
@@ -26,11 +26,13 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/commands/add.ts`, `src/commands/addText.ts`, and `src/commands/addUrl.ts` own source capture command behavior.
 - `src/commands/queue.ts` and `src/commands/log.ts` own queue inspection, status transitions, and parsed runtime log output.
 - `src/commands/lint.ts` and `src/commands/index.ts` own executable lint checks and rebuildable cache generation.
+- `src/commands/search.ts` and `src/commands/nav.ts` own offline search and Markdown graph/navigation command behavior.
 - `src/commands/status.ts` and `src/commands/snapshot.ts` own runtime health reporting and lint-gated Git snapshots.
 - `src/sourceCapture/` owns deterministic source IDs, hashing, metadata, duplicate detection, and raw writes.
 - `src/scanner/` normalizes repository Markdown, queue, profile, raw, and log state for lint and cache rebuild workflows.
 - `src/lint/` owns raw hash, source-card, queue, log, index, wikilink, provenance, and public-profile leak rules.
 - `src/index/` owns generated `.llm-wiki/cache/*` files built from source Markdown and raw state.
+- `src/search/` and `src/nav/` own local Markdown search scoring, source relation lookup, wikilink navigation, orphan reporting, and graph JSON.
 - `src/runtime/status.ts` owns health aggregation across lint, queue, profiles, Git, and Explorer readiness.
 - `src/runtime/queue.ts` and `src/runtime/log.ts` own queue/source-card consistency and runtime log parsing/appending.
 - `src/scaffold/` plans and writes generated wiki files.
@@ -58,6 +60,12 @@ llm-wiki lint
 llm-wiki lint --fix
 llm-wiki lint --profile public --strict
 llm-wiki index rebuild
+llm-wiki search "research note" --scope all
+llm-wiki nav outlinks curated/topics/example.md
+llm-wiki nav backlinks curated/topics/example.md
+llm-wiki nav sources curated/topics/example.md
+llm-wiki nav orphans
+llm-wiki nav graph --json
 llm-wiki status
 llm-wiki snapshot
 git status
@@ -83,6 +91,12 @@ llm-wiki log --repo my-wiki --json
 llm-wiki lint --repo my-wiki --json
 llm-wiki lint --repo my-wiki --profile public --strict --json
 llm-wiki index rebuild --repo my-wiki --json
+llm-wiki search "research note" --repo my-wiki --scope all --json
+llm-wiki nav outlinks curated/topics/example.md --repo my-wiki --json
+llm-wiki nav backlinks curated/topics/example.md --repo my-wiki --json
+llm-wiki nav sources curated/topics/example.md --repo my-wiki --json
+llm-wiki nav orphans --repo my-wiki --json
+llm-wiki nav graph --repo my-wiki --json
 llm-wiki snapshot --repo my-wiki --json
 ```
 
@@ -94,7 +108,7 @@ llm-wiki snapshot --repo my-wiki --json
 
 `snapshot` runs lint before touching Git. It refuses to commit while error-severity lint issues exist, and malformed or unreadable config fails with an actionable config error before Git preflight. When lint passes, it stages the repository, creates a `chore: snapshot llm-wiki state` commit, falls back to the built-in llm-wiki Git identity when local Git identity is missing, and reports the commit SHA plus post-commit Git state.
 
-`add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state.
+`add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files.
 
 ## Source Capture
 
@@ -121,6 +135,18 @@ Duplicate content returns the existing source metadata with `status: duplicate` 
 `llm-wiki queue set-status <source_id> <status>` supports explicit validated transitions: `queued -> ingesting`, `ingesting -> ingested`, `ingesting -> blocked`, and `blocked -> queued`. It mirrors the status and `updated_at` timestamp into both the queue JSON and `_source.md`, updates the source card body status line, and appends a parseable `ingest` entry to `curated/log.md`.
 
 `llm-wiki log` parses runtime entries from `curated/log.md` while ignoring the seeded entry-format template and fenced examples. JSON output includes parsed entries, scanner issues, and counts.
+
+## Search and Navigation
+
+`llm-wiki search "<query>" --scope raw|curated|all` searches live Markdown titles, aliases, tags, headings, body text, source cards, curated summaries, and `source_ids`. JSON results include path, page type, title, snippet, score, source IDs, visibility, and matched fields. System/generated pages such as `curated/log.md`, dashboards, and Quartz output are excluded from search inputs.
+
+`llm-wiki nav outlinks <page>` and `llm-wiki nav backlinks <page>` parse Obsidian-style wikilinks, including aliases and heading targets, and return resolved target page metadata where possible.
+
+`llm-wiki nav sources <page>` resolves `source_ids` from a curated page to raw source cards and curated source summaries.
+
+`llm-wiki nav orphans` reports user-authored concept, entity, topic, question, and comparison pages with no inbound curated wikilinks. Generated/system pages such as `curated/home.md`, `curated/index.md`, `curated/log.md`, and `curated/dashboards/**` are excluded.
+
+`llm-wiki nav graph --json` returns browser-ready nodes and edges for local graph visualization.
 
 ## Lint and Index Rebuild
 
@@ -183,8 +209,8 @@ Agent-specific files are thin pointers:
 The following PRD features are not implemented in this foundation slice:
 
 - `ingest` task orchestration and validation.
-- `Quartz runtime`, including `explore init`, `explore sync`, `explore serve`, search, backlinks, and graph UI.
+- `Quartz runtime`, including `explore init`, `explore sync`, `explore serve`, browser search, backlinks, and graph UI.
 - `upload` workflows, local daemon, remote API, and browser upload form.
 - `GitHub Pages deploy`, including deploy profile initialization, local preflight, generated Pages workflow, and Pages status checks.
 
-Until those features land, the supported product behavior is repo initialization plus local source capture, queue/log inspection, lint/index rebuild, status reporting, and Git snapshots.
+Until those features land, the supported product behavior is repo initialization plus local source capture, queue/log inspection, lint/index rebuild, status reporting, Git snapshots, and offline search/navigation over local Markdown.

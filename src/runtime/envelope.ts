@@ -1,4 +1,5 @@
 import type { WikiRootError } from "./repo.js";
+import type { RuntimeCommandError } from "./errors.js";
 
 export type RuntimeIssue = {
   severity: "error" | "warning";
@@ -65,6 +66,32 @@ export function buildRuntimeFailureEnvelope<Command extends string>(
         code: error.code,
         message: error.message,
         path: error.startPath,
+        hint: error.hint,
+      },
+    ],
+  };
+}
+
+export function buildRuntimeCommandFailureEnvelope<Command extends string>(
+  command: Command,
+  error: RuntimeCommandError,
+  repo: string,
+): RuntimeFailureEnvelope<Command> {
+  return {
+    ok: false,
+    command,
+    repo,
+    error: {
+      code: error.code,
+      message: error.message,
+      hint: error.hint,
+    },
+    issues: [
+      {
+        severity: "error",
+        code: error.code,
+        message: error.message,
+        path: error.path,
         hint: error.hint,
       },
     ],

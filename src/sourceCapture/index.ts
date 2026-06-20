@@ -13,7 +13,7 @@ import {
 } from "../utils/fs.js";
 import { err, ok, type Result } from "../utils/result.js";
 
-export type SourceKind = "file" | "text";
+export type SourceKind = "file" | "text" | "url";
 export type QueueStatus = "queued";
 
 export type CapturedSource = {
@@ -21,6 +21,7 @@ export type CapturedSource = {
   title: string;
   source_kind: SourceKind;
   origin: string;
+  origin_url?: string;
   captured_at: string;
   content_hash: string;
   visibility: "private";
@@ -45,7 +46,11 @@ export type SourceCaptureErrorCode =
   | "SOURCE_PATH_UNSAFE"
   | "SOURCE_READ_FAILED"
   | "TEXT_REQUIRED"
-  | "TITLE_REQUIRED";
+  | "TITLE_REQUIRED"
+  | "URL_EMPTY_RESPONSE"
+  | "URL_FETCH_FAILED"
+  | "URL_INVALID"
+  | "URL_UNSUPPORTED_RESPONSE";
 
 export type SourceCaptureError = {
   code: SourceCaptureErrorCode;
@@ -70,11 +75,20 @@ export type CaptureTextSourceOptions = {
   command?: string;
 };
 
+export type CaptureUrlSourceOptions = {
+  repoRoot: string;
+  url: string;
+  title?: string;
+  now?: Date;
+  command?: string;
+};
+
 type CaptureInput = {
   repoRoot: string;
   title: string;
   sourceKind: SourceKind;
   origin: string;
+  originUrl?: string;
   originalExtension: string;
   content: Buffer;
   now: Date;
@@ -87,6 +101,7 @@ type QueueJson = {
   title: string;
   source_kind: SourceKind;
   origin: string;
+  origin_url?: string;
   captured_at: string;
   content_hash: string;
   status: QueueStatus;
@@ -155,6 +170,37 @@ export async function captureTextSource(
   });
 }
 
+export async function captureUrlSource(
+  options: CaptureUrlSourceOptions,
+): Promise<Result<SourceCaptureSuccess, SourceCaptureError>> {
+  const normalizedUrl = normalizeCaptureUrl(options.url);
+  if (!normalizedUrl.ok) {
+    return normalizedUrl;
+  }
+
+  const fetched = await fetchUrlText(normalizedUrl.value);
+  if (!fetched.ok) {
+    return fetched;
+  }
+
+  const title = normalizeTitle(options.title, deriveUrlTitle(normalizedUrl.value));
+  if (!title.ok) {
+    return title;
+  }
+
+  return captureSource({
+    repoRoot: options.repoRoot,
+    title: title.value,
+    sourceKind: "url",
+    origin: "url",
+    originUrl: normalizedUrl.value,
+    originalExtension: "md",
+    content: Buffer.from(fetched.value, "utf8"),
+    now: options.now ?? new Date(),
+    command: options.command ?? `llm-wiki add-url ${normalizedUrl.value}`,
+  });
+}
+
 async function captureSource(input: CaptureInput): Promise<Result<SourceCaptureSuccess, SourceCaptureError>> {
   const contentHash = `sha256:${sha256Hex(input.content)}`;
   const duplicate = await findDuplicateSource(input.repoRoot, contentHash);
@@ -183,6 +229,7 @@ async function captureSource(input: CaptureInput): Promise<Result<SourceCaptureS
     title: input.title,
     source_kind: input.sourceKind,
     origin: input.origin,
+    ...(input.originUrl === undefined ? {} : { origin_url: input.originUrl }),
     captured_at: capturedAt,
     content_hash: contentHash,
     visibility: "private",
@@ -443,6 +490,7 @@ async function findDuplicateSource(
       title: queueItem.title,
       source_kind: queueItem.source_kind,
       origin: queueItem.origin,
+      ...(typeof queueItem.origin_url === "string" ? { origin_url: queueItem.origin_url } : {}),
       captured_at: typeof queueItem.captured_at === "string" ? queueItem.captured_at : "",
       content_hash: contentHash,
       visibility: "private",
@@ -555,6 +603,7 @@ function isValidDuplicateQueueItem(value: unknown, contentHash: string): value i
     isSourceKind(value.source_kind) &&
     value.kind === value.source_kind &&
     isNonEmptyString(value.origin) &&
+    (value.source_kind !== "url" || isNonEmptyString(value.origin_url)) &&
     isNonEmptyString(value.captured_at) &&
     value.status === "queued" &&
     value.visibility === "private" &&
@@ -572,7 +621,7 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 function isSourceKind(value: unknown): value is SourceKind {
-  return value === "file" || value === "text";
+  return value === "file" || value === "text" || value === "url";
 }
 
 function isSourceId(value: unknown): value is string {
@@ -597,7 +646,7 @@ async function validateCaptureDestinations(
 }
 
 function toQueueJson(source: CapturedSource): QueueJson {
-  return {
+  const queueJson: QueueJson = {
     kind: source.source_kind,
     source_id: source.source_id,
     title: source.title,
@@ -610,6 +659,12 @@ function toQueueJson(source: CapturedSource): QueueJson {
     path: source.source_card_path,
     original_path: source.original_path,
   };
+
+  if (source.origin_url !== undefined) {
+    queueJson.origin_url = source.origin_url;
+  }
+
+  return queueJson;
 }
 
 function formatSourceCard(source: CapturedSource): string {
@@ -619,7 +674,7 @@ function formatSourceCard(source: CapturedSource): string {
     title: source.title,
     source_kind: source.source_kind,
     origin: source.origin,
-    origin_url: null,
+    origin_url: source.origin_url ?? null,
     captured_at: source.captured_at,
     content_hash: source.content_hash,
     status: source.queue_status,
@@ -673,6 +728,124 @@ function normalizeOriginalExtension(extension: string, fallback: string): string
   }
 
   return fallback;
+}
+
+function normalizeCaptureUrl(url: string): Result<string, SourceCaptureError> {
+  let parsedUrl: URL;
+
+  try {
+    parsedUrl = new URL(url.trim());
+  } catch {
+    return err(invalidUrl());
+  }
+
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    return err(invalidUrl());
+  }
+
+  return ok(parsedUrl.href);
+}
+
+async function fetchUrlText(url: string): Promise<Result<string, SourceCaptureError>> {
+  let response: Response;
+
+  try {
+    response = await fetch(url);
+  } catch {
+    return err({
+      code: "URL_FETCH_FAILED",
+      message: `Could not fetch URL: ${url}`,
+      path: url,
+      hint: "Check the URL and network connection, then try again.",
+    });
+  }
+
+  if (!response.ok) {
+    return err({
+      code: "URL_FETCH_FAILED",
+      message: `URL fetch returned HTTP ${response.status} for ${url}`,
+      path: url,
+      hint: "Fetchable URLs must return a successful HTTP status.",
+    });
+  }
+
+  const contentType = normalizeContentType(response.headers.get("content-type"));
+  if (!isSupportedUrlContentType(contentType)) {
+    return err({
+      code: "URL_UNSUPPORTED_RESPONSE",
+      message: `URL response content type is not supported: ${contentType}`,
+      path: url,
+      hint: "Capture URLs that return text, Markdown, HTML, XML, or JSON content.",
+    });
+  }
+
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    return err({
+      code: "URL_FETCH_FAILED",
+      message: `Could not read URL response: ${url}`,
+      path: url,
+      hint: "Check that the URL returns readable text content, then try again.",
+    });
+  }
+
+  if (text.trim().length === 0) {
+    return err({
+      code: "URL_EMPTY_RESPONSE",
+      message: `URL response was empty: ${url}`,
+      path: url,
+      hint: "Capture a URL that returns non-empty text content.",
+    });
+  }
+
+  return ok(text);
+}
+
+function invalidUrl(): SourceCaptureError {
+  return {
+    code: "URL_INVALID",
+    message: "URL capture requires a valid http(s) URL.",
+    path: "url",
+    hint: "Pass an absolute http:// or https:// URL to llm-wiki add-url.",
+  };
+}
+
+function normalizeContentType(contentType: string | null): string {
+  return contentType?.split(";")[0]?.trim().toLowerCase() ?? "";
+}
+
+function isSupportedUrlContentType(contentType: string): boolean {
+  return (
+    contentType === "" ||
+    contentType.startsWith("text/") ||
+    contentType === "application/json" ||
+    contentType === "application/ld+json" ||
+    contentType === "application/markdown" ||
+    contentType === "application/xhtml+xml" ||
+    contentType === "application/xml" ||
+    contentType.endsWith("+json") ||
+    contentType.endsWith("+xml")
+  );
+}
+
+function deriveUrlTitle(url: string): string {
+  const parsedUrl = new URL(url);
+  const lastPathSegment = parsedUrl.pathname.split("/").filter(Boolean).at(-1);
+  if (lastPathSegment !== undefined) {
+    return decodeUrlTitleSegment(lastPathSegment).replace(/\.[a-z0-9]+$/i, "");
+  }
+
+  return parsedUrl.hostname;
+}
+
+function decodeUrlTitleSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
 }
 
 function slugify(title: string): string {

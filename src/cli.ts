@@ -6,6 +6,7 @@ import { Command, CommanderError } from "commander";
 
 import { registerAddCommand } from "./commands/add.js";
 import { registerAddTextCommand } from "./commands/addText.js";
+import { registerAddUrlCommand } from "./commands/addUrl.js";
 import { registerInitCommand } from "./commands/init.js";
 import { registerStatusCommand } from "./commands/status.js";
 
@@ -65,6 +66,7 @@ function createProgram(io: CliIo): Command {
   registerInitCommand(program, io);
   registerAddCommand(program, io);
   registerAddTextCommand(program, io);
+  registerAddUrlCommand(program, io);
   registerStatusCommand(program, io);
 
   return program;

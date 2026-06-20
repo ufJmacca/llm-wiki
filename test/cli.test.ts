@@ -13,6 +13,8 @@ type PackageManifest = {
   version?: unknown;
   type?: unknown;
   bin?: Record<string, unknown>;
+  dependencies?: Record<string, unknown>;
+  devDependencies?: Record<string, unknown>;
   engines?: Record<string, unknown>;
   scripts?: Record<string, unknown>;
 };
@@ -69,6 +71,8 @@ describe("llm-wiki CLI baseline", () => {
     expect(manifest.type).toBe("module");
     expect(manifest.engines?.node).toBe(">=22");
     expect(manifest.bin?.["llm-wiki"]).toBe("./dist/src/cli.js");
+    expect(manifest.dependencies?.yaml).toEqual(expect.any(String));
+    expect(manifest.devDependencies?.yaml).toBeUndefined();
     for (const script of expectedScripts) {
       expect(manifest.scripts?.[script]).toEqual(expect.any(String));
     }

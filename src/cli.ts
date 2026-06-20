@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { Command, CommanderError } from "commander";
 
 import { registerInitCommand } from "./commands/init.js";
+import { registerStatusCommand } from "./commands/status.js";
 
 export type CliIo = {
   stdout: (message: string) => void;
@@ -58,6 +59,7 @@ function createProgram(io: CliIo): Command {
     });
 
   registerInitCommand(program, io);
+  registerStatusCommand(program, io);
 
   return program;
 }

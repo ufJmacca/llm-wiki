@@ -2,7 +2,7 @@
 
 `llm-wiki` is a local-first CLI for creating a Git-backed, Obsidian-compatible Markdown wiki that can later grow into the full LLM Wiki workflow described in the PRD.
 
-The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization.
+The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
 
 ## Development
 
@@ -41,6 +41,22 @@ git status
 ```
 
 For an uninstalled local checkout, use `node dist/src/cli.js init ...` after `npm run build`. The npm package exposes the same command as `llm-wiki` through `bin` after installation.
+
+## Shared Command Runtime
+
+Non-init commands accept the shared runtime options:
+
+```bash
+llm-wiki status --repo my-wiki
+llm-wiki status --repo my-wiki --json
+llm-wiki status --repo my-wiki --quiet
+```
+
+- `--repo <path>` may point at a wiki root or any descendant directory containing `.llm-wiki/config.yml` above it.
+- `--json` prints stable envelopes shaped as `{ ok, command, repo, data, warnings }` on success or `{ ok, command, repo, error, issues }` on failure.
+- `--quiet` suppresses human success output only. Human errors and JSON output are still printed.
+
+`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. Full health reporting is deferred to the status slice.
 
 ## Generated Scaffold Semantics
 

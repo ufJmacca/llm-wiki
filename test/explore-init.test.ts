@@ -114,11 +114,42 @@ describe("explore init command", () => {
         "quartz/package.json",
         "quartz/quartz.config.ts",
         "quartz/quartz.layout.ts",
+        "quartz/scripts/llm-wiki-loopback-listen.cjs",
+        "quartz/scripts/llm-wiki-sync-quartz-runtime.cjs",
       ]);
-      await expect(readGeneratedFile(wikiDir, "quartz/package.json")).resolves.toContain("\"private\": true");
-      await expect(readGeneratedFile(wikiDir, "quartz/quartz.config.ts")).resolves.toContain("LLM Wiki Quartz placeholder");
+      const packageJson = JSON.parse(await readGeneratedFile(wikiDir, "quartz/package.json")) as {
+        private: boolean;
+        version: string;
+        scripts: Record<string, string>;
+        dependencies: Record<string, string>;
+      };
+      expect(packageJson).toMatchObject({
+        private: true,
+        version: "4.5.2",
+        scripts: {
+          postinstall: "node scripts/llm-wiki-sync-quartz-runtime.cjs",
+          build: "node ./quartz/bootstrap-cli.mjs build",
+          serve: "node ./quartz/bootstrap-cli.mjs build --serve",
+        },
+        dependencies: {
+          "@jackyzha0/quartz": "github:jackyzha0/quartz#v4.5.2",
+        },
+      });
+      const quartzConfig = await readGeneratedFile(wikiDir, "quartz/quartz.config.ts");
+      expect(quartzConfig).toContain("pageTitle: \"LLM Wiki\"");
+      expect(quartzConfig).toContain("enableSiteMap: false");
+      expect(quartzConfig).toContain("enableRSS: false");
       await expect(readGeneratedFile(wikiDir, "quartz/components/LlmWikiReviewPanel.tsx")).resolves.toContain(
         "llm-wiki-review-panel",
+      );
+      await expect(readGeneratedFile(wikiDir, "quartz/scripts/llm-wiki-loopback-listen.cjs")).resolves.toContain(
+        "LLM_WIKI_EXPLORER_HOST",
+      );
+      await expect(readGeneratedFile(wikiDir, "quartz/scripts/llm-wiki-loopback-listen.cjs")).resolves.toContain(
+        "requestedHost === undefined",
+      );
+      await expect(readGeneratedFile(wikiDir, "quartz/scripts/llm-wiki-sync-quartz-runtime.cjs")).resolves.toContain(
+        "node_modules/@jackyzha0/quartz/quartz",
       );
     });
   });
@@ -163,6 +194,220 @@ describe("explore init command", () => {
       expect(payload.data.created_paths).not.toContain("quartz/package.json");
       expect(payload.warnings).toEqual(expect.arrayContaining([expect.stringContaining("quartz/package.json")]));
       await expect(readGeneratedFile(wikiDir, "quartz/package.json")).resolves.toBe(customPackageJson);
+    });
+  });
+
+  it("migrates old generated Quartz placeholders to the runnable runtime package", async () => {
+    await withTempWorkspace("llm-wiki-explore-init-upgrade-placeholder-", async (workspaceDir) => {
+      // Arrange
+      execFileMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz"), { recursive: true });
+      await writeFile(
+        resolve(wikiDir, "quartz/README.md"),
+        `# Quartz Runtime
+
+This directory contains LLM Wiki generated Quartz placeholders.
+
+Install dependencies:
+
+\`\`\`bash
+cd quartz && npm install
+\`\`\`
+
+Sync content with:
+
+\`\`\`bash
+llm-wiki explore sync --profile local
+\`\`\`
+`,
+        "utf8",
+      );
+      await writeFile(
+        resolve(wikiDir, "quartz/package.json"),
+        `${JSON.stringify(
+          {
+            private: true,
+            type: "module",
+            scripts: {
+              build: "quartz build",
+              serve: "quartz build --serve",
+            },
+            dependencies: {},
+            devDependencies: {},
+          },
+          null,
+          2,
+        )}\n`,
+        "utf8",
+      );
+      await writeFile(
+        resolve(wikiDir, "quartz/quartz.config.ts"),
+        `// LLM Wiki Quartz placeholder.
+// Replace this file with a full Quartz config when wiring the upstream Quartz runtime.
+export default {
+  configuration: {
+    pageTitle: "LLM Wiki",
+  },
+  plugins: {},
+};
+`,
+        "utf8",
+      );
+      await writeFile(
+        resolve(wikiDir, "quartz/quartz.layout.ts"),
+        `// LLM Wiki Quartz layout placeholder.
+export const defaultContentPageLayout = {
+  beforeBody: [],
+  left: [],
+  right: [],
+};
+`,
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      const payload = parseExploreInit(result.stdout);
+      const packageJson = JSON.parse(await readGeneratedFile(wikiDir, "quartz/package.json")) as {
+        version: string;
+        scripts: Record<string, string>;
+        dependencies: Record<string, string>;
+      };
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(execFile).not.toHaveBeenCalled();
+      expect(payload.data.created_paths).toContain("quartz/scripts/llm-wiki-sync-quartz-runtime.cjs");
+      expect(payload.data.created_paths).not.toContain("quartz/README.md");
+      expect(payload.data.created_paths).not.toContain("quartz/package.json");
+      const updatedWarning = payload.warnings.find((warning) =>
+        warning.startsWith("Updated generated Quartz runtime files:"),
+      );
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/README.md"));
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/package.json"));
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/quartz.config.ts"));
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/quartz.layout.ts"));
+      expect(payload.warnings).toEqual(
+        expect.arrayContaining([
+          "Quartz dependencies were not installed. Run: cd quartz && npm install",
+        ]),
+      );
+      expect(packageJson).toMatchObject({
+        version: "4.5.2",
+        scripts: {
+          postinstall: "node scripts/llm-wiki-sync-quartz-runtime.cjs",
+          build: "node ./quartz/bootstrap-cli.mjs build",
+          serve: "node ./quartz/bootstrap-cli.mjs build --serve",
+        },
+        dependencies: {
+          "@jackyzha0/quartz": "github:jackyzha0/quartz#v4.5.2",
+        },
+      });
+      await expect(readGeneratedFile(wikiDir, "quartz/quartz.config.ts")).resolves.toContain(
+        "import { QuartzConfig } from \"./quartz/cfg\"",
+      );
+    });
+  });
+
+  it("migrates exact generated Quartz configs that enabled feeds without a base URL", async () => {
+    await withTempWorkspace("llm-wiki-explore-init-upgrade-feed-config-", async (workspaceDir) => {
+      // Arrange
+      execFileMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const firstInit = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      expect(firstInit.exitCode).toBe(0);
+      const generatedConfig = await readGeneratedFile(wikiDir, "quartz/quartz.config.ts");
+      const oldGeneratedConfig = generatedConfig
+        .replace("enableSiteMap: false", "enableSiteMap: true")
+        .replace("enableRSS: false", "enableRSS: true");
+      await writeFile(resolve(wikiDir, "quartz/quartz.config.ts"), oldGeneratedConfig, "utf8");
+
+      // Act
+      const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      const payload = parseExploreInit(result.stdout);
+      const migratedConfig = await readGeneratedFile(wikiDir, "quartz/quartz.config.ts");
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      const updatedWarning = payload.warnings.find((warning) =>
+        warning.startsWith("Updated generated Quartz runtime files:"),
+      );
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/quartz.config.ts"));
+      expect(migratedConfig).toContain("enableSiteMap: false");
+      expect(migratedConfig).toContain("enableRSS: false");
+      expect(migratedConfig).not.toContain("enableSiteMap: true");
+      expect(migratedConfig).not.toContain("enableRSS: true");
+    });
+  });
+
+  it("preserves customized Quartz runtime files that retain old placeholder text", async () => {
+    await withTempWorkspace("llm-wiki-explore-init-customized-placeholder-", async (workspaceDir) => {
+      // Arrange
+      execFileMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz"), { recursive: true });
+      const customizedPackageJson = `${JSON.stringify(
+        {
+          private: true,
+          type: "module",
+          scripts: {
+            build: "quartz build",
+            serve: "quartz build --serve",
+          },
+          dependencies: {},
+          devDependencies: {},
+          customRuntime: true,
+        },
+        null,
+        2,
+      )}\n`;
+      const customizedReadme = `# Quartz Runtime
+
+This directory contains LLM Wiki generated Quartz placeholders.
+
+Custom operator notes that must not be overwritten.
+`;
+      const customizedConfig = `// LLM Wiki Quartz placeholder.
+// User-customized config that must not be overwritten.
+export default {
+  configuration: {
+    pageTitle: "Custom Wiki",
+  },
+  plugins: {},
+};
+`;
+      const customizedLayout = `// LLM Wiki Quartz layout placeholder.
+export const defaultContentPageLayout = {
+  beforeBody: ["custom"],
+  left: [],
+  right: [],
+};
+`;
+      await writeFile(resolve(wikiDir, "quartz/package.json"), customizedPackageJson, "utf8");
+      await writeFile(resolve(wikiDir, "quartz/README.md"), customizedReadme, "utf8");
+      await writeFile(resolve(wikiDir, "quartz/quartz.config.ts"), customizedConfig, "utf8");
+      await writeFile(resolve(wikiDir, "quartz/quartz.layout.ts"), customizedLayout, "utf8");
+
+      // Act
+      const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      const payload = parseExploreInit(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(execFile).not.toHaveBeenCalled();
+      expect(payload.warnings).not.toEqual(expect.arrayContaining([expect.stringContaining("Updated generated Quartz runtime files")]));
+      expect(payload.warnings).toEqual(expect.arrayContaining([expect.stringContaining("quartz/package.json")]));
+      await expect(readGeneratedFile(wikiDir, "quartz/package.json")).resolves.toBe(customizedPackageJson);
+      await expect(readGeneratedFile(wikiDir, "quartz/README.md")).resolves.toBe(customizedReadme);
+      await expect(readGeneratedFile(wikiDir, "quartz/quartz.config.ts")).resolves.toBe(customizedConfig);
+      await expect(readGeneratedFile(wikiDir, "quartz/quartz.layout.ts")).resolves.toBe(customizedLayout);
     });
   });
 
@@ -248,6 +493,38 @@ describe("explore init command", () => {
       expect(gitignore).toContain("quartz/content/");
       expect(gitignore).toContain("quartz/public/");
       expect(gitignore).toContain("quartz/.quartz-cache/");
+      expect(gitignore).toContain("quartz/quartz/");
+    });
+  });
+
+  it("patches upgraded wiki ignore rules before install can copy the Quartz runtime tree", async () => {
+    await withTempWorkspace("llm-wiki-explore-init-upgraded-gitignore-", async (workspaceDir) => {
+      // Arrange
+      execFileMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await writeFile(
+        resolve(wikiDir, ".gitignore"),
+        ".DS_Store\n.llm-wiki/cache/\nnode_modules/\nquartz/.quartz-cache/\nquartz/content/\nquartz/public/\n",
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      const payload = parseExploreInit(result.stdout);
+      const gitignore = await readFile(resolve(wikiDir, ".gitignore"), "utf8");
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(execFile).not.toHaveBeenCalled();
+      expect(payload.warnings).toEqual(
+        expect.arrayContaining([
+          "Added missing generated Quartz ignore rule: quartz/quartz/",
+          "Quartz dependencies were not installed. Run: cd quartz && npm install",
+        ]),
+      );
+      expect(gitignore).toContain("quartz/quartz/\n");
     });
   });
 });

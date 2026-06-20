@@ -82,6 +82,7 @@ const SKIPPED_ROOTS = [
   "quartz/content",
   "quartz/node_modules",
   "quartz/public",
+  "quartz/quartz",
 ];
 const SKIPPED_FILES = new Set([".llm-wiki/config.yml"]);
 

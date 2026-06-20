@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { lstat, readFile, rm } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 import { computeContentHash } from "../scanner/index.js";
 import { scanWikiRepository, type RepoMarkdownFile, type RepoScan } from "../scanner/repo.js";
@@ -41,6 +41,10 @@ export type QuartzSyncResult = {
   warnings: string[];
 };
 
+export type QuartzSyncOptions = {
+  preserveContentRoot?: boolean;
+};
+
 export type QuartzManifest = {
   profile: ExploreProfileName;
   source_profile: string;
@@ -66,12 +70,17 @@ export type QuartzManifestGeneratedFile = {
 };
 
 export type QuartzOperationErrorCode =
+  | "EXPLORER_STATE_WRITE_FAILED"
   | "PROFILE_INVALID"
   | "PROFILE_MISSING"
   | "PROFILE_UNSUPPORTED"
+  | "PUBLIC_LINT_FAILED"
   | "PUBLIC_PROFILE_LEAK_CHECK_FAILED"
+  | "QUARTZ_COMMAND_FAILED"
   | "QUARTZ_CONTENT_UNSAFE"
+  | "QUARTZ_DEPENDENCIES_MISSING"
   | "QUARTZ_INSTALL_FAILED"
+  | "QUARTZ_RUNTIME_MISSING"
   | "QUARTZ_WRITE_FAILED";
 
 export class QuartzOperationError extends Error {
@@ -89,12 +98,70 @@ export class QuartzOperationError extends Error {
 }
 
 const INSTALL_COMMAND = "cd quartz && npm install" as const;
+const QUARTZ_VERSION = "4.5.2" as const;
 const EXPLORE_PROFILE_NAMES = ["local", "review", "public", "github-pages"] as const satisfies readonly ExploreProfileName[];
 const QUARTZ_CONTENT_IGNORE_RULE = "quartz/content/";
 const QUARTZ_CONTENT_IGNORE_PROBE = "quartz/content/.llm-wiki-sync-probe.md";
 const QUARTZ_CONTENT_GITIGNORE_PATH = "quartz/content/.gitignore";
 const QUARTZ_CONTENT_GITIGNORE_CONTENT = "*\n";
+const QUARTZ_PARENT_GITIGNORE_PATH = "quartz/.gitignore";
+const QUARTZ_PARENT_CONTENT_IGNORE_RULE = "content/";
+const QUARTZ_RUNTIME_IGNORE_RULE = "quartz/quartz/";
+const QUARTZ_RUNTIME_IGNORE_PROBE = "quartz/quartz/.llm-wiki-runtime-probe";
+const QUARTZ_RUNTIME_IGNORE_PROBE_PATHS = [
+  QUARTZ_RUNTIME_IGNORE_PROBE,
+  "quartz/quartz/build.ts",
+  "quartz/quartz/components/index.ts",
+  "quartz/quartz/plugins/index.ts",
+] as const;
+const QUARTZ_PARENT_RUNTIME_IGNORE_RULE = "quartz/";
 const VALID_VISIBILITIES = new Set(["private", "public"]);
+const OLD_PLACEHOLDER_QUARTZ_PACKAGE_JSON = `${JSON.stringify(
+  {
+    private: true,
+    type: "module",
+    scripts: {
+      build: "quartz build",
+      serve: "quartz build --serve",
+    },
+    dependencies: {},
+    devDependencies: {},
+  },
+  null,
+  2,
+)}\n`;
+const OLD_PLACEHOLDER_QUARTZ_README = `# Quartz Runtime
+
+This directory contains LLM Wiki generated Quartz placeholders.
+
+Install dependencies:
+
+\`\`\`bash
+cd quartz && npm install
+\`\`\`
+
+Sync content with:
+
+\`\`\`bash
+llm-wiki explore sync --profile local
+\`\`\`
+`;
+const OLD_PLACEHOLDER_QUARTZ_CONFIG = `// LLM Wiki Quartz placeholder.
+// Replace this file with a full Quartz config when wiring the upstream Quartz runtime.
+export default {
+  configuration: {
+    pageTitle: "LLM Wiki",
+  },
+  plugins: {},
+};
+`;
+const OLD_PLACEHOLDER_QUARTZ_LAYOUT = `// LLM Wiki Quartz layout placeholder.
+export const defaultContentPageLayout = {
+  beforeBody: [],
+  left: [],
+  right: [],
+};
+`;
 
 export async function initializeQuartzRuntime(
   repoRoot: string,
@@ -102,29 +169,33 @@ export async function initializeQuartzRuntime(
 ): Promise<{ data: QuartzInitResult; warnings: string[] }> {
   const entries = quartzRuntimeEntries();
   const createdPaths: string[] = [];
+  const updatedPaths: string[] = [];
   const skippedPaths: string[] = [];
   for (const entry of entries) {
     if (await quartzRuntimeFileExists(repoRoot, entry.path)) {
+      if (await shouldMigrateQuartzRuntimeEntry(repoRoot, entry)) {
+        await writeQuartzRuntimeEntry(repoRoot, entry);
+        updatedPaths.push(entry.path);
+        continue;
+      }
+
       skippedPaths.push(entry.path);
       continue;
     }
 
-    const writeResult = await writeTextFileInsideRoot(repoRoot, entry.path, entry.content);
-    if (!writeResult.ok) {
-      throw new QuartzOperationError({
-        code: "QUARTZ_WRITE_FAILED",
-        message: `Failed to write Quartz runtime file: ${entry.path}.`,
-        path: entry.path,
-        hint: writeResult.error.hint,
-      });
-    }
+    await writeQuartzRuntimeEntry(repoRoot, entry);
     createdPaths.push(entry.path);
   }
 
+  const ignoreWarnings = await ensureQuartzRuntimeIgnored(repoRoot);
   const install = options.install ? await runNpmInstall(repoRoot) : skippedInstall(repoRoot);
   const warnings = [
+    ...ignoreWarnings,
     ...(skippedPaths.length > 0
       ? [`Existing Quartz runtime files were left unchanged: ${skippedPaths.sort().join(", ")}`]
+      : []),
+    ...(updatedPaths.length > 0
+      ? [`Updated generated Quartz runtime files: ${updatedPaths.sort().join(", ")}`]
       : []),
     ...(install.attempted ? [] : [`Quartz dependencies were not installed. Run: ${INSTALL_COMMAND}`]),
   ];
@@ -141,6 +212,7 @@ export async function initializeQuartzRuntime(
 export async function syncQuartzContent(
   repoRoot: string,
   profileName: string,
+  options: QuartzSyncOptions = {},
 ): Promise<{ data: QuartzSyncResult; warnings: string[] }> {
   if (!isExploreProfileName(profileName)) {
     throw new QuartzOperationError({
@@ -152,7 +224,8 @@ export async function syncQuartzContent(
   }
 
   const publicLike = isPublicLikeProfile(profileName);
-  if (publicLike) {
+  const preserveContentRoot = options.preserveContentRoot === true;
+  if (publicLike && !preserveContentRoot) {
     await clearQuartzContent(repoRoot);
     await removeQuartzManifests(repoRoot);
   }
@@ -173,7 +246,7 @@ export async function syncQuartzContent(
   const warnings = await ensureQuartzContentIgnored(repoRoot);
   if (publicLike) {
     await assertPublicSyncIsSafe(repoRoot, scan, profile, selection.markdown, selection.matchedMarkdown);
-  } else {
+  } else if (!preserveContentRoot) {
     await clearQuartzContent(repoRoot);
     await removeQuartzManifests(repoRoot);
   }
@@ -185,8 +258,13 @@ export async function syncQuartzContent(
   ];
   warnings.push(...await ensureQuartzContentIgnoredByGit(repoRoot, expectedContentPaths));
 
+  const previousContentPaths = preserveContentRoot ? await readQuartzManifestContentPaths(repoRoot, profileName) : [];
   const manifestFiles = await materializeMarkdown(repoRoot, selection.markdown, selection.excludedRawOriginals);
   const generatedFiles = publicLike ? [] : await writeStaticReviewPages(repoRoot, staticReviewPages);
+  if (previousContentPaths.length > 0) {
+    await removeStaleQuartzContent(repoRoot, previousContentPaths, new Set(expectedContentPaths));
+  }
+
   const excludedPaths = publicLike ? [] : selection.excludedRawOriginals;
   const manifest: QuartzManifest = {
     profile: profileName,
@@ -223,6 +301,71 @@ export async function syncQuartzContent(
     },
     warnings,
   };
+}
+
+async function readQuartzManifestContentPaths(
+  repoRoot: string,
+  profileName: ExploreProfileName,
+): Promise<string[]> {
+  try {
+    const content = await readFile(resolve(repoRoot, `.llm-wiki/cache/quartz-manifest.${profileName}.json`), "utf8");
+    const parsed = JSON.parse(content) as unknown;
+    if (!isRecord(parsed)) {
+      return [];
+    }
+
+    return [
+      ...manifestEntryContentPaths(parsed.files),
+      ...manifestEntryContentPaths(parsed.generated_files),
+    ];
+  } catch (error) {
+    if (
+      (isNodeError(error) && error.code === "ENOENT") ||
+      error instanceof SyntaxError
+    ) {
+      return [];
+    }
+
+    throw error;
+  }
+}
+
+async function removeStaleQuartzContent(
+  repoRoot: string,
+  previousPaths: readonly string[],
+  expectedContentPaths: ReadonlySet<string>,
+): Promise<void> {
+  for (const path of previousPaths) {
+    if (expectedContentPaths.has(path)) {
+      continue;
+    }
+
+    if (!path.startsWith("quartz/content/")) {
+      continue;
+    }
+
+    const validation = await validateTextFileWriteInsideRoot(repoRoot, path);
+    if (!validation.ok) {
+      throw new QuartzOperationError({
+        code: "QUARTZ_WRITE_FAILED",
+        message: `Failed to remove stale Quartz content: ${path}.`,
+        path,
+        hint: validation.error.hint,
+      });
+    }
+
+    await rm(resolve(repoRoot, path), { force: true });
+  }
+}
+
+function manifestEntryContentPaths(entries: unknown): string[] {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+
+  return entries.flatMap((entry) =>
+    isRecord(entry) && typeof entry.content_path === "string" ? [entry.content_path] : [],
+  );
 }
 
 async function assertPublicSyncIsSafe(
@@ -482,12 +625,12 @@ async function ensureQuartzContentIgnored(repoRoot: string): Promise<string[]> {
   const gitignorePath = ".gitignore";
   const content = await readOptionalTextFile(repoRoot, gitignorePath);
   const hasExplicitRule = hasGitignoreLine(content, QUARTZ_CONTENT_IGNORE_RULE);
-  if (hasExplicitRule && isQuartzContentEffectivelyIgnored(content)) {
+  if (hasExplicitRule && areGitignorePathsIgnored(content, ["quartz/content", QUARTZ_CONTENT_IGNORE_PROBE])) {
     return [];
   }
 
   const updatedContent = appendGitignoreLine(content, QUARTZ_CONTENT_IGNORE_RULE);
-  if (!isQuartzContentEffectivelyIgnored(updatedContent)) {
+  if (!areGitignorePathsIgnored(updatedContent, ["quartz/content", QUARTZ_CONTENT_IGNORE_PROBE])) {
     throw new QuartzOperationError({
       code: "QUARTZ_CONTENT_UNSAFE",
       message: "Generated Quartz content is not protected by .gitignore.",
@@ -513,6 +656,46 @@ async function ensureQuartzContentIgnored(repoRoot: string): Promise<string[]> {
   ];
 }
 
+async function ensureQuartzRuntimeIgnored(repoRoot: string): Promise<string[]> {
+  const gitignorePath = ".gitignore";
+  const content = await readOptionalTextFile(repoRoot, gitignorePath);
+  const hasExplicitRule = hasGitignoreLine(content, QUARTZ_RUNTIME_IGNORE_RULE);
+  const warnings: string[] = [];
+  if (hasExplicitRule && areGitignorePathsIgnored(content, ["quartz/quartz", QUARTZ_RUNTIME_IGNORE_PROBE])) {
+    warnings.push(...await ensureQuartzRuntimeIgnoredByGit(repoRoot));
+    return warnings;
+  }
+
+  const updatedContent = appendGitignoreLine(content, QUARTZ_RUNTIME_IGNORE_RULE);
+  if (!areGitignorePathsIgnored(updatedContent, ["quartz/quartz", QUARTZ_RUNTIME_IGNORE_PROBE])) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_CONTENT_UNSAFE",
+      message: "Generated Quartz runtime is not protected by .gitignore.",
+      path: gitignorePath,
+      hint: `Move ${QUARTZ_RUNTIME_IGNORE_RULE} to the end of .gitignore or remove later negation rules before installing Quartz dependencies.`,
+    });
+  }
+
+  const writeResult = await writeTextFileInsideRoot(repoRoot, gitignorePath, updatedContent);
+  if (!writeResult.ok) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to update generated Quartz runtime ignore rule.",
+      path: gitignorePath,
+      hint: writeResult.error.hint,
+    });
+  }
+
+  warnings.push(
+    hasExplicitRule
+      ? `Repaired overridden generated Quartz ignore rule: ${QUARTZ_RUNTIME_IGNORE_RULE}`
+      : `Added missing generated Quartz ignore rule: ${QUARTZ_RUNTIME_IGNORE_RULE}`,
+  );
+  warnings.push(...await ensureQuartzRuntimeIgnoredByGit(repoRoot));
+
+  return warnings;
+}
+
 async function readOptionalTextFile(repoRoot: string, path: string): Promise<string> {
   try {
     return await readFile(resolve(repoRoot, path), "utf8");
@@ -534,10 +717,8 @@ function hasGitignoreLine(content: string, line: string): boolean {
   return content.split(/\r?\n/u).some((entry) => entry.trim() === line);
 }
 
-function isQuartzContentEffectivelyIgnored(content: string): boolean {
-  return ["quartz/content", "quartz/content/.llm-wiki-sync-probe.md"].every((path) =>
-    isGitignorePathIgnored(content, path),
-  );
+function areGitignorePathsIgnored(content: string, paths: readonly string[]): boolean {
+  return paths.every((path) => isGitignorePathIgnored(content, path));
 }
 
 function isGitignorePathIgnored(content: string, path: string): boolean {
@@ -657,21 +838,25 @@ function appendGitignoreLine(content: string, line: string): string {
 }
 
 async function ensureQuartzContentIgnoredByGit(repoRoot: string, contentPaths: readonly string[]): Promise<string[]> {
+  const warnings = await removeGeneratedQuartzContentGitignore(repoRoot);
+  await assertQuartzContentGitignoreAllowsSyncedContent(repoRoot, contentPaths);
+
   const unsafePath = await firstUnignoredGitPath(repoRoot, contentPaths);
   if (unsafePath === null) {
-    return [];
+    return warnings;
   }
 
+  const parentGitignore = await readOptionalTextFile(repoRoot, QUARTZ_PARENT_GITIGNORE_PATH);
   const writeResult = await writeTextFileInsideRoot(
     repoRoot,
-    QUARTZ_CONTENT_GITIGNORE_PATH,
-    QUARTZ_CONTENT_GITIGNORE_CONTENT,
+    QUARTZ_PARENT_GITIGNORE_PATH,
+    appendGitignoreLine(parentGitignore, QUARTZ_PARENT_CONTENT_IGNORE_RULE),
   );
   if (!writeResult.ok) {
     throw new QuartzOperationError({
       code: "QUARTZ_WRITE_FAILED",
-      message: "Failed to write generated Quartz content ignore override.",
-      path: QUARTZ_CONTENT_GITIGNORE_PATH,
+      message: "Failed to repair nested generated Quartz ignore rule.",
+      path: QUARTZ_PARENT_GITIGNORE_PATH,
       hint: writeResult.error.hint,
     });
   }
@@ -682,11 +867,157 @@ async function ensureQuartzContentIgnoredByGit(repoRoot: string, contentPaths: r
       code: "QUARTZ_CONTENT_UNSAFE",
       message: "Generated Quartz content is not protected by Git ignore rules.",
       path: repairedUnsafePath,
-      hint: "Remove nested .gitignore negation rules that re-include quartz/content/** before syncing.",
+      hint: `Move ${QUARTZ_PARENT_CONTENT_IGNORE_RULE} to the end of ${QUARTZ_PARENT_GITIGNORE_PATH} or remove nested .gitignore negation rules that re-include quartz/content/** before syncing.`,
     });
   }
 
-  return [`Added content-level generated Quartz ignore override: ${QUARTZ_CONTENT_GITIGNORE_PATH}`];
+  return [...warnings, `Repaired nested generated Quartz ignore rule: ${QUARTZ_PARENT_GITIGNORE_PATH}`];
+}
+
+async function ensureQuartzRuntimeIgnoredByGit(repoRoot: string): Promise<string[]> {
+  const parentGitignore = await readOptionalTextFile(repoRoot, QUARTZ_PARENT_GITIGNORE_PATH);
+  if (!canNestedGitignoreReincludeRuntime(parentGitignore)) {
+    return [];
+  }
+
+  if (!(await hasGitMetadataInAncestor(repoRoot))) {
+    return [];
+  }
+
+  const unsafePath = await firstUnignoredGitPath(repoRoot, QUARTZ_RUNTIME_IGNORE_PROBE_PATHS);
+  if (unsafePath === null) {
+    return [];
+  }
+
+  const writeResult = await writeTextFileInsideRoot(
+    repoRoot,
+    QUARTZ_PARENT_GITIGNORE_PATH,
+    appendGitignoreLine(parentGitignore, QUARTZ_PARENT_RUNTIME_IGNORE_RULE),
+  );
+  if (!writeResult.ok) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to repair nested generated Quartz runtime ignore rule.",
+      path: QUARTZ_PARENT_GITIGNORE_PATH,
+      hint: writeResult.error.hint,
+    });
+  }
+
+  const repairedUnsafePath = await firstUnignoredGitPath(repoRoot, QUARTZ_RUNTIME_IGNORE_PROBE_PATHS);
+  if (repairedUnsafePath !== null) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_CONTENT_UNSAFE",
+      message: "Generated Quartz runtime is not protected by Git ignore rules.",
+      path: repairedUnsafePath,
+      hint: `Move ${QUARTZ_PARENT_RUNTIME_IGNORE_RULE} to the end of ${QUARTZ_PARENT_GITIGNORE_PATH} or remove nested .gitignore negation rules that re-include quartz/quartz/** before installing Quartz dependencies.`,
+    });
+  }
+
+  return [`Repaired nested generated Quartz runtime ignore rule: ${QUARTZ_PARENT_GITIGNORE_PATH}`];
+}
+
+function canNestedGitignoreReincludeRuntime(content: string): boolean {
+  const lines = content.split(/\r?\n/u);
+  return QUARTZ_RUNTIME_IGNORE_PROBE_PATHS.some((path) => {
+    const nestedPath = path.startsWith("quartz/") ? path.slice("quartz/".length) : path;
+    return lines.some((line) => {
+      const rule = parseGitignoreRule(line);
+      return rule?.negated === true && gitignorePatternMatches(rule.pattern, nestedPath);
+    });
+  });
+}
+
+async function hasGitMetadataInAncestor(repoRoot: string): Promise<boolean> {
+  let current = resolve(repoRoot);
+  while (true) {
+    try {
+      await lstat(resolve(current, ".git"));
+      return true;
+    } catch (error) {
+      if (!(isNodeError(error) && error.code === "ENOENT")) {
+        throw new QuartzOperationError({
+          code: "QUARTZ_CONTENT_UNSAFE",
+          message: "Could not inspect Git metadata before Quartz runtime setup.",
+          path: ".git",
+          hint: error instanceof Error ? error.message : "Fix Git metadata permissions before initializing Quartz Explorer.",
+        });
+      }
+    }
+
+    const parent = dirname(current);
+    if (parent === current) {
+      return false;
+    }
+    current = parent;
+  }
+}
+
+async function removeGeneratedQuartzContentGitignore(repoRoot: string): Promise<string[]> {
+  let content: string;
+  try {
+    content = await readFile(resolve(repoRoot, QUARTZ_CONTENT_GITIGNORE_PATH), "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return [];
+    }
+
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to inspect generated Quartz content ignore override.",
+      path: QUARTZ_CONTENT_GITIGNORE_PATH,
+      hint: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  if (content !== QUARTZ_CONTENT_GITIGNORE_CONTENT) {
+    return [];
+  }
+
+  try {
+    await rm(resolve(repoRoot, QUARTZ_CONTENT_GITIGNORE_PATH), { force: true });
+  } catch (error) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to remove generated Quartz content ignore override.",
+      path: QUARTZ_CONTENT_GITIGNORE_PATH,
+      hint: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return [`Removed obsolete content-level generated Quartz ignore override: ${QUARTZ_CONTENT_GITIGNORE_PATH}`];
+}
+
+async function assertQuartzContentGitignoreAllowsSyncedContent(
+  repoRoot: string,
+  contentPaths: readonly string[],
+): Promise<void> {
+  if (contentPaths.length === 0) {
+    return;
+  }
+
+  const content = await readOptionalTextFile(repoRoot, QUARTZ_CONTENT_GITIGNORE_PATH);
+  if (content === "") {
+    return;
+  }
+
+  const ignoredPath = contentPaths
+    .map((path) => stripQuartzContentPrefix(path))
+    .find((path) => path !== null && isGitignorePathIgnored(content, path));
+  if (ignoredPath === undefined || ignoredPath === null) {
+    return;
+  }
+
+  throw new QuartzOperationError({
+    code: "QUARTZ_CONTENT_UNSAFE",
+    message: "Quartz content-level .gitignore would hide synced pages from Quartz.",
+    path: QUARTZ_CONTENT_GITIGNORE_PATH,
+    hint: "Remove quartz/content/.gitignore or change it so synced Markdown remains visible to Quartz.",
+  });
+}
+
+function stripQuartzContentPrefix(path: string): string | null {
+  const prefix = "quartz/content/";
+  return path.startsWith(prefix) ? path.slice(prefix.length) : null;
 }
 
 async function firstUnignoredGitPath(repoRoot: string, paths: readonly string[]): Promise<string | null> {
@@ -810,6 +1141,56 @@ async function quartzRuntimeFileExists(repoRoot: string, path: string): Promise<
   }
 }
 
+async function writeQuartzRuntimeEntry(repoRoot: string, entry: ScaffoldEntry): Promise<void> {
+  const writeResult = await writeTextFileInsideRoot(repoRoot, entry.path, entry.content);
+  if (!writeResult.ok) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: `Failed to write Quartz runtime file: ${entry.path}.`,
+      path: entry.path,
+      hint: writeResult.error.hint,
+    });
+  }
+}
+
+async function shouldMigrateQuartzRuntimeEntry(repoRoot: string, entry: ScaffoldEntry): Promise<boolean> {
+  let content: string;
+  try {
+    content = await readFile(resolve(repoRoot, entry.path), "utf8");
+  } catch (error) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: `Failed to inspect Quartz runtime file: ${entry.path}.`,
+      path: entry.path,
+      hint: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  if (content === entry.content) {
+    return false;
+  }
+
+  switch (entry.path) {
+    case "quartz/package.json":
+      return content === OLD_PLACEHOLDER_QUARTZ_PACKAGE_JSON;
+    case "quartz/README.md":
+      return content === OLD_PLACEHOLDER_QUARTZ_README;
+    case "quartz/quartz.config.ts":
+      return (
+        content === OLD_PLACEHOLDER_QUARTZ_CONFIG ||
+        content === quartzConfigContent({ enableContentIndexFeeds: true })
+      );
+    case "quartz/quartz.layout.ts":
+      return content === OLD_PLACEHOLDER_QUARTZ_LAYOUT;
+    default:
+      return false;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function skippedInstall(repoRoot: string): QuartzInstallResult {
   return {
     attempted: false,
@@ -861,19 +1242,26 @@ function quartzRuntimeEntries(): ScaffoldEntry[] {
     { path: "quartz/package.json", content: quartzPackageJsonContent() },
     { path: "quartz/quartz.config.ts", content: quartzConfigContent() },
     { path: "quartz/quartz.layout.ts", content: quartzLayoutContent() },
+    { path: "quartz/scripts/llm-wiki-loopback-listen.cjs", content: quartzLoopbackListenContent() },
+    { path: "quartz/scripts/llm-wiki-sync-quartz-runtime.cjs", content: quartzRuntimeSyncContent() },
   ].sort((left, right) => left.path.localeCompare(right.path));
 }
 
 function quartzPackageJsonContent(): string {
   return `${JSON.stringify(
     {
+      name: "llm-wiki-quartz-runtime",
+      version: QUARTZ_VERSION,
       private: true,
       type: "module",
       scripts: {
-        build: "quartz build",
-        serve: "quartz build --serve",
+        postinstall: "node scripts/llm-wiki-sync-quartz-runtime.cjs",
+        build: "node ./quartz/bootstrap-cli.mjs build",
+        serve: "node ./quartz/bootstrap-cli.mjs build --serve",
       },
-      dependencies: {},
+      dependencies: {
+        "@jackyzha0/quartz": `github:jackyzha0/quartz#v${QUARTZ_VERSION}`,
+      },
       devDependencies: {},
     },
     null,
@@ -881,24 +1269,228 @@ function quartzPackageJsonContent(): string {
   )}\n`;
 }
 
-function quartzConfigContent(): string {
-  return `// LLM Wiki Quartz placeholder.
-// Replace this file with a full Quartz config when wiring the upstream Quartz runtime.
-export default {
+function quartzConfigContent(options: { enableContentIndexFeeds?: boolean } = {}): string {
+  const enableContentIndexFeeds = options.enableContentIndexFeeds === true;
+
+  return `import { QuartzConfig } from "./quartz/cfg"
+import * as Plugin from "./quartz/plugins"
+
+const config: QuartzConfig = {
   configuration: {
     pageTitle: "LLM Wiki",
+    pageTitleSuffix: "",
+    enableSPA: true,
+    enablePopovers: true,
+    analytics: null,
+    locale: "en-US",
+    ignorePatterns: ["private", "templates", ".obsidian"],
+    defaultDateType: "modified",
+    theme: {
+      fontOrigin: "googleFonts",
+      cdnCaching: true,
+      typography: {
+        header: "Schibsted Grotesk",
+        body: "Source Sans Pro",
+        code: "IBM Plex Mono",
+      },
+      colors: {
+        lightMode: {
+          light: "#faf8f8",
+          lightgray: "#e5e5e5",
+          gray: "#b8b8b8",
+          darkgray: "#4e4e4e",
+          dark: "#2b2b2b",
+          secondary: "#284b63",
+          tertiary: "#84a59d",
+          highlight: "rgba(143, 159, 169, 0.15)",
+          textHighlight: "#fff23688",
+        },
+        darkMode: {
+          light: "#161618",
+          lightgray: "#393639",
+          gray: "#646464",
+          darkgray: "#d4d4d4",
+          dark: "#ebebec",
+          secondary: "#7b97aa",
+          tertiary: "#84a59d",
+          highlight: "rgba(143, 159, 169, 0.15)",
+          textHighlight: "#b3aa0288",
+        },
+      },
+    },
   },
-  plugins: {},
-};
+  plugins: {
+    transformers: [
+      Plugin.FrontMatter(),
+      Plugin.CreatedModifiedDate({
+        priority: ["frontmatter", "git", "filesystem"],
+      }),
+      Plugin.SyntaxHighlighting({
+        theme: {
+          light: "github-light",
+          dark: "github-dark",
+        },
+        keepBackground: false,
+      }),
+      Plugin.ObsidianFlavoredMarkdown({ enableInHtmlEmbed: false }),
+      Plugin.GitHubFlavoredMarkdown(),
+      Plugin.TableOfContents(),
+      Plugin.CrawlLinks({ markdownLinkResolution: "shortest" }),
+      Plugin.Description(),
+      Plugin.Latex({ renderEngine: "katex" }),
+    ],
+    filters: [Plugin.RemoveDrafts()],
+    emitters: [
+      Plugin.AliasRedirects(),
+      Plugin.ComponentResources(),
+      Plugin.ContentPage(),
+      Plugin.FolderPage(),
+      Plugin.TagPage(),
+      Plugin.ContentIndex({
+        enableSiteMap: ${enableContentIndexFeeds ? "true" : "false"},
+        enableRSS: ${enableContentIndexFeeds ? "true" : "false"},
+      }),
+      Plugin.Assets(),
+      Plugin.Static(),
+      Plugin.Favicon(),
+      Plugin.NotFoundPage(),
+    ],
+  },
+}
+
+export default config
 `;
 }
 
 function quartzLayoutContent(): string {
-  return `// LLM Wiki Quartz layout placeholder.
+  return `import { PageLayout, SharedLayout } from "./quartz/cfg"
+import * as Component from "./quartz/components"
+
+export const sharedPageComponents: SharedLayout = {
+  head: Component.Head(),
+  header: [],
+  afterBody: [],
+  footer: Component.Footer({
+    links: {},
+  }),
+}
+
 export const defaultContentPageLayout = {
-  beforeBody: [],
-  left: [],
+  beforeBody: [
+    Component.ConditionalRender({
+      component: Component.Breadcrumbs(),
+      condition: (page) => page.fileData.slug !== "index",
+    }),
+    Component.ArticleTitle(),
+    Component.ContentMeta(),
+    Component.TagList(),
+  ],
+  left: [
+    Component.PageTitle(),
+    Component.MobileOnly(Component.Spacer()),
+    Component.Flex({
+      components: [
+        {
+          Component: Component.Search(),
+          grow: true,
+        },
+        { Component: Component.Darkmode() },
+        { Component: Component.ReaderMode() },
+      ],
+    }),
+    Component.Explorer(),
+  ],
+  right: [
+    Component.Graph(),
+    Component.DesktopOnly(Component.TableOfContents()),
+    Component.Backlinks(),
+  ],
+} satisfies PageLayout
+
+export const defaultListPageLayout: PageLayout = {
+  beforeBody: [Component.Breadcrumbs(), Component.ArticleTitle(), Component.ContentMeta()],
+  left: [
+    Component.PageTitle(),
+    Component.MobileOnly(Component.Spacer()),
+    Component.Flex({
+      components: [
+        {
+          Component: Component.Search(),
+          grow: true,
+        },
+        { Component: Component.Darkmode() },
+      ],
+    }),
+    Component.Explorer(),
+  ],
   right: [],
+}
+`;
+}
+
+function quartzRuntimeSyncContent(): string {
+  return `"use strict";
+
+const { cpSync, existsSync, mkdirSync, rmSync } = require("node:fs");
+const { dirname, resolve } = require("node:path");
+
+const runtimeRoot = resolve(__dirname, "..");
+const source = resolve(runtimeRoot, "node_modules/@jackyzha0/quartz/quartz");
+const destination = resolve(runtimeRoot, "quartz");
+
+if (!existsSync(source)) {
+  console.error("Installed Quartz source tree not found at node_modules/@jackyzha0/quartz/quartz.");
+  process.exit(1);
+}
+
+rmSync(destination, { force: true, recursive: true });
+mkdirSync(dirname(destination), { recursive: true });
+cpSync(source, destination, { recursive: true });
+`;
+}
+
+function quartzLoopbackListenContent(): string {
+  return `"use strict";
+
+const net = require("node:net");
+
+const host = process.env.LLM_WIKI_EXPLORER_HOST || "127.0.0.1";
+const originalListen = net.Server.prototype.listen;
+
+net.Server.prototype.listen = function listenWithLlmWikiLoopback(...args) {
+  if (typeof args[0] === "number") {
+    const requestedHost = args[1];
+    if (typeof requestedHost === "number") {
+      return originalListen.call(this, args[0], host, requestedHost, args[2]);
+    }
+
+    if (requestedHost === undefined || typeof requestedHost === "function") {
+      const backlog = typeof args[2] === "number" ? args[2] : undefined;
+      const callback =
+        typeof requestedHost === "function"
+          ? requestedHost
+          : typeof args[2] === "function"
+            ? args[2]
+            : typeof args[3] === "function"
+              ? args[3]
+              : undefined;
+      return backlog === undefined
+        ? originalListen.call(this, args[0], host, callback)
+        : originalListen.call(this, args[0], host, backlog, callback);
+    }
+  }
+
+  if (
+    args[0] &&
+    typeof args[0] === "object" &&
+    !Array.isArray(args[0]) &&
+    args[0].host === undefined &&
+    args[0].port !== undefined
+  ) {
+    return originalListen.call(this, { ...args[0], host }, ...args.slice(1));
+  }
+
+  return originalListen.apply(this, args);
 };
 `;
 }
@@ -913,7 +1505,7 @@ function componentPlaceholder(className: string): string {
 function quartzReadmeContent(): string {
   return `# Quartz Runtime
 
-This directory contains LLM Wiki generated Quartz placeholders.
+This directory contains the LLM Wiki generated Quartz runtime.
 
 Install dependencies:
 

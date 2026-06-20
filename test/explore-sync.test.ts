@@ -649,7 +649,7 @@ describe("explore sync command", () => {
     });
   });
 
-  it("adds a content-level ignore override when nested Quartz ignore rules re-include generated content", async () => {
+  it("repairs nested Quartz ignore rules outside the content root", async () => {
     await withTempWorkspace("llm-wiki-explore-sync-nested-gitignore-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
@@ -675,14 +675,14 @@ describe("explore sync command", () => {
       // Act
       const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "local", "--json"]);
       const payload = parseExploreSync(result.stdout);
+      const quartzGitignore = await readFile(resolve(wikiDir, "quartz/.gitignore"), "utf8");
 
       // Assert
       expect(result.exitCode).toBe(0);
-      expect(payload.warnings).toEqual([
-        "Added content-level generated Quartz ignore override: quartz/content/.gitignore",
-      ]);
+      expect(payload.warnings).toEqual(["Repaired nested generated Quartz ignore rule: quartz/.gitignore"]);
       expect(payload.data.warnings).toEqual(payload.warnings);
-      await expect(readFile(resolve(wikiDir, "quartz/content/.gitignore"), "utf8")).resolves.toBe("*\n");
+      expect(quartzGitignore.trimEnd().endsWith("content/")).toBe(true);
+      expect(await pathExists(resolve(wikiDir, "quartz/content/.gitignore"))).toBe(false);
       expect(await pathExists(resolve(wikiDir, privateContentPath))).toBe(true);
       expect(await gitIgnoresPath(wikiDir, privateContentPath)).toBe(true);
     });
@@ -721,12 +721,13 @@ describe("explore sync command", () => {
       // Act
       const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "local", "--json"]);
       const payload = parseExploreSync(result.stdout);
+      const quartzGitignore = await readFile(resolve(wikiDir, "quartz/.gitignore"), "utf8");
 
       // Assert
       expect(result.exitCode).toBe(0);
-      expect(payload.warnings).toEqual([
-        "Added content-level generated Quartz ignore override: quartz/content/.gitignore",
-      ]);
+      expect(payload.warnings).toEqual(["Repaired nested generated Quartz ignore rule: quartz/.gitignore"]);
+      expect(quartzGitignore.trimEnd().endsWith("content/")).toBe(true);
+      expect(await pathExists(resolve(wikiDir, "quartz/content/.gitignore"))).toBe(false);
       expect(await pathExists(resolve(wikiDir, privateContentPath))).toBe(true);
       expect(await gitIgnoresPath(wikiDir, privateContentPath)).toBe(true);
     });

@@ -2,7 +2,7 @@
 
 `llm-wiki` is a local-first CLI for creating a Git-backed, Obsidian-compatible Markdown wiki that can later grow into the full LLM Wiki workflow described in the PRD.
 
-The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, and `llm-wiki add-url` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
+The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, and `llm-wiki add-url` capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue` and `llm-wiki log` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
 
 ## Development
 
@@ -24,7 +24,9 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/cli.ts` registers the CLI entrypoint and command surface.
 - `src/commands/init.ts` owns the first supported `llm-wiki init` command behavior.
 - `src/commands/add.ts`, `src/commands/addText.ts`, and `src/commands/addUrl.ts` own source capture command behavior.
+- `src/commands/queue.ts` and `src/commands/log.ts` own queue inspection, status transitions, and parsed runtime log output.
 - `src/sourceCapture/` owns deterministic source IDs, hashing, metadata, duplicate detection, and raw writes.
+- `src/runtime/queue.ts` and `src/runtime/log.ts` own queue/source-card consistency and runtime log parsing/appending.
 - `src/scaffold/` plans and writes generated wiki files.
 - `src/scaffold/templates/` contains reusable scaffold template content.
 - `src/utils/` contains filesystem, Git, and result helpers.
@@ -42,6 +44,10 @@ cd my-wiki
 llm-wiki add ../notes/research-note.md --title "Research Note"
 llm-wiki add-text --title "Pasted Note" --text "Captured text"
 llm-wiki add-url https://example.com/research-note --title "Fetched Note"
+llm-wiki queue
+llm-wiki queue show <source_id>
+llm-wiki queue set-status <source_id> ingesting
+llm-wiki log
 git status
 ```
 
@@ -58,13 +64,17 @@ llm-wiki status --repo my-wiki --quiet
 llm-wiki add ../notes/research-note.md --repo my-wiki --title "Research Note" --json
 llm-wiki add-text --repo my-wiki --title "Pasted Note" --text "Captured text" --json
 llm-wiki add-url https://example.com/research-note --repo my-wiki --title "Fetched Note" --json
+llm-wiki queue --repo my-wiki --json
+llm-wiki queue show <source_id> --repo my-wiki --json
+llm-wiki queue set-status <source_id> ingesting --repo my-wiki --json
+llm-wiki log --repo my-wiki --json
 ```
 
 - `--repo <path>` may point at a wiki root or any descendant directory containing `.llm-wiki/config.yml` above it.
 - `--json` prints stable envelopes shaped as `{ ok, command, repo, data, warnings }` on success or `{ ok, command, repo, error, issues }` on failure.
 - `--quiet` suppresses human success output only. Human errors and JSON output are still printed.
 
-`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. Full health reporting is deferred to the status slice.
+`status` currently verifies that the CLI can resolve an existing LLM Wiki workspace and reports the resolved repository root. `add`, `add-text`, and `add-url` return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. Full health reporting is deferred to the status slice.
 
 ## Source Capture
 
@@ -81,6 +91,16 @@ src_<yyyy>_<mm>_<dd>_<slug>_<12-char-sha256>
 ```
 
 Duplicate content returns the existing source metadata with `status: duplicate` and does not write new files or log entries. Raw originals are written with binary-safe no-overwrite semantics.
+
+## Queue and Log
+
+`llm-wiki queue` lists queue items from `raw/queue/*.json` with source ID, title, source kind, status, visibility, source-card path, queue path, original path, updated time, and status counts.
+
+`llm-wiki queue show <source_id>` returns the queue record and linked `_source.md` frontmatter. It fails with stable errors when the queue item is missing, the source card is missing, or the queue JSON and source-card frontmatter disagree on source ID, title, source kind, status, or visibility.
+
+`llm-wiki queue set-status <source_id> <status>` supports explicit validated transitions: `queued -> ingesting`, `ingesting -> ingested`, `ingesting -> blocked`, and `blocked -> queued`. It mirrors the status and `updated_at` timestamp into both the queue JSON and `_source.md`, updates the source card body status line, and appends a parseable `ingest` entry to `curated/log.md`.
+
+`llm-wiki log` parses runtime entries from `curated/log.md` while ignoring the seeded entry-format template and fenced examples. JSON output includes parsed entries, scanner issues, and counts.
 
 ## Generated Scaffold Semantics
 

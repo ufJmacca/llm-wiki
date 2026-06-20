@@ -225,6 +225,36 @@ export async function validateAppendFileInsideRoot(
   return readAppendDestinationState(target.value.rootRealPath, target.value.normalizedPath, target.value.absolutePath);
 }
 
+export async function validateReadFileInsideRoot(
+  rootDir: string,
+  relativePath: string,
+): Promise<Result<{ absolutePath: string }, BinaryWriteError>> {
+  const target = await validateContainedWriteTarget(rootDir, relativePath);
+  if (!target.ok) {
+    return target;
+  }
+
+  if (!target.value.parentExists) {
+    return err(
+      destinationParentUnsafe(
+        target.value.normalizedPath,
+        `destination parent does not exist: ${target.value.parentRelativePath}`,
+      ),
+    );
+  }
+
+  const fileState = await readExistingContainedFileState(
+    target.value.rootRealPath,
+    target.value.normalizedPath,
+    target.value.absolutePath,
+  );
+  if (!fileState.ok) {
+    return fileState;
+  }
+
+  return ok({ absolutePath: target.value.absolutePath });
+}
+
 async function validateWritableScaffoldPaths(
   rootPath: string,
   rootRealPath: string,
@@ -525,6 +555,32 @@ async function readAppendDestinationState(
       return ok(undefined);
     }
 
+    return err(destinationParentUnsafe(relativePath, error instanceof Error ? error.message : String(error)));
+  }
+}
+
+async function readExistingContainedFileState(
+  rootRealPath: string,
+  relativePath: string,
+  absolutePath: string,
+): Promise<Result<void, BinaryWriteError>> {
+  try {
+    const pathStat = await lstat(absolutePath);
+    if (pathStat.isSymbolicLink()) {
+      return err(destinationParentUnsafe(relativePath, `destination file is a symlink: ${relativePath}`));
+    }
+
+    if (!pathStat.isFile()) {
+      return err(destinationParentUnsafe(relativePath, `destination is not a regular file: ${relativePath}`));
+    }
+
+    const resolvedPath = await realpath(absolutePath);
+    if (!isInsideRealPath(rootRealPath, resolvedPath)) {
+      return err(destinationPathUnsafe(relativePath));
+    }
+
+    return ok(undefined);
+  } catch (error) {
     return err(destinationParentUnsafe(relativePath, error instanceof Error ? error.message : String(error)));
   }
 }

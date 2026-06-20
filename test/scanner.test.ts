@@ -4,6 +4,7 @@ import { planWikiScaffold } from "../src/scaffold/files.js";
 import {
   computeContentHash,
   parseCacheMetadata,
+  parseMarkdownLinks,
   parseProfile,
   parseQueueItem,
   parseSourceId,
@@ -464,6 +465,7 @@ visibility:
       kind: "file",
       status: "queued",
       path: "raw/inputs/2026/06/src_2026_06_17_research_note_a1b2c3d4/_source.md",
+      original_path: "raw/inputs/2026/06/src_2026_06_17_research_note_a1b2c3d4/original.md",
     });
     const malformedQueue = `{"source_id" 1}`;
 
@@ -595,8 +597,10 @@ visibility:
     const schemaInvalidQueue = JSON.stringify({
       source_id: "not-a-source-id",
       title: "Research note",
+      kind: "file",
       status: "archived",
       path: "raw/inputs/2026/06/not-a-source-id/_source.md",
+      original_path: "raw/inputs/2026/06/not-a-source-id/original.md",
     });
 
     // Act
@@ -608,12 +612,6 @@ visibility:
     // Assert
     expect(scan.item).toBeUndefined();
     expect(scan.issues).toEqual([
-      expect.objectContaining({
-        severity: "error",
-        code: "QUEUE_FIELD_MISSING",
-        path: "raw/queue/not-a-source-id.json",
-        hint: expect.stringContaining('Add a non-empty "kind" value'),
-      }),
       expect.objectContaining({
         severity: "error",
         code: "SOURCE_ID_INVALID",
@@ -720,6 +718,7 @@ visibility:
       kind: "file",
       status: "queued",
       path: `raw/inputs/2026/99/${invalidMonthSourceId}/_source.md`,
+      original_path: `raw/inputs/2026/99/${invalidMonthSourceId}/original.md`,
     });
     const sourceCardContent = `---
 type: raw_source
@@ -817,6 +816,37 @@ Links to [[Plain Page]], [[target-page|Alias]], and ![[assets/image.png|Image]].
         alias: "Image",
         embed: true,
       },
+    ]);
+  });
+
+  it("allows closing brackets inside wikilink aliases", () => {
+    // Arrange
+    const content = `# Page
+
+Links to [[Private|alias ] text]] and ![[raw/inputs/source/original.md|raw ] alias]].
+`;
+
+    // Act
+    const links = parseWikilinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      expect.objectContaining({
+        path: "curated/page.md",
+        line: 3,
+        raw: "[[Private|alias ] text]]",
+        target: "Private",
+        alias: "alias ] text",
+        embed: false,
+      }),
+      expect.objectContaining({
+        path: "curated/page.md",
+        line: 3,
+        raw: "![[raw/inputs/source/original.md|raw ] alias]]",
+        target: "raw/inputs/source/original.md",
+        alias: "raw ] alias",
+        embed: true,
+      }),
     ]);
   });
 
@@ -1096,5 +1126,546 @@ ${quotedAfter}
         embed: false,
       },
     ]);
+  });
+});
+
+describe("scanner Markdown link parsing", () => {
+  it("parses inline Markdown links while ignoring code", () => {
+    // Arrange
+    const visibleLine = "Visible [private page](private.md) and ![raw file](../raw/original.md \"raw\").";
+    const content = `# Page
+
+\`[ignored inline](raw/secret.md)\`
+    [ignored indented](raw/secret.md)
+${visibleLine}
+
+\`\`\`markdown
+[ignored fenced](raw/secret.md)
+\`\`\`
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: visibleLine.indexOf("[private page]") + 1,
+        raw: "[private page](private.md)",
+        text: "private page",
+        target: "private.md",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: visibleLine.indexOf("![raw file]") + 1,
+        raw: '![raw file](../raw/original.md "raw")',
+        text: "raw file",
+        target: "../raw/original.md",
+        embed: true,
+      },
+    ]);
+  });
+
+  it("parses URI autolinks while ignoring code, HTML tags, and link destinations", () => {
+    // Arrange
+    const visibleLine = "Visible <file:///repo/raw/inputs/source/original.md> and <https://example.test/page>.";
+    const content = `# Page
+
+\`<file:///ignored/raw/original.md>\`
+    <file:///ignored/raw/original.md>
+${visibleLine}
+[inline](<file:///repo/raw/inputs/source/inline.md>)
+[raw-ref]: <file:///repo/raw/inputs/source/reference.md>
+<div>not a link</div>
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: visibleLine.indexOf("<file:") + 1,
+        raw: "<file:///repo/raw/inputs/source/original.md>",
+        text: "file:///repo/raw/inputs/source/original.md",
+        target: "file:///repo/raw/inputs/source/original.md",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: visibleLine.indexOf("<https:") + 1,
+        raw: "<https://example.test/page>",
+        text: "https://example.test/page",
+        target: "https://example.test/page",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 6,
+        column: 1,
+        raw: "[inline](<file:///repo/raw/inputs/source/inline.md>)",
+        text: "inline",
+        target: "file:///repo/raw/inputs/source/inline.md",
+        embed: false,
+      },
+    ]);
+  });
+
+  it("parses HTML href and src links while ignoring code and preserving Markdown link labels", () => {
+    // Arrange
+    const rawUrl = "file:///repo/raw/inputs/source/original.md";
+    const imageUrl = "../raw/inputs/source/original.png";
+    const htmlLine = `<a class="source" href="${rawUrl}">raw</a> <img alt="raw" src='${imageUrl}'>.`;
+    const content = `# Page
+
+\`<a href="${rawUrl}">ignored</a>\`
+    <img src="${imageUrl}">
+[inline <a href="${rawUrl}">label</a>](public.md)
+${htmlLine}
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: 1,
+        raw: `[inline <a href="${rawUrl}">label</a>](public.md)`,
+        text: `inline <a href="${rawUrl}">label</a>`,
+        target: "public.md",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: "[inline <a ".length + 1,
+        raw: `href="${rawUrl}"`,
+        text: "href",
+        target: rawUrl,
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 6,
+        column: htmlLine.indexOf("href=") + 1,
+        raw: `href="${rawUrl}"`,
+        text: "href",
+        target: rawUrl,
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 6,
+        column: htmlLine.indexOf("src=") + 1,
+        raw: `src='${imageUrl}'`,
+        text: "src",
+        target: imageUrl,
+        embed: true,
+      },
+    ]);
+  });
+
+  it("decodes HTML character references in href and src targets", () => {
+    // Arrange
+    const encodedRawPath = "raw&#47;inputs&#x2F;source&sol;original.md";
+    const encodedImagePath = "raw&#47;inputs&#x2F;source&sol;original.png";
+    const content = `# Page
+
+<a href="${encodedRawPath}">raw</a>
+<img src='${encodedImagePath}'>
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: 4,
+        raw: `href="${encodedRawPath}"`,
+        text: "href",
+        target: "raw/inputs/source/original.md",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 4,
+        column: 6,
+        raw: `src='${encodedImagePath}'`,
+        text: "src",
+        target: "raw/inputs/source/original.png",
+        embed: true,
+      },
+    ]);
+  });
+
+  it("parses multiline HTML href and src attributes", () => {
+    // Arrange
+    const rawUrl = "file:///repo/raw/inputs/source/original.md";
+    const imageUrl = "../raw/inputs/source/original.png";
+    const content = `# Page
+
+<a
+  class="source"
+  href
+    =
+    "${rawUrl}"
+>raw</a>
+<img
+  alt="raw"
+  src='${imageUrl}'
+>
+
+\`\`\`html
+<a
+  href="${rawUrl}"
+>ignored</a>
+\`\`\`
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: 3,
+        raw: `href
+    =
+    "${rawUrl}"`,
+        text: "href",
+        target: rawUrl,
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 11,
+        column: 3,
+        raw: `src='${imageUrl}'`,
+        text: "src",
+        target: imageUrl,
+        embed: true,
+      },
+    ]);
+  });
+
+  it("parses inline Markdown destinations with balanced parentheses", () => {
+    // Arrange
+    const visibleLine = 'Visible [raw file](../raw/file(1).pdf "raw") and [plain](plain.md).';
+    const content = `# Page
+
+${visibleLine}
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[raw file]") + 1,
+        raw: '[raw file](../raw/file(1).pdf "raw")',
+        text: "raw file",
+        target: "../raw/file(1).pdf",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[plain]") + 1,
+        raw: "[plain](plain.md)",
+        text: "plain",
+        target: "plain.md",
+        embed: false,
+      },
+    ]);
+  });
+
+  it("unescapes Markdown escapes in inline destinations", () => {
+    // Arrange
+    const visibleLine = "Visible [private](../private/foo\\).md).";
+    const content = `# Page
+
+${visibleLine}
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[private]") + 1,
+        raw: "[private](../private/foo\\).md)",
+        text: "private",
+        target: "../private/foo).md",
+        embed: false,
+      },
+    ]);
+  });
+
+  it("decodes HTML character references in inline Markdown destinations", () => {
+    // Arrange
+    const visibleLine =
+      "Visible [raw](&period;&period;&sol;raw&#47;original&period;md) and [file](file&colon;&sol;&sol;&sol;tmp&#47;raw&#47;original.md).";
+    const content = `# Page
+
+${visibleLine}
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[raw]") + 1,
+        raw: "[raw](&period;&period;&sol;raw&#47;original&period;md)",
+        text: "raw",
+        target: "../raw/original.md",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[file]") + 1,
+        raw: "[file](file&colon;&sol;&sol;&sol;tmp&#47;raw&#47;original.md)",
+        text: "file",
+        target: "file:///tmp/raw/original.md",
+        embed: false,
+      },
+    ]);
+  });
+
+  it("parses inline Markdown labels with balanced brackets", () => {
+    // Arrange
+    const visibleLine = "Visible [raw [PDF]](../raw/file.pdf) and [private [topic]](private.md).";
+    const content = `# Page
+
+${visibleLine}
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[raw [PDF]]") + 1,
+        raw: "[raw [PDF]](../raw/file.pdf)",
+        text: "raw [PDF]",
+        target: "../raw/file.pdf",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[private [topic]]") + 1,
+        raw: "[private [topic]](private.md)",
+        text: "private [topic]",
+        target: "private.md",
+        embed: false,
+      },
+    ]);
+  });
+
+  it("parses inline Markdown labels across soft line breaks", () => {
+    // Arrange
+    const content = `# Page
+
+[raw
+file](../raw/original.md) and [plain](plain.md).
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: 1,
+        raw: "[raw\nfile](../raw/original.md)",
+        text: "raw\nfile",
+        target: "../raw/original.md",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 4,
+        column: "file](../raw/original.md) and ".length + 1,
+        raw: "[plain](plain.md)",
+        text: "plain",
+        target: "plain.md",
+        embed: false,
+      },
+    ]);
+  });
+
+  it("parses image links nested inside outer Markdown links", () => {
+    // Arrange
+    const visibleLine = "Visible [![raw](../../raw/a.png)](https://example.test/source) and [plain](plain.md).";
+    const content = `# Page
+
+${visibleLine}
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[![raw]") + 1,
+        raw: "[![raw](../../raw/a.png)](https://example.test/source)",
+        text: "![raw](../../raw/a.png)",
+        target: "https://example.test/source",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("![raw]") + 1,
+        raw: "![raw](../../raw/a.png)",
+        text: "raw",
+        target: "../../raw/a.png",
+        embed: true,
+      },
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[plain]") + 1,
+        raw: "[plain](plain.md)",
+        text: "plain",
+        target: "plain.md",
+        embed: false,
+      },
+    ]);
+  });
+
+  it("parses reference-style Markdown links through definitions", () => {
+    // Arrange
+    const visibleLine = "Visible [private page][p], ![raw file][raw-ref], [collapsed][], and [shortcut].";
+    const content = `# Page
+
+\`[ignored reference][p]\`
+    [ignored indented][p]
+${visibleLine}
+
+[p]: private.md
+[raw-ref]: <../raw/original.md> "raw"
+[collapsed]: collapsed.md
+[shortcut]: shortcut.md
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: visibleLine.indexOf("[private page]") + 1,
+        raw: "[private page][p]",
+        text: "private page",
+        target: "private.md",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: visibleLine.indexOf("![raw file]") + 1,
+        raw: "![raw file][raw-ref]",
+        text: "raw file",
+        target: "../raw/original.md",
+        embed: true,
+      },
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: visibleLine.indexOf("[collapsed]") + 1,
+        raw: "[collapsed][]",
+        text: "collapsed",
+        target: "collapsed.md",
+        embed: false,
+      },
+      {
+        path: "curated/page.md",
+        line: 5,
+        column: visibleLine.indexOf("[shortcut]") + 1,
+        raw: "[shortcut]",
+        text: "shortcut",
+        target: "shortcut.md",
+        embed: false,
+      },
+    ]);
+  });
+
+  it("parses reference-style Markdown links through blockquoted definitions", () => {
+    // Arrange
+    const visibleLine = "> Visible [raw file][raw-ref].";
+    const content = `# Page
+
+${visibleLine}
+> [raw-ref]: <../raw/original.md> "raw"
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([
+      {
+        path: "curated/page.md",
+        line: 3,
+        column: visibleLine.indexOf("[raw file]") + 1,
+        raw: "[raw file][raw-ref]",
+        text: "raw file",
+        target: "../raw/original.md",
+        embed: false,
+      },
+    ]);
+  });
+
+  it("does not treat Obsidian footnotes as reference-style Markdown links", () => {
+    // Arrange
+    const content = `# Page
+
+Footnote marker[^1].
+
+[^1]: raw notes from a local source.
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([]);
   });
 });

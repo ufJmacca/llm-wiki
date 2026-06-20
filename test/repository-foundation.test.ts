@@ -94,7 +94,6 @@ describe("repository documentation and CI foundation", () => {
     // Arrange
     const deferredFeatures = [
       "ingest",
-      "lint command behavior",
       "Quartz runtime",
       "upload",
       "GitHub Pages deploy",
@@ -115,6 +114,9 @@ describe("repository documentation and CI foundation", () => {
     expect(readme).toContain("`llm-wiki add <path> --title <title>`");
     expect(readme).toContain("`llm-wiki add-text --title <title> --text <text>`");
     expect(readme).toContain("Duplicate content returns the existing source metadata");
+    expect(readme).toContain("`llm-wiki lint` reports stable issue records");
+    expect(readme).toContain("`llm-wiki index rebuild` writes `.llm-wiki/cache/pages.json`");
+    expect(readme).toContain("Public leak checks are represented in generated lint-rule configuration and enforced");
     for (const feature of deferredFeatures) {
       expect(readme, feature).toContain(feature);
     }

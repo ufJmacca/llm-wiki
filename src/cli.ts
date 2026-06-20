@@ -7,7 +7,9 @@ import { Command, CommanderError } from "commander";
 import { registerAddCommand } from "./commands/add.js";
 import { registerAddTextCommand } from "./commands/addText.js";
 import { registerAddUrlCommand } from "./commands/addUrl.js";
+import { registerIndexCommand } from "./commands/index.js";
 import { registerInitCommand } from "./commands/init.js";
+import { registerLintCommand } from "./commands/lint.js";
 import { registerLogCommand } from "./commands/log.js";
 import { registerQueueCommand } from "./commands/queue.js";
 import { registerStatusCommand } from "./commands/status.js";
@@ -69,6 +71,8 @@ function createProgram(io: CliIo): Command {
   registerAddCommand(program, io);
   registerAddTextCommand(program, io);
   registerAddUrlCommand(program, io);
+  registerLintCommand(program, io);
+  registerIndexCommand(program, io);
   registerQueueCommand(program, io);
   registerLogCommand(program, io);
   registerStatusCommand(program, io);

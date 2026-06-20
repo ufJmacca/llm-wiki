@@ -55,6 +55,7 @@ export type SourceCard = RepoMarkdownFile & {
 export type RepoScan = {
   rootDir: string;
   files: RepoFile[];
+  linkableFilePaths: string[];
   markdown: RepoMarkdownFile[];
   curatedPages: RepoMarkdownFile[];
   sourceCards: SourceCard[];
@@ -75,9 +76,10 @@ const SKIPPED_ROOTS = [
   "quartz/node_modules",
   "quartz/public",
 ];
+const SKIPPED_FILES = new Set([".llm-wiki/config.yml"]);
 
 export async function scanWikiRepository(rootDir: string): Promise<RepoScan> {
-  const filePaths = await listInputFiles(rootDir);
+  const { filePaths, linkableFilePaths } = await listInputFiles(rootDir);
   const files: RepoFile[] = [];
   const markdown: RepoMarkdownFile[] = [];
   const queueFiles: RepoQueueFile[] = [];
@@ -150,6 +152,7 @@ export async function scanWikiRepository(rootDir: string): Promise<RepoScan> {
   return {
     rootDir,
     files: sortByPath(files),
+    linkableFilePaths: [...linkableFilePaths].sort(),
     markdown: sortByPath(markdown),
     curatedPages: sortByPath(markdown.filter((file) => file.path.startsWith("curated/"))),
     sourceCards: sortByPath(sourceCards),
@@ -210,15 +213,21 @@ function toSourceCard(file: RepoMarkdownFile): SourceCard {
   };
 }
 
-async function listInputFiles(rootDir: string): Promise<string[]> {
+async function listInputFiles(rootDir: string): Promise<{ filePaths: string[]; linkableFilePaths: string[] }> {
   const paths: string[] = [];
+  const linkableFilePaths: string[] = [];
 
   async function visit(relativeDir: string): Promise<void> {
     const absoluteDir = resolve(rootDir, relativeDir);
     const entries = await readdir(absoluteDir);
     for (const entry of entries.sort()) {
       const path = joinRelativePath(relativeDir, entry);
-      if (shouldSkipPath(path)) {
+      if (SKIPPED_FILES.has(path)) {
+        linkableFilePaths.push(path);
+        continue;
+      }
+
+      if (shouldSkipRoot(path)) {
         continue;
       }
 
@@ -240,10 +249,10 @@ async function listInputFiles(rootDir: string): Promise<string[]> {
   }
 
   await visit("");
-  return paths.sort();
+  return { filePaths: paths.sort(), linkableFilePaths: linkableFilePaths.sort() };
 }
 
-function shouldSkipPath(path: string): boolean {
+function shouldSkipRoot(path: string): boolean {
   return SKIPPED_ROOTS.some((skippedRoot) => path === skippedRoot || path.startsWith(`${skippedRoot}/`));
 }
 

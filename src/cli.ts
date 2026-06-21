@@ -7,6 +7,7 @@ import { Command, CommanderError } from "commander";
 import { registerAddCommand } from "./commands/add.js";
 import { registerAddTextCommand } from "./commands/addText.js";
 import { registerAddUrlCommand } from "./commands/addUrl.js";
+import { registerDaemonCommand } from "./commands/daemon.js";
 import { registerDeployCommand } from "./commands/deploy.js";
 import { registerExploreCommand } from "./commands/explore.js";
 import { registerIngestCommand } from "./commands/ingest.js";
@@ -78,6 +79,7 @@ function createProgram(io: CliIo): Command {
   registerAddCommand(program, io);
   registerAddTextCommand(program, io);
   registerAddUrlCommand(program, io);
+  registerDaemonCommand(program, io);
   registerDeployCommand(program, io);
   registerExploreCommand(program, io);
   registerIngestCommand(program, io);

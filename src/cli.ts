@@ -9,13 +9,16 @@ import { registerAddTextCommand } from "./commands/addText.js";
 import { registerAddUrlCommand } from "./commands/addUrl.js";
 import { registerDeployCommand } from "./commands/deploy.js";
 import { registerExploreCommand } from "./commands/explore.js";
+import { registerIngestCommand } from "./commands/ingest.js";
 import { registerIndexCommand } from "./commands/index.js";
 import { registerInitCommand } from "./commands/init.js";
 import { registerLintCommand } from "./commands/lint.js";
 import { registerLogCommand } from "./commands/log.js";
 import { registerNavCommand } from "./commands/nav.js";
+import { registerQueryCommand } from "./commands/query.js";
 import { registerQueueCommand } from "./commands/queue.js";
 import { registerSearchCommand } from "./commands/search.js";
+import { registerSnapshotCommand } from "./commands/snapshot.js";
 import { registerStatusCommand } from "./commands/status.js";
 
 export type CliIo = {
@@ -77,6 +80,7 @@ function createProgram(io: CliIo): Command {
   registerAddUrlCommand(program, io);
   registerDeployCommand(program, io);
   registerExploreCommand(program, io);
+  registerIngestCommand(program, io);
   registerLintCommand(program, io);
   registerIndexCommand(program, io);
   registerQueueCommand(program, io);
@@ -84,6 +88,8 @@ function createProgram(io: CliIo): Command {
   registerStatusCommand(program, io);
   registerSearchCommand(program, io);
   registerNavCommand(program, io);
+  registerQueryCommand(program, io);
+  registerSnapshotCommand(program, io);
 
   return program;
 }

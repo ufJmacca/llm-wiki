@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { lintWiki, type LintResult } from "../lint/index.js";
 import { isExploreProfileName, isPublicLikeProfile, type ExploreProfileName } from "../profiles/index.js";
 import { writeTextFileInsideRoot } from "../utils/fs.js";
-import { syncQuartzContent, QuartzOperationError, type QuartzSyncResult } from "./index.js";
+import { GITHUB_PAGES_CNAME_CACHE_PATH, syncQuartzContent, QuartzOperationError, type QuartzSyncResult } from "./index.js";
 import { assertQuartzDependenciesInstalled, runQuartzCommand, syncSummary, type QuartzProcessResult } from "./server.js";
 
 export type QuartzBuildResult = {
@@ -19,6 +19,7 @@ export type QuartzBuildResult = {
 
 const QUARTZ_BUILD_ROOT_INDEX_PATH = "quartz/content/index.md" as const;
 const QUARTZ_BUILD_CURATED_INDEX_PATH = "quartz/content/curated/index.md" as const;
+const QUARTZ_PUBLIC_CNAME_PATH = "quartz/public/CNAME" as const;
 
 export async function buildQuartzExplorer(
   repoRoot: string,
@@ -42,6 +43,7 @@ export async function buildQuartzExplorer(
   await ensureQuartzBuildRootIndex(repoRoot);
   await assertQuartzDependenciesInstalled(repoRoot);
   const quartz = await runQuartzCommand(repoRoot, ["run", "build"]);
+  await materializeGitHubPagesCnameArtifact(repoRoot, syncResult.data.profile);
 
   return {
     data: {
@@ -55,6 +57,38 @@ export async function buildQuartzExplorer(
     },
     warnings: syncResult.warnings,
   };
+}
+
+async function materializeGitHubPagesCnameArtifact(repoRoot: string, profileName: ExploreProfileName): Promise<void> {
+  if (profileName !== "github-pages") {
+    return;
+  }
+
+  let content: string;
+  try {
+    content = await readFile(resolve(repoRoot, GITHUB_PAGES_CNAME_CACHE_PATH), "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return;
+    }
+
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to read generated GitHub Pages CNAME cache.",
+      path: GITHUB_PAGES_CNAME_CACHE_PATH,
+      hint: error instanceof Error ? error.message : "Fix filesystem permissions before rerunning Quartz build.",
+    });
+  }
+
+  const writeResult = await writeTextFileInsideRoot(repoRoot, QUARTZ_PUBLIC_CNAME_PATH, content);
+  if (!writeResult.ok) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to materialize GitHub Pages CNAME artifact.",
+      path: QUARTZ_PUBLIC_CNAME_PATH,
+      hint: writeResult.error.hint,
+    });
+  }
 }
 
 async function ensureQuartzBuildRootIndex(repoRoot: string): Promise<void> {

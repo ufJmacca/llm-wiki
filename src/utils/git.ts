@@ -260,6 +260,45 @@ export function formatCdCommand(targetDir: string): string {
   return `cd ${shellQuote(targetDir)}`;
 }
 
+export async function readGitRemoteUrl(targetDir: string, remoteName = "origin"): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", ["remote", "get-url", remoteName], {
+      cwd: targetDir,
+      env: gitCommandEnv(),
+    });
+    const value = stdout.trim();
+    return value === "" ? null : value;
+  } catch {
+    return null;
+  }
+}
+
+export async function readGitTopLevel(targetDir: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], {
+      cwd: targetDir,
+      env: gitCommandEnv(),
+    });
+    const value = stdout.trim();
+    return value === "" ? null : resolve(value);
+  } catch {
+    return null;
+  }
+}
+
+export async function readGitCurrentBranch(targetDir: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+      cwd: targetDir,
+      env: gitCommandEnv(),
+    });
+    const value = stdout.trim();
+    return value === "" ? null : value;
+  } catch {
+    return null;
+  }
+}
+
 export async function isGitRepositoryEnabled(targetDir: string): Promise<boolean> {
   try {
     await lstat(resolve(targetDir, ".git"));

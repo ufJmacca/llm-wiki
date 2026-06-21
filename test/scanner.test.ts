@@ -1800,6 +1800,24 @@ ${visibleLine}
     ]);
   });
 
+  it("ignores escaped reference-style Markdown link openers", () => {
+    // Arrange
+    const content = `# Page
+
+Literal references: \\[private page][p], \\[collapsed][], and \\[shortcut].
+
+[p]: private.md
+[collapsed]: raw.md
+[shortcut]: shortcut.md
+`;
+
+    // Act
+    const links = parseMarkdownLinks({ path: "curated/page.md", content });
+
+    // Assert
+    expect(links).toEqual([]);
+  });
+
   it("does not fabricate overlapping reference links after consumed labels", () => {
     // Arrange
     const visibleLine = "[One][safe][Two][also-safe]";

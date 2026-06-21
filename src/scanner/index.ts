@@ -1105,6 +1105,11 @@ function parseMarkdownReferenceLinks(
       break;
     }
 
+    if (isEscapedMarkdownOpener(scanLine, labelStart)) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
     const labelEnd = findMarkdownLinkLabelEnd(scanLine, labelStart);
     if (labelEnd === -1) {
       searchIndex = labelStart + 1;
@@ -1214,6 +1219,11 @@ function parseMarkdownShortcutReferenceLinks(
     const labelStart = scanLine.indexOf("[", searchIndex);
     if (labelStart === -1) {
       break;
+    }
+
+    if (isEscapedMarkdownOpener(scanLine, labelStart)) {
+      searchIndex = labelStart + 1;
+      continue;
     }
 
     const labelEnd = findMarkdownLinkLabelEnd(scanLine, labelStart);

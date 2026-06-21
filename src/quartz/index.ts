@@ -2,9 +2,14 @@ import { execFile } from "node:child_process";
 import { lstat, readFile, rm } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
+import {
+  deployProfileBaseUrlError,
+  deployProfileCustomDomainBaseUrlError,
+  deployProfileCustomDomainError,
+} from "../deploy/profileValidation.js";
 import { computeContentHash } from "../scanner/index.js";
 import { scanWikiRepository, type RepoMarkdownFile, type RepoScan } from "../scanner/repo.js";
-import { createLinkResolutionIndex, lintWiki, resolveLinks } from "../lint/index.js";
+import { createLinkResolutionIndex, lintWiki, resolveLinks, type LintResult } from "../lint/index.js";
 import {
   isExploreProfileName,
   isPublicLikeProfile,
@@ -43,6 +48,10 @@ export type QuartzSyncResult = {
 
 export type QuartzSyncOptions = {
   preserveContentRoot?: boolean;
+};
+
+export type QuartzPublicSyncSafetyOptions = {
+  lintResult?: LintResult;
 };
 
 export type QuartzManifest = {
@@ -104,6 +113,11 @@ const QUARTZ_CONTENT_IGNORE_RULE = "quartz/content/";
 const QUARTZ_CONTENT_IGNORE_PROBE = "quartz/content/.llm-wiki-sync-probe.md";
 const QUARTZ_CONTENT_GITIGNORE_PATH = "quartz/content/.gitignore";
 const QUARTZ_CONTENT_GITIGNORE_CONTENT = "*\n";
+const QUARTZ_CONFIG_PATH = "quartz/quartz.config.ts";
+const QUARTZ_GENERATED_BASE_URL_MARKER = "// llm-wiki generated baseUrl";
+export const GITHUB_PAGES_CNAME_CACHE_PATH = ".llm-wiki/cache/github-pages-CNAME";
+const QUARTZ_BUILD_HOMEPAGE_SOURCE_PATH = "curated/index.md";
+const QUARTZ_BUILD_HOMEPAGE_CONTENT_PATH = "quartz/content/index.md";
 const QUARTZ_PARENT_GITIGNORE_PATH = "quartz/.gitignore";
 const QUARTZ_PARENT_CONTENT_IGNORE_RULE = "content/";
 const QUARTZ_RUNTIME_IGNORE_RULE = "quartz/quartz/";
@@ -116,6 +130,20 @@ const QUARTZ_RUNTIME_IGNORE_PROBE_PATHS = [
 ] as const;
 const QUARTZ_PARENT_RUNTIME_IGNORE_RULE = "quartz/";
 const VALID_VISIBILITIES = new Set(["private", "public"]);
+
+type QuartzConfigurationBlock = {
+  closeBraceIndex: number;
+  openBraceIndex: number;
+  openingLineEnd: number;
+  propertyIndent: string;
+};
+
+type QuartzConfigObjectBlock = {
+  closeBraceIndex: number;
+  openBraceIndex: number;
+  openingLineEnd: number;
+};
+
 const OLD_PLACEHOLDER_QUARTZ_PACKAGE_JSON = `${JSON.stringify(
   {
     private: true,
@@ -242,6 +270,9 @@ export async function syncQuartzContent(
   }
 
   const profile = profileResult.value;
+  assertGitHubPagesDeployProfileFieldsValid(profile);
+  await applyProfileBaseUrlToQuartzConfig(repoRoot, profile);
+  await applyProfileCustomDomainToGitHubPagesCname(repoRoot, profile);
   const selection = selectMarkdownForProfile(profile, scan.markdown, scan.rawOriginals);
   const warnings = await ensureQuartzContentIgnored(repoRoot);
   if (publicLike) {
@@ -252,15 +283,19 @@ export async function syncQuartzContent(
   }
   await ensureQuartzContentRoot(repoRoot);
   const staticReviewPages = publicLike ? [] : staticReviewPageDefinitions(profile, scan);
+  const buildHomepagePages = publicLike
+    ? quartzBuildHomepageDefinitions(selection.markdown, selection.excludedRawOriginals)
+    : [];
+  const generatedPages = [...staticReviewPages, ...buildHomepagePages];
   const expectedContentPaths = [
     ...selection.markdown.map((file) => `quartz/content/${file.path}`),
-    ...staticReviewPages.map((page) => page.path),
+    ...generatedPages.map((page) => page.path),
   ];
   warnings.push(...await ensureQuartzContentIgnoredByGit(repoRoot, expectedContentPaths));
 
   const previousContentPaths = preserveContentRoot ? await readQuartzManifestContentPaths(repoRoot, profileName) : [];
   const manifestFiles = await materializeMarkdown(repoRoot, selection.markdown, selection.excludedRawOriginals);
-  const generatedFiles = publicLike ? [] : await writeStaticReviewPages(repoRoot, staticReviewPages);
+  const generatedFiles = await writeGeneratedPages(repoRoot, generatedPages);
   if (previousContentPaths.length > 0) {
     await removeStaleQuartzContent(repoRoot, previousContentPaths, new Set(expectedContentPaths));
   }
@@ -330,6 +365,130 @@ async function readQuartzManifestContentPaths(
   }
 }
 
+export async function assertPublicQuartzSyncSafety(
+  repoRoot: string,
+  profileName: string,
+  options: QuartzPublicSyncSafetyOptions = {},
+): Promise<void> {
+  if (!isExploreProfileName(profileName) || !isPublicLikeProfile(profileName)) {
+    throw new QuartzOperationError({
+      code: "PROFILE_UNSUPPORTED",
+      message: `Unsupported public Quartz sync profile: ${profileName}.`,
+      path: "--profile",
+      hint: "Use --profile public or github-pages for public sync safety checks.",
+    });
+  }
+
+  const scan = await scanWikiRepository(repoRoot);
+  const profileResult = await readWikiProfile(repoRoot, profileName);
+  if (!profileResult.ok) {
+    throw new QuartzOperationError({
+      code: profileResult.error.code,
+      message: profileResult.error.message,
+      path: profileResult.error.path,
+      hint: profileResult.error.hint,
+    });
+  }
+
+  const profile = profileResult.value;
+  const selection = selectMarkdownForProfile(profile, scan.markdown, scan.rawOriginals);
+  await assertPublicSyncIsSafe(
+    repoRoot,
+    scan,
+    profile,
+    selection.markdown,
+    selection.matchedMarkdown,
+    options.lintResult,
+  );
+}
+
+export async function assertPublicQuartzBuildPreflight(
+  repoRoot: string,
+  profileName: string,
+  options: QuartzPublicSyncSafetyOptions = {},
+): Promise<void> {
+  if (!isExploreProfileName(profileName) || !isPublicLikeProfile(profileName)) {
+    throw new QuartzOperationError({
+      code: "PROFILE_UNSUPPORTED",
+      message: `Unsupported public Quartz build profile: ${profileName}.`,
+      path: "--profile",
+      hint: "Use --profile public or github-pages for public Quartz build preflight checks.",
+    });
+  }
+
+  await assertQuartzContentRootCanSync(repoRoot);
+
+  const scan = await scanWikiRepository(repoRoot);
+  const profileResult = await readWikiProfile(repoRoot, profileName);
+  if (!profileResult.ok) {
+    throw new QuartzOperationError({
+      code: profileResult.error.code,
+      message: profileResult.error.message,
+      path: profileResult.error.path,
+      hint: profileResult.error.hint,
+    });
+  }
+
+  const profile = profileResult.value;
+  const selection = selectMarkdownForProfile(profile, scan.markdown, scan.rawOriginals);
+  await assertPublicSyncIsSafe(
+    repoRoot,
+    scan,
+    profile,
+    selection.markdown,
+    selection.matchedMarkdown,
+    options.lintResult,
+  );
+  assertQuartzBuildHomepageSelected(selection.markdown);
+}
+
+export async function assertProfileBaseUrlQuartzConfigCanSync(repoRoot: string, profileName: string): Promise<void> {
+  if (!isExploreProfileName(profileName)) {
+    throw new QuartzOperationError({
+      code: "PROFILE_UNSUPPORTED",
+      message: `Unsupported Quartz sync profile: ${profileName}.`,
+      path: "--profile",
+      hint: "Use --profile local, review, public, or github-pages.",
+    });
+  }
+
+  const profileResult = await readWikiProfile(repoRoot, profileName);
+  if (!profileResult.ok) {
+    throw new QuartzOperationError({
+      code: profileResult.error.code,
+      message: profileResult.error.message,
+      path: profileResult.error.path,
+      hint: profileResult.error.hint,
+    });
+  }
+
+  const profile = profileResult.value;
+  assertGitHubPagesDeployProfileFieldsValid(profile);
+  await validatedQuartzConfigBaseUrlUpdate(repoRoot, profile);
+  await validateGitHubPagesCnameCacheTarget(repoRoot, profile);
+}
+
+function assertGitHubPagesDeployProfileFieldsValid(profile: WikiProfile): void {
+  if (profile.requestedName !== "github-pages") {
+    return;
+  }
+
+  const error =
+    deployProfileBaseUrlError(profile.baseUrl, profile.path) ??
+    deployProfileCustomDomainError(profile.customDomain, profile.path) ??
+    deployProfileCustomDomainBaseUrlError(profile.baseUrl, profile.customDomain, profile.path);
+  if (error === null) {
+    return;
+  }
+
+  throw new QuartzOperationError({
+    code: error.code,
+    message: error.message,
+    path: error.path,
+    hint: error.hint,
+  });
+}
+
 async function removeStaleQuartzContent(
   repoRoot: string,
   previousPaths: readonly string[],
@@ -374,14 +533,15 @@ async function assertPublicSyncIsSafe(
   profile: WikiProfile,
   materializedFiles: readonly RepoMarkdownFile[],
   matchedFiles: readonly RepoMarkdownFile[],
+  lintResult?: LintResult,
 ): Promise<void> {
-  const lintResult = await lintWiki(repoRoot, { profile: profile.sourceName, strict: true });
+  const publicLintResult = lintResult ?? await lintWiki(repoRoot, { profile: profile.sourceName, strict: true });
   const materializedPaths = new Set(materializedFiles.map((file) => file.path));
   const matchedPaths = new Set(matchedFiles.map((file) => file.path));
   const matchedMissingOrInvalidVisibilityPaths = new Set(
     matchedFiles.filter((file) => hasMissingOrInvalidVisibility(file)).map((file) => file.path),
   );
-  const blockingIssue = lintResult.issues.find(
+  const blockingIssue = publicLintResult.issues.find(
     (issue) =>
       issue.severity === "error" &&
       !shouldIgnorePublicSyncIssue(
@@ -509,7 +669,25 @@ function staticReviewPageDefinitions(profile: WikiProfile, scan: RepoScan): Stat
   ];
 }
 
-async function writeStaticReviewPages(
+function quartzBuildHomepageDefinitions(
+  files: readonly RepoMarkdownFile[],
+  excludedRawOriginals: readonly string[],
+): StaticReviewPage[] {
+  const source = files.find((file) => file.path === QUARTZ_BUILD_HOMEPAGE_SOURCE_PATH);
+  if (source === undefined) {
+    return [];
+  }
+
+  return [
+    {
+      path: QUARTZ_BUILD_HOMEPAGE_CONTENT_PATH,
+      title: stringFrontmatterValue(source, "title") ?? "Index",
+      content: quartzMaterializedMarkdownContent(source, new Set(excludedRawOriginals)),
+    },
+  ];
+}
+
+async function writeGeneratedPages(
   repoRoot: string,
   pages: readonly StaticReviewPage[],
 ): Promise<QuartzManifestGeneratedFile[]> {
@@ -535,6 +713,11 @@ async function writeStaticReviewPages(
 }
 
 async function clearQuartzContent(repoRoot: string): Promise<void> {
+  await assertQuartzContentRootCanSync(repoRoot);
+  await rm(resolve(repoRoot, "quartz/content"), { force: true, recursive: true });
+}
+
+async function assertQuartzContentRootCanSync(repoRoot: string): Promise<void> {
   const validation = await validateTextFileWriteInsideRoot(repoRoot, "quartz/content/.llm-wiki-sync-probe");
   if (!validation.ok) {
     throw new QuartzOperationError({
@@ -572,8 +755,19 @@ async function clearQuartzContent(repoRoot: string): Promise<void> {
       hint: "Fix filesystem permissions or unsafe paths before syncing Quartz content.",
     });
   }
+}
 
-  await rm(contentPath, { force: true, recursive: true });
+function assertQuartzBuildHomepageSelected(materializedFiles: readonly RepoMarkdownFile[]): void {
+  if (materializedFiles.some((file) => file.path === QUARTZ_BUILD_HOMEPAGE_SOURCE_PATH)) {
+    return;
+  }
+
+  throw new QuartzOperationError({
+    code: "QUARTZ_CONTENT_UNSAFE",
+    message: "GitHub Pages profile does not materialize curated/index.md for the Quartz build homepage.",
+    path: QUARTZ_BUILD_HOMEPAGE_SOURCE_PATH,
+    hint: "Make curated/index.md eligible for the github-pages profile before deploying; remove it from profile excludes and keep visibility: public.",
+  });
 }
 
 async function ensureQuartzContentRoot(repoRoot: string): Promise<void> {
@@ -711,6 +905,453 @@ async function readOptionalTextFile(repoRoot: string, path: string): Promise<str
       hint: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+async function applyProfileBaseUrlToQuartzConfig(repoRoot: string, profile: WikiProfile): Promise<void> {
+  const update = await validatedQuartzConfigBaseUrlUpdate(repoRoot, profile);
+  if (update === null || update.updatedContent === update.content) {
+    return;
+  }
+
+  const writeResult = await writeTextFileInsideRoot(repoRoot, QUARTZ_CONFIG_PATH, update.updatedContent);
+  if (!writeResult.ok) {
+    throw quartzConfigBaseUrlWriteError(writeResult.error.message, writeResult.error.hint);
+  }
+}
+
+async function applyProfileCustomDomainToGitHubPagesCname(repoRoot: string, profile: WikiProfile): Promise<void> {
+  if (profile.requestedName !== "github-pages") {
+    return;
+  }
+
+  await validateGitHubPagesCnameCacheTarget(repoRoot, profile);
+
+  if (profile.customDomain === null) {
+    await rm(resolve(repoRoot, GITHUB_PAGES_CNAME_CACHE_PATH), { force: true });
+    return;
+  }
+
+  const writeResult = await writeTextFileInsideRoot(repoRoot, GITHUB_PAGES_CNAME_CACHE_PATH, `${profile.customDomain}\n`);
+  if (!writeResult.ok) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to write generated GitHub Pages CNAME cache.",
+      path: GITHUB_PAGES_CNAME_CACHE_PATH,
+      hint: writeResult.error.hint,
+    });
+  }
+}
+
+async function validateGitHubPagesCnameCacheTarget(repoRoot: string, profile: WikiProfile): Promise<void> {
+  if (profile.requestedName !== "github-pages") {
+    return;
+  }
+
+  const validation = await validateTextFileWriteInsideRoot(repoRoot, GITHUB_PAGES_CNAME_CACHE_PATH);
+  if (!validation.ok) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: profile.customDomain === null
+        ? "Failed to remove generated GitHub Pages CNAME cache."
+        : "Failed to write generated GitHub Pages CNAME cache.",
+      path: GITHUB_PAGES_CNAME_CACHE_PATH,
+      hint: validation.error.hint,
+    });
+  }
+}
+
+async function validatedQuartzConfigBaseUrlUpdate(
+  repoRoot: string,
+  profile: WikiProfile,
+): Promise<{ content: string; updatedContent: string } | null> {
+  if (profile.baseUrl !== null) {
+    const writeValidation = await validateTextFileWriteInsideRoot(repoRoot, QUARTZ_CONFIG_PATH);
+    if (!writeValidation.ok) {
+      throw quartzConfigBaseUrlWriteError(writeValidation.error.message, writeValidation.error.hint);
+    }
+  }
+
+  const update = await quartzConfigBaseUrlUpdate(repoRoot, profile);
+  if (update === null || update.updatedContent === update.content) {
+    return update;
+  }
+
+  const writeValidation = await validateTextFileWriteInsideRoot(repoRoot, QUARTZ_CONFIG_PATH);
+  if (!writeValidation.ok) {
+    throw quartzConfigBaseUrlWriteError(writeValidation.error.message, writeValidation.error.hint);
+  }
+
+  return update;
+}
+
+function quartzConfigBaseUrlWriteError(message: string, hint: string): QuartzOperationError {
+  return new QuartzOperationError({
+    code: "QUARTZ_WRITE_FAILED",
+    message: `Failed to update Quartz config with GitHub Pages baseUrl: ${message}`,
+    path: QUARTZ_CONFIG_PATH,
+    hint,
+  });
+}
+
+async function quartzConfigBaseUrlUpdate(
+  repoRoot: string,
+  profile: WikiProfile,
+): Promise<{ content: string; updatedContent: string } | null> {
+  let content: string;
+  try {
+    content = await readFile(resolve(repoRoot, QUARTZ_CONFIG_PATH), "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      if (profile.baseUrl !== null) {
+        throw new QuartzOperationError({
+          code: "QUARTZ_WRITE_FAILED",
+          message: "Quartz config is missing; cannot apply GitHub Pages baseUrl.",
+          path: QUARTZ_CONFIG_PATH,
+          hint: "Restore quartz/quartz.config.ts or rerun llm-wiki explore init before checking GitHub Pages deployment.",
+        });
+      }
+
+      return null;
+    }
+
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to read Quartz config before applying GitHub Pages baseUrl.",
+      path: QUARTZ_CONFIG_PATH,
+      hint: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const updatedContent = profile.baseUrl === null
+    ? clearQuartzConfigBaseUrl(content)
+    : setQuartzConfigBaseUrl(content, quartzBaseUrlFromDeployBaseUrl(profile.baseUrl));
+  return { content, updatedContent };
+}
+
+function clearQuartzConfigBaseUrl(content: string): string {
+  return content.replace(/^\s*\/\/ llm-wiki generated baseUrl\s*\r?\n\s*baseUrl\s*:[^\r\n]*(?:\r?\n)?/mu, "");
+}
+
+function quartzBaseUrlFromDeployBaseUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/u, "");
+  try {
+    const url = new URL(trimmed);
+    const path = url.pathname.replace(/\/+$/u, "");
+    return `${url.hostname}${path === "/" ? "" : path}`;
+  } catch {
+    return trimmed.replace(/^https?:\/\//u, "").replace(/^\/+|\/+$/gu, "");
+  }
+}
+
+function setQuartzConfigBaseUrl(content: string, baseUrl: string): string {
+  const baseUrlLine = `baseUrl: ${JSON.stringify(baseUrl)},`;
+  const configurationBlock = findQuartzConfigurationBlock(content);
+  if (configurationBlock !== null) {
+    const generatedBaseUrl = replaceGeneratedQuartzConfigBaseUrl(content, configurationBlock, baseUrlLine);
+    if (generatedBaseUrl !== null) {
+      return generatedBaseUrl;
+    }
+
+    const existingBaseUrl = replaceExistingQuartzConfigBaseUrl(content, configurationBlock, baseUrlLine);
+    if (existingBaseUrl !== null) {
+      return existingBaseUrl;
+    }
+
+    const block = `${configurationBlock.propertyIndent}${QUARTZ_GENERATED_BASE_URL_MARKER}\n${configurationBlock.propertyIndent}${baseUrlLine}\n`;
+    return `${content.slice(0, configurationBlock.openingLineEnd)}${block}${content.slice(configurationBlock.openingLineEnd)}`;
+  }
+
+  throw new QuartzOperationError({
+    code: "QUARTZ_WRITE_FAILED",
+    message: "Failed to locate Quartz configuration block for GitHub Pages baseUrl.",
+    path: QUARTZ_CONFIG_PATH,
+    hint: "Add a configuration: { ... } object to quartz/quartz.config.ts or regenerate the Quartz runtime before rerunning deploy sync.",
+  });
+}
+
+function findQuartzConfigurationBlock(content: string): QuartzConfigurationBlock | null {
+  const configBlock = findExportedQuartzConfigObjectBlock(content);
+  if (configBlock === null) {
+    return null;
+  }
+
+  const body = content.slice(configBlock.openingLineEnd, configBlock.closeBraceIndex);
+  const configurationPattern = /^([ \t]*)configuration[ \t]*:[ \t]*\{[ \t]*$/gmu;
+  let match: RegExpExecArray | null;
+  while ((match = configurationPattern.exec(body)) !== null) {
+    if (match.index === undefined) {
+      continue;
+    }
+
+    const absoluteIndex = configBlock.openingLineEnd + match.index;
+    if (braceDepthBeforeIndex(content, configBlock.openBraceIndex, absoluteIndex) !== 1) {
+      continue;
+    }
+
+    const openBraceOffset = match[0].indexOf("{");
+    const openBraceIndex = absoluteIndex + openBraceOffset;
+    const closeBraceIndex = findMatchingBrace(content, openBraceIndex);
+    if (closeBraceIndex === null || closeBraceIndex > configBlock.closeBraceIndex) {
+      return null;
+    }
+
+    const lineEnd = absoluteIndex + match[0].length;
+    const lineBreakLength = content.startsWith("\r\n", lineEnd) ? 2 : content.startsWith("\n", lineEnd) ? 1 : 0;
+    return {
+      closeBraceIndex,
+      openBraceIndex,
+      openingLineEnd: lineEnd + lineBreakLength,
+      propertyIndent: `${match[1] ?? ""}  `,
+    };
+  }
+
+  return null;
+}
+
+function findExportedQuartzConfigObjectBlock(content: string): QuartzConfigObjectBlock | null {
+  const configPattern = /^([ \t]*)(export[ \t]+)?const[ \t]+([A-Za-z_$][\w$]*)[ \t]*:[ \t]*QuartzConfig[ \t]*=[ \t]*\{[ \t]*$/gmu;
+  let match: RegExpExecArray | null;
+  while ((match = configPattern.exec(content)) !== null) {
+    if (match.index === undefined) {
+      continue;
+    }
+
+    const name = match[3] ?? "";
+    if ((match[2] === undefined || match[2] === "") && !isDefaultExportedConfigName(content, name)) {
+      continue;
+    }
+
+    const openBraceOffset = match[0].indexOf("{");
+    const openBraceIndex = match.index + openBraceOffset;
+    const closeBraceIndex = findMatchingBrace(content, openBraceIndex);
+    if (closeBraceIndex === null) {
+      return null;
+    }
+
+    const lineEnd = match.index + match[0].length;
+    const lineBreakLength = content.startsWith("\r\n", lineEnd) ? 2 : content.startsWith("\n", lineEnd) ? 1 : 0;
+    return {
+      closeBraceIndex,
+      openBraceIndex,
+      openingLineEnd: lineEnd + lineBreakLength,
+    };
+  }
+
+  return null;
+}
+
+function isDefaultExportedConfigName(content: string, name: string): boolean {
+  return new RegExp(`\\bexport\\s+default\\s+${escapeRegExp(name)}\\b`, "u").test(content);
+}
+
+function findMatchingBrace(content: string, openBraceIndex: number): number | null {
+  let depth = 0;
+  let quote: "\"" | "'" | "`" | null = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+
+  for (let index = openBraceIndex; index < content.length; index += 1) {
+    const char = content[index];
+    const nextChar = content[index + 1];
+
+    if (lineComment) {
+      if (char === "\n") {
+        lineComment = false;
+      }
+      continue;
+    }
+
+    if (blockComment) {
+      if (char === "*" && nextChar === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+
+    if (quote !== null) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+
+    if (char === "/" && nextChar === "/") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+
+    if (char === "/" && nextChar === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+
+    if (char === "\"" || char === "'" || char === "`") {
+      quote = char;
+      continue;
+    }
+
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+      if (depth < 0) {
+        return null;
+      }
+    }
+  }
+
+  return null;
+}
+
+function braceDepthBeforeIndex(content: string, openBraceIndex: number, targetIndex: number): number | null {
+  let depth = 0;
+  let quote: "\"" | "'" | "`" | null = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+
+  for (let index = openBraceIndex; index < targetIndex; index += 1) {
+    const char = content[index];
+    const nextChar = content[index + 1];
+
+    if (lineComment) {
+      if (char === "\n") {
+        lineComment = false;
+      }
+      continue;
+    }
+
+    if (blockComment) {
+      if (char === "*" && nextChar === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+
+    if (quote !== null) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+
+    if (char === "/" && nextChar === "/") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+
+    if (char === "/" && nextChar === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+
+    if (char === "\"" || char === "'" || char === "`") {
+      quote = char;
+      continue;
+    }
+
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth < 0) {
+        return null;
+      }
+    }
+  }
+
+  return depth;
+}
+
+function replaceGeneratedQuartzConfigBaseUrl(
+  content: string,
+  configurationBlock: QuartzConfigurationBlock,
+  baseUrlLine: string,
+): string | null {
+  const body = content.slice(configurationBlock.openingLineEnd, configurationBlock.closeBraceIndex);
+  const pattern = /^([ \t]*)\/\/ llm-wiki generated baseUrl[ \t]*\r?\n[ \t]*baseUrl[ \t]*:[^\r\n]*$/gmu;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(body)) !== null) {
+    if (match.index === undefined) {
+      continue;
+    }
+
+    const start = configurationBlock.openingLineEnd + match.index;
+    if (braceDepthBeforeIndex(content, configurationBlock.openBraceIndex, start) !== 1) {
+      continue;
+    }
+
+    const indentation = match[1] ?? "";
+    return `${content.slice(0, start)}${indentation}${QUARTZ_GENERATED_BASE_URL_MARKER}\n${indentation}${baseUrlLine}${content.slice(start + match[0].length)}`;
+  }
+
+  return null;
+}
+
+function replaceExistingQuartzConfigBaseUrl(
+  content: string,
+  configurationBlock: QuartzConfigurationBlock,
+  baseUrlLine: string,
+): string | null {
+  const body = content.slice(configurationBlock.openingLineEnd, configurationBlock.closeBraceIndex);
+  const pattern = /^([ \t]*)baseUrl[ \t]*:[ \t]*([^\r\n]*)$/gmu;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(body)) !== null) {
+    if (match.index === undefined) {
+      continue;
+    }
+
+    const start = configurationBlock.openingLineEnd + match.index;
+    if (braceDepthBeforeIndex(content, configurationBlock.openBraceIndex, start) !== 1) {
+      continue;
+    }
+
+    const value = match[2]?.trim() ?? "";
+    const nextLine = nextNonBlankLine(body.slice(match.index + match[0].length));
+    const lineHasTrailingComma = /,\s*(?:(?:\/\/.*)|(?:\/\*.*\*\/)\s*)?$/u.test(value);
+    if (value === "" || (!lineHasTrailingComma && nextLine !== null && !nextLine.startsWith("}"))) {
+      throw new QuartzOperationError({
+        code: "QUARTZ_WRITE_FAILED",
+        message: "Failed to replace multi-line Quartz baseUrl configuration.",
+        path: QUARTZ_CONFIG_PATH,
+        hint: "Put configuration.baseUrl on one line or remove it before rerunning deploy sync.",
+      });
+    }
+
+    const indentation = match[1] ?? "";
+    return `${content.slice(0, start)}${indentation}${QUARTZ_GENERATED_BASE_URL_MARKER}\n${indentation}${baseUrlLine}${content.slice(start + match[0].length)}`;
+  }
+
+  return null;
+}
+
+function nextNonBlankLine(content: string): string | null {
+  for (const line of content.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (trimmed !== "") {
+      return trimmed;
+    }
+  }
+
+  return null;
 }
 
 function hasGitignoreLine(content: string, line: string): boolean {

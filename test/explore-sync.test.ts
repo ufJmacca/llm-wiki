@@ -90,6 +90,25 @@ async function initializeWiki(targetDir: string): Promise<void> {
   parseInitJson(result.stdout);
 }
 
+async function initializeQuartzRuntime(wikiDir: string): Promise<void> {
+  const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+
+  expect(result.exitCode).toBe(0);
+}
+
+async function prepareGitHubPagesSyncProfile(wikiDir: string): Promise<void> {
+  await initializeQuartzRuntime(wikiDir);
+  const publicProfile = await readFile(resolve(wikiDir, ".llm-wiki/profiles/public.yml"), "utf8");
+  await writeFile(
+    resolve(wikiDir, ".llm-wiki/profiles/github-pages.yml"),
+    publicProfile.replace(
+      /^name: public\nmode: deploy\n/u,
+      "name: github-pages\nmode: deploy\nbase_url: https://docs.example.com\n",
+    ),
+    "utf8",
+  );
+}
+
 async function initializeGitRepository(wikiDir: string): Promise<void> {
   await execFileAsync("git", ["init"], { cwd: wikiDir });
 }
@@ -392,6 +411,112 @@ describe("explore sync command", () => {
     });
   });
 
+  it.each([
+    {
+      name: "missing base_url",
+      profile: `name: github-pages
+mode: deploy
+custom_domain: docs.example.com
+include:
+  - curated/**
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+`,
+      message: "GitHub Pages deploy profile must define base_url.",
+    },
+    {
+      name: "unsafe base_url",
+      profile: `name: github-pages
+mode: deploy
+base_url: https://docs.example.com/%2e%2e/private
+custom_domain: docs.example.com
+include:
+  - curated/**
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+`,
+      message: "GitHub Pages deploy profile base_url must be an absolute HTTPS URL.",
+    },
+    {
+      name: "invalid custom_domain",
+      profile: `name: github-pages
+mode: deploy
+base_url: https://docs.example.com
+custom_domain: docs.example.com/wiki
+include:
+  - curated/**
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+`,
+      message: "GitHub Pages deploy profile custom_domain must be a host name only.",
+    },
+    {
+      name: "custom_domain and base_url host mismatch",
+      profile: `name: github-pages
+mode: deploy
+base_url: https://org.github.io/repo
+custom_domain: docs.example.com
+include:
+  - curated/**
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+`,
+      message: "GitHub Pages deploy profile base_url host must match custom_domain.",
+    },
+    {
+      name: "custom_domain and base_url path prefix",
+      profile: `name: github-pages
+mode: deploy
+base_url: https://docs.example.com/wiki
+custom_domain: docs.example.com
+include:
+  - curated/**
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+`,
+      message: "GitHub Pages deploy profile base_url must use custom_domain at the domain root.",
+    },
+  ])("rejects edited github-pages deploy profile fields before applying them: $name", async ({ profile, message }) => {
+    await withTempWorkspace("llm-wiki-explore-sync-invalid-github-pages-profile-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await writeFile(resolve(wikiDir, ".llm-wiki/profiles/github-pages.yml"), profile, "utf8");
+      const configPath = resolve(wikiDir, "quartz/quartz.config.ts");
+      const originalConfig = await readFile(configPath, "utf8");
+
+      // Act
+      const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "github-pages", "--json"]);
+      const payload = parseExploreSyncFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("PROFILE_INVALID");
+      expect(payload.error.message).toBe(message);
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "PROFILE_INVALID",
+          path: ".llm-wiki/profiles/github-pages.yml",
+        }),
+      ]);
+      await expect(readFile(configPath, "utf8")).resolves.toBe(originalConfig);
+      expect(await pathExists(resolve(wikiDir, ".llm-wiki/cache/github-pages-CNAME"))).toBe(false);
+    });
+  });
+
   it.each(["public", "github-pages"] as const)("rejects symlinked public profiles for %s sync", async (profile) => {
     await withTempWorkspace(`llm-wiki-explore-sync-${profile}-symlink-profile-`, async (workspaceDir) => {
       // Arrange
@@ -439,6 +564,9 @@ describe("explore sync command", () => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
       await initializeWiki(wikiDir);
+      if (profile === "github-pages") {
+        await prepareGitHubPagesSyncProfile(wikiDir);
+      }
 
       // Act
       const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", profile, "--json"]);
@@ -742,6 +870,9 @@ describe("explore sync command", () => {
         await initializeWiki(wikiDir);
         await writeFile(resolve(wikiDir, ".gitignore"), ".DS_Store\n.llm-wiki/cache/\nnode_modules/\n", "utf8");
         await makeDefaultCuratedPagesPublic(wikiDir);
+        if (profile === "github-pages") {
+          await prepareGitHubPagesSyncProfile(wikiDir);
+        }
         await writeCuratedPage(
           wikiDir,
           "curated/topics/public-topic.md",
@@ -788,6 +919,7 @@ describe("explore sync command", () => {
       expect(addResult.exitCode).toBe(0);
       const capture = parseSourceCapture(addResult.stdout);
       await makeDefaultCuratedPagesPublic(wikiDir);
+      await prepareGitHubPagesSyncProfile(wikiDir);
       await writeCuratedPage(
         wikiDir,
         "curated/topics/public-topic.md",
@@ -825,7 +957,7 @@ describe("explore sync command", () => {
         // Assert
         expect(result.exitCode).toBe(0);
         expect(result.stderr).toEqual([]);
-        expect(payload.data.source_profile).toBe("public");
+        expect(payload.data.source_profile).toBe(profile === "github-pages" ? "github-pages" : "public");
         expect(manifest.profile).toBe(profile);
         expect(manifest.files.map((file) => file.source_path)).toContain("curated/topics/public-topic.md");
         expect(manifest.files.map((file) => file.source_path)).not.toContain("curated/topics/private-topic.md");
@@ -859,6 +991,9 @@ describe("explore sync command", () => {
         const wikiDir = resolve(workspaceDir, "wiki");
         await initializeWiki(wikiDir);
         await makeDefaultCuratedPagesPublic(wikiDir);
+        if (profile === "github-pages") {
+          await prepareGitHubPagesSyncProfile(wikiDir);
+        }
         await writeCuratedPage(
           wikiDir,
           "curated/sources/public-summary.md",
@@ -912,6 +1047,9 @@ describe("explore sync command", () => {
         // Arrange
         const wikiDir = resolve(workspaceDir, "wiki");
         await initializeWiki(wikiDir);
+        if (profile === "github-pages") {
+          await prepareGitHubPagesSyncProfile(wikiDir);
+        }
         await writeCuratedPage(
           wikiDir,
           "curated/topics/public-topic.md",
@@ -966,6 +1104,9 @@ describe("explore sync command", () => {
         // Arrange
         const wikiDir = resolve(workspaceDir, "wiki");
         await initializeWiki(wikiDir);
+        if (profile === "github-pages") {
+          await prepareGitHubPagesSyncProfile(wikiDir);
+        }
         await makeDefaultCuratedPagesPublic(wikiDir);
         await writeCuratedPage(
           wikiDir,
@@ -1006,6 +1147,9 @@ describe("explore sync command", () => {
         // Arrange
         const wikiDir = resolve(workspaceDir, "wiki");
         await initializeWiki(wikiDir);
+        if (profile === "github-pages") {
+          await prepareGitHubPagesSyncProfile(wikiDir);
+        }
         await makeDefaultCuratedPagesPublic(wikiDir);
         await writeCuratedPage(
           wikiDir,
@@ -1047,6 +1191,9 @@ describe("explore sync command", () => {
         // Arrange
         const wikiDir = resolve(workspaceDir, "wiki");
         await initializeWiki(wikiDir);
+        if (profile === "github-pages") {
+          await prepareGitHubPagesSyncProfile(wikiDir);
+        }
         await makeDefaultCuratedPagesPublic(wikiDir);
         await writeCuratedPage(
           wikiDir,
@@ -1111,6 +1258,9 @@ describe("explore sync command", () => {
         // Arrange
         const wikiDir = resolve(workspaceDir, "wiki");
         await initializeWiki(wikiDir);
+        if (profile === "github-pages") {
+          await prepareGitHubPagesSyncProfile(wikiDir);
+        }
         await makeDefaultCuratedPagesPublic(wikiDir);
         await writeCuratedPage(
           wikiDir,

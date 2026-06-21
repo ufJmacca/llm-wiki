@@ -8,7 +8,7 @@ import { err, ok, type Result } from "../utils/result.js";
 
 export type RuntimeLogAppendEntry = {
   timestamp: string;
-  operation: "add" | "ingest";
+  operation: "add" | "ingest" | "query";
   affectedId: string;
   title: string;
   command: string;

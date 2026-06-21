@@ -702,6 +702,55 @@ describe("queue command", () => {
     });
   });
 
+  it("rejects missing runtime logs before changing queue status", async () => {
+    await withTempWorkspace("llm-wiki-queue-set-status-missing-log-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureTextSource(wikiDir, "Missing Log Transition", "status stays queued");
+      const queueBefore = await readFile(resolve(wikiDir, source.queue_path), "utf8");
+      const sourceCardBefore = await readFile(resolve(wikiDir, source.source_card_path), "utf8");
+      await rm(resolve(wikiDir, "curated/log.md"));
+
+      // Act
+      const result = await runCliBuffered([
+        "queue",
+        "set-status",
+        source.source_id,
+        "ingesting",
+        "--repo",
+        wikiDir,
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"queue set-status">(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload).toMatchObject({
+        ok: false,
+        command: "queue set-status",
+        repo: wikiDir,
+        error: {
+          code: "QUEUE_WRITE_FAILED",
+          message: "Required runtime log file is missing: curated/log.md.",
+          hint: "Restore curated/log.md from the scaffold before running workflows that append runtime log entries.",
+        },
+        issues: [
+          {
+            severity: "error",
+            code: "QUEUE_WRITE_FAILED",
+            message: "Required runtime log file is missing: curated/log.md.",
+            path: "curated/log.md",
+            hint: "Restore curated/log.md from the scaffold before running workflows that append runtime log entries.",
+          },
+        ],
+      });
+      expect(await readFile(resolve(wikiDir, source.queue_path), "utf8")).toBe(queueBefore);
+      expect(await readFile(resolve(wikiDir, source.source_card_path), "utf8")).toBe(sourceCardBefore);
+    });
+  });
+
   it("preserves CRLF source-card body content when setting status", async () => {
     await withTempWorkspace("llm-wiki-queue-set-status-crlf-", async (workspaceDir) => {
       // Arrange

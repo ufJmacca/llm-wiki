@@ -1,0 +1,422 @@
+import { EventEmitter } from "node:events";
+import { execFile, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { PassThrough } from "node:stream";
+import { promisify } from "node:util";
+
+import { stringify } from "yaml";
+import { describe, expect, it, vi } from "vitest";
+
+import { parseInitJson, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
+
+const spawnMock = vi.hoisted(() => vi.fn());
+const execFileAsync = promisify(execFile);
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+
+  return {
+    ...actual,
+    spawn: spawnMock,
+  };
+});
+
+type ExploreBuildEnvelope = {
+  ok: true;
+  command: "explore.build";
+  repo: string;
+  data: {
+    profile: "local" | "review" | "public" | "github-pages";
+    output_path: "quartz/public";
+    sync: {
+      manifest_path: string;
+      materialized_paths: string[];
+      generated_paths: string[];
+    };
+    lint: {
+      counts: {
+        total: number;
+        error: number;
+        warning: number;
+        fixed: number;
+      };
+    };
+    quartz: {
+      command: "npm";
+      args: string[];
+      cwd: string;
+      exit_code: number;
+    };
+  };
+  warnings: string[];
+};
+
+type ExploreBuildFailureEnvelope = {
+  ok: false;
+  command: "explore.build";
+  repo: string;
+  error: {
+    code: string;
+    message: string;
+    hint: string;
+  };
+  issues: Array<{
+    severity: "error";
+    code: string;
+    path: string;
+    hint: string;
+  }>;
+};
+
+async function initializeWiki(targetDir: string): Promise<void> {
+  const result = await runCliBuffered(["init", targetDir, "--no-git", "--json"]);
+
+  expect(result.exitCode).toBe(0);
+  parseInitJson(result.stdout);
+}
+
+async function initializeQuartzRuntime(wikiDir: string): Promise<void> {
+  const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+
+  expect(result.exitCode).toBe(0);
+}
+
+async function markQuartzDependenciesInstalled(wikiDir: string): Promise<void> {
+  await mkdir(resolve(wikiDir, "quartz/node_modules/.bin"), { recursive: true });
+  await writeFile(resolve(wikiDir, "quartz/node_modules/.bin/quartz"), "#!/usr/bin/env node\n", "utf8");
+  await mkdir(resolve(wikiDir, "quartz/quartz/components"), { recursive: true });
+  await mkdir(resolve(wikiDir, "quartz/quartz/plugins"), { recursive: true });
+  await writeFile(resolve(wikiDir, "quartz/quartz/build.ts"), "export {}\n", "utf8");
+  await writeFile(resolve(wikiDir, "quartz/quartz/components/index.ts"), "export {}\n", "utf8");
+  await writeFile(resolve(wikiDir, "quartz/quartz/plugins/index.ts"), "export {}\n", "utf8");
+}
+
+function parseExploreBuild(stdout: string[]): ExploreBuildEnvelope {
+  expect(stdout).toHaveLength(1);
+  return JSON.parse(stdout[0]) as ExploreBuildEnvelope;
+}
+
+function parseExploreBuildFailure(stdout: string[]): ExploreBuildFailureEnvelope {
+  expect(stdout).toHaveLength(1);
+  return JSON.parse(stdout[0]) as ExploreBuildFailureEnvelope;
+}
+
+function mockSuccessfulSpawn(): {
+  syncedBeforeBuild: () => boolean;
+  rootIndexMaterializedBeforeBuild: () => boolean;
+  contentGitignoreAbsentBeforeBuild: () => boolean;
+} {
+  let syncedBeforeBuild = false;
+  let rootIndexMaterializedBeforeBuild = false;
+  let contentGitignoreAbsentBeforeBuild = false;
+  spawnMock.mockImplementation((_command: string, _args: string[], options: SpawnOptionsWithoutStdio) => {
+    const cwd = typeof options.cwd === "string" ? options.cwd : "";
+    const wikiDir = resolve(cwd, "..");
+    syncedBeforeBuild =
+      existsSync(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.public.json")) &&
+      existsSync(resolve(wikiDir, "quartz/content/curated/home.md"));
+    rootIndexMaterializedBeforeBuild = existsSync(resolve(wikiDir, "quartz/content/index.md"));
+    contentGitignoreAbsentBeforeBuild = !existsSync(resolve(wikiDir, "quartz/content/.gitignore"));
+
+    const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = new PassThrough();
+    child.kill = vi.fn();
+    queueMicrotask(() => child.emit("close", 0, null));
+
+    return child;
+  });
+
+  return {
+    syncedBeforeBuild: () => syncedBeforeBuild,
+    rootIndexMaterializedBeforeBuild: () => rootIndexMaterializedBeforeBuild,
+    contentGitignoreAbsentBeforeBuild: () => contentGitignoreAbsentBeforeBuild,
+  };
+}
+
+async function initializeGitRepository(wikiDir: string): Promise<void> {
+  await execFileAsync("git", ["init"], { cwd: wikiDir });
+}
+
+async function writeCuratedPage(
+  wikiDir: string,
+  path: string,
+  frontmatter: Record<string, unknown>,
+  body: string,
+): Promise<void> {
+  const absolutePath = resolve(wikiDir, path);
+  await mkdir(dirname(absolutePath), { recursive: true });
+  await writeFile(absolutePath, `---\n${stringify(frontmatter).trimEnd()}\n---\n\n${body}`, "utf8");
+}
+
+async function makeDefaultCuratedPagesPublic(wikiDir: string): Promise<void> {
+  const pages = [
+    ["curated/contradictions.md", "Contradictions"],
+    ["curated/home.md", "Home"],
+    ["curated/index.md", "Index"],
+    ["curated/map.md", "Map"],
+    ["curated/open-questions.md", "Open Questions"],
+  ] as const;
+
+  for (const [path, title] of pages) {
+    await writeCuratedPage(
+      wikiDir,
+      path,
+      {
+        type: path === "curated/index.md" ? "index" : "page",
+        title,
+        visibility: "public",
+        source_ids: [],
+      },
+      `# ${title}\n`,
+    );
+  }
+}
+
+async function withProcessPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T>): Promise<T> {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { configurable: true, value: platform });
+  try {
+    return await run();
+  } finally {
+    if (descriptor !== undefined) {
+      Object.defineProperty(process, "platform", descriptor);
+    }
+  }
+}
+
+describe("explore build command", () => {
+  for (const profile of ["local", "review"] as const) {
+    it(`rejects ${profile} before syncing or building static Quartz output`, async () => {
+      await withTempWorkspace(`llm-wiki-explore-build-${profile}-rejected-`, async (workspaceDir) => {
+        // Arrange
+        spawnMock.mockReset();
+        const wikiDir = resolve(workspaceDir, "wiki");
+        await initializeWiki(wikiDir);
+        await initializeQuartzRuntime(wikiDir);
+        await markQuartzDependenciesInstalled(wikiDir);
+
+        // Act
+        const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", profile, "--json"]);
+        const payload = parseExploreBuildFailure(result.stdout);
+
+        // Assert
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toEqual([]);
+        expect(spawnMock).not.toHaveBeenCalled();
+        expect(payload.error).toEqual({
+          code: "PROFILE_UNSUPPORTED",
+          message: `Unsupported Quartz build profile: ${profile}.`,
+          hint: "Use --profile public or github-pages for static builds.",
+        });
+        expect(payload.issues).toEqual([
+          expect.objectContaining({
+            severity: "error",
+            code: "PROFILE_UNSUPPORTED",
+            path: "--profile",
+            hint: "Use --profile public or github-pages for static builds.",
+          }),
+        ]);
+        expect(existsSync(resolve(wikiDir, `.llm-wiki/cache/quartz-manifest.${profile}.json`))).toBe(false);
+        expect(existsSync(resolve(wikiDir, "quartz/content"))).toBe(false);
+      });
+    });
+  }
+
+  it("runs public sync, strict public lint, then Quartz build", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-public-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const spawnObservation = mockSuccessfulSpawn();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"]);
+      const payload = parseExploreBuild(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(spawnObservation.syncedBeforeBuild()).toBe(true);
+      expect(spawnObservation.rootIndexMaterializedBeforeBuild()).toBe(true);
+      expect(spawnMock).toHaveBeenCalledWith(
+        "npm",
+        ["run", "build"],
+        { cwd: resolve(wikiDir, "quartz"), stdio: ["ignore", "pipe", "pipe"] },
+      );
+      expect(payload.data).toMatchObject({
+        profile: "public",
+        output_path: "quartz/public",
+        sync: {
+          manifest_path: ".llm-wiki/cache/quartz-manifest.public.json",
+        },
+        lint: {
+          counts: {
+            error: 0,
+          },
+        },
+        quartz: {
+          command: "npm",
+          args: ["run", "build"],
+          cwd: resolve(wikiDir, "quartz"),
+          exit_code: 0,
+        },
+      });
+      await expect(readFile(resolve(wikiDir, "quartz/content/index.md"), "utf8")).resolves.toContain("# Index");
+    });
+  });
+
+  it("does not run Quartz build with a generated content-level gitignore", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-nested-gitignore-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const spawnObservation = mockSuccessfulSpawn();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await writeFile(resolve(wikiDir, "quartz/.gitignore"), "!content/\n!content/**\n", "utf8");
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"]);
+      const payload = parseExploreBuild(result.stdout);
+      const quartzGitignore = await readFile(resolve(wikiDir, "quartz/.gitignore"), "utf8");
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(spawnObservation.syncedBeforeBuild()).toBe(true);
+      expect(spawnObservation.contentGitignoreAbsentBeforeBuild()).toBe(true);
+      expect(quartzGitignore.trimEnd().endsWith("content/")).toBe(true);
+      expect(existsSync(resolve(wikiDir, "quartz/content/.gitignore"))).toBe(false);
+      expect(payload.warnings).toEqual(["Repaired nested generated Quartz ignore rule: quartz/.gitignore"]);
+    });
+  });
+
+  it("launches npm through the Windows command shim when building", async () => {
+    await withProcessPlatform("win32", async () => {
+      await withTempWorkspace("llm-wiki-explore-build-windows-npm-", async (workspaceDir) => {
+        // Arrange
+        spawnMock.mockReset();
+        mockSuccessfulSpawn();
+        const wikiDir = resolve(workspaceDir, "wiki");
+        await initializeWiki(wikiDir);
+        await initializeQuartzRuntime(wikiDir);
+        await markQuartzDependenciesInstalled(wikiDir);
+        await makeDefaultCuratedPagesPublic(wikiDir);
+
+        // Act
+        const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"]);
+
+        // Assert
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toEqual([]);
+        expect(spawnMock).toHaveBeenCalledWith(
+          "npm.cmd",
+          ["run", "build"],
+          { cwd: resolve(wikiDir, "quartz"), stdio: ["ignore", "pipe", "pipe"] },
+        );
+      });
+    });
+  });
+
+  it("runs public sync before failing strict public lint and does not build", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-public-lint-failure-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/private-topic.md",
+        {
+          type: "topic",
+          title: "Private Topic",
+          visibility: "private",
+          source_ids: [],
+        },
+        "# Private Topic\n\nPrivate body selected by public profile but excluded by visibility.\n",
+      );
+      const ordinaryLint = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--json"]);
+      const strictLint = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"]);
+      const payload = parseExploreBuildFailure(result.stdout);
+
+      // Assert
+      expect(ordinaryLint.exitCode).toBe(0);
+      expect(ordinaryLint.stdout.join("\n")).not.toContain("public_private_page_selected");
+      expect(strictLint.exitCode).toBe(1);
+      expect(strictLint.stdout.join("\n")).toContain("public_private_page_selected");
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(payload.error).toEqual({
+        code: "PUBLIC_LINT_FAILED",
+        message: "Strict public lint failed before Quartz build.",
+        hint: "Fix error-severity lint issues before building public Quartz output.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "PUBLIC_LINT_FAILED",
+          path: ".",
+        }),
+      ]);
+      await expect(readFile(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.public.json"), "utf8")).resolves.toContain(
+        "\"profile\": \"public\"",
+      );
+      await expect(readFile(resolve(wikiDir, "quartz/content/curated/home.md"), "utf8")).resolves.toContain("# Home");
+    });
+  });
+
+  it("returns exact install instructions and a stable error code when dependencies are missing", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-missing-deps-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/node_modules"), { recursive: true });
+      await makeDefaultCuratedPagesPublic(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"]);
+      const payload = parseExploreBuildFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(payload.error).toEqual({
+        code: "QUARTZ_DEPENDENCIES_MISSING",
+        message: "Quartz dependencies are not installed.",
+        hint: "Run cd quartz && npm install.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "QUARTZ_DEPENDENCIES_MISSING",
+          path: "quartz/package.json",
+          hint: "Run cd quartz && npm install.",
+        }),
+      ]);
+      await expect(readFile(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.public.json"), "utf8")).resolves.toContain(
+        "\"profile\": \"public\"",
+      );
+    });
+  });
+});

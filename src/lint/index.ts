@@ -113,6 +113,7 @@ const PUBLIC_FORBIDDEN_SKIPPED_PROFILE_ROOTS = [
     ],
   },
 ] as const;
+const PUBLIC_SKIPPED_NON_MARKDOWN_PROFILE_PATHS = [".llm-wiki/config.yml"] as const;
 
 export async function lintWiki(repoRoot: string, options: LintOptions = {}): Promise<LintResult> {
   const scan = await scanWikiRepository(repoRoot);
@@ -225,17 +226,62 @@ function profileScanIssues(scan: RepoScan, profileName?: string): LintIssue[] {
     return [missingProfileIssue(profileName)];
   }
 
-  return profiles.flatMap((profile) =>
-    profile.scan.issues.map((scannerIssue) => ({
-      rule_id: "profile_malformed",
-      severity: scannerIssue.severity,
-      path: scannerIssue.path,
-      line: scannerIssue.line,
-      message: scannerIssue.message,
-      fix_hint: scannerIssue.hint,
+  return [
+    ...duplicateProfileIssues(profiles),
+    ...profiles.flatMap((profile) =>
+      profile.scan.issues.map((scannerIssue) => ({
+        rule_id: "profile_malformed",
+        severity: scannerIssue.severity,
+        path: scannerIssue.path,
+        line: scannerIssue.line,
+        message: scannerIssue.message,
+        fix_hint: scannerIssue.hint,
+        fixable: false,
+      })),
+    ),
+  ];
+}
+
+function duplicateProfileIssues(profiles: RepoScan["profiles"]): LintIssue[] {
+  const profilesByName = new Map<string, string[]>();
+  for (const profile of profiles) {
+    profilesByName.set(profile.name, [...(profilesByName.get(profile.name) ?? []), profile.path]);
+  }
+
+  const issues: LintIssue[] = [];
+  for (const [name, paths] of profilesByName) {
+    if (paths.length <= 1) {
+      continue;
+    }
+
+    const orderedPaths = sortProfilePaths(paths);
+    issues.push({
+      rule_id: "profile_duplicate",
+      severity: "error",
+      path: orderedPaths[0] ?? `.llm-wiki/profiles/${name}.yml`,
+      message: `Duplicate profile files found for ${name}: ${orderedPaths.join(", ")}.`,
+      fix_hint: "Keep exactly one profile file for each name; remove either the .yml or .yaml variant before syncing Quartz content.",
       fixable: false,
-    })),
-  );
+    });
+  }
+
+  return issues;
+}
+
+function sortProfilePaths(paths: string[]): string[] {
+  return [...paths].sort((left, right) => profilePathSortWeight(left) - profilePathSortWeight(right) || left.localeCompare(right));
+}
+
+function profilePathSortWeight(path: string): number {
+  if (path.endsWith(".yml")) {
+    return 0;
+  }
+
+  if (path.endsWith(".yaml")) {
+    return 1;
+  }
+
+  return 2;
 }
 
 function sourceCardIssues(scan: RepoScan): LintIssue[] {
@@ -857,42 +903,21 @@ function indexIssues(scan: RepoScan): LintIssue[] {
   const expectedEntries = generatedIndexEntries(scan);
   const missing = expectedEntries.filter((entry) => !indexPage.content.includes(entry));
   const stale = staleGeneratedIndexRows(indexPage.content, expectedEntries);
-  if (missing.length === 0) {
-    if (stale.length === 0) {
-      return [];
-    }
-
-    return [
-      {
-        rule_id: "index_stale",
-        severity: "warning",
-        path: "curated/index.md",
-        message: `curated/index.md has ${stale.length} stale generated row${stale.length === 1 ? "" : "s"}.`,
-        fix_hint: "Run llm-wiki lint --fix to regenerate deterministic index entries.",
-        fixable: true,
-      },
-    ];
+  if (missing.length === 0 && stale.length === 0) {
+    return [];
   }
 
-  if (stale.length === 0) {
-    return [
-      {
-        rule_id: "index_stale",
-        severity: "warning",
-        path: "curated/index.md",
-        message: `curated/index.md is missing ${missing.length} known page or source entr${missing.length === 1 ? "y" : "ies"}.`,
-        fix_hint: "Run llm-wiki lint --fix to regenerate deterministic index entries.",
-        fixable: true,
-      },
-    ];
-  }
+  const details = [
+    missing.length > 0 ? `missing ${missing.length} known page or source entr${missing.length === 1 ? "y" : "ies"}` : "",
+    stale.length > 0 ? `has ${stale.length} stale generated row${stale.length === 1 ? "" : "s"}` : "",
+  ].filter((detail) => detail !== "");
 
   return [
     {
       rule_id: "index_stale",
       severity: "warning",
       path: "curated/index.md",
-      message: `curated/index.md is missing ${missing.length} known page or source entr${missing.length === 1 ? "y" : "ies"} and has ${stale.length} stale generated row${stale.length === 1 ? "" : "s"}.`,
+      message: `curated/index.md ${details.join(" and ")}.`,
       fix_hint: "Run llm-wiki lint --fix to regenerate deterministic index entries.",
       fixable: true,
     },
@@ -1114,7 +1139,11 @@ function publicProfileIssues(scan: RepoScan, profileName: string, linkIndex: Lin
   const exclude = toStringArray(profile.scan.profile.exclude);
   const configuredRequiredVisibility = profileRequiredVisibility(profile.scan.profile);
   const requiredVisibility = "public";
-  const selectedPaths = new Set(scan.files.map((file) => file.path).filter((path) => matchesProfile(path, include, exclude)));
+  const selectedPaths = new Set([
+    ...scan.files.map((file) => file.path).filter((path) => matchesProfile(path, include, exclude)),
+    ...scan.linkableFilePaths.filter((path) => matchesProfile(path, include, exclude)),
+    ...selectedSkippedNonMarkdownProfilePaths(include, exclude),
+  ]);
   const markdownByPath = linkIndex.markdownByPath;
   const issues: LintIssue[] = [];
 
@@ -1412,10 +1441,10 @@ function publicRawSourceIndexLeakIssues(
     return [];
   }
 
-  const rawSourceCells = scan.sourceCards
+  const rawSourceRowPrefixes = scan.sourceCards
     .filter((card) => card.source_id !== null && card.title !== null && !hasSourceCardErrors(card))
-    .map((card) => `| ${sourceIndexSourceCell(card, requiredVisibility)} |`);
-  if (rawSourceCells.length === 0) {
+    .map((card) => `| ${sourceIndexSourceCell(card, requiredVisibility)} | ${card.status ?? ""} |`);
+  if (rawSourceRowPrefixes.length === 0) {
     return [];
   }
 
@@ -1424,11 +1453,12 @@ function publicRawSourceIndexLeakIssues(
   const reportedLines = new Set<number>();
   for (const [lineIndex, line] of lines.entries()) {
     const lineNumber = lineIndex + 1;
-    if (reportedLines.has(lineNumber) || !line.trimStart().startsWith("|")) {
+    const tableLine = line.trim();
+    if (reportedLines.has(lineNumber) || !tableLine.startsWith("|")) {
       continue;
     }
 
-    if (rawSourceCells.some((cell) => line.includes(cell))) {
+    if (rawSourceRowPrefixes.some((rowPrefix) => tableLine.startsWith(rowPrefix))) {
       reportedLines.add(lineNumber);
       issues.push({
         rule_id: "public_raw_source_metadata_leak",
@@ -1731,10 +1761,6 @@ function indexableCuratedTargets(scan: RepoScan, indexVisibility = "private"): I
 }
 
 function sourceSummaryTargets(scan: RepoScan, indexVisibility = "private"): IndexTarget[] {
-  if (indexVisibility === "public") {
-    return [];
-  }
-
   const summaryPages = new Map(
     scan.curatedPages
       .filter((page) => /^curated\/sources\/[^/]+\.md$/.test(page.path))
@@ -1775,11 +1801,11 @@ function publicSourceSummaryIndexRows(scan: RepoScan): string[] {
 }
 
 function sourceIndexRows(scan: RepoScan, indexVisibility: string): string[] {
-  const sourceSummaryByPath = new Map(sourceSummaryTargets(scan, indexVisibility).map((target) => [target.path, target]));
   if (indexVisibility === "public") {
-    return [...sourceSummaryByPath.values()].map((summary) => `| ${summary.link} | | | |`);
+    return [];
   }
 
+  const sourceSummaryByPath = new Map(sourceSummaryTargets(scan, indexVisibility).map((target) => [target.path, target]));
   return scan.sourceCards
     .filter((card) => card.source_id !== null && card.title !== null && !hasSourceCardErrors(card))
     .map((card) => {
@@ -1896,7 +1922,7 @@ function publicProfileLinkResolutions(scan: RepoScan, page: RepoMarkdownFile, li
 }
 
 export function createLinkResolutionIndex(scan: RepoScan): LinkResolutionIndex {
-  const filePaths = new Set(scan.files.map((file) => file.path));
+  const filePaths = new Set([...scan.files.map((file) => file.path), ...scan.linkableFilePaths]);
   const markdownByPath = new Map<string, RepoMarkdownFile>();
   const markdownByTitle = new Map<string, RepoMarkdownFile>();
   const markdownByAlias = new Map<string, RepoMarkdownFile>();
@@ -2077,6 +2103,10 @@ function selectedForbiddenSkippedProfileRoots(include: string[], exclude: string
   );
 }
 
+function selectedSkippedNonMarkdownProfilePaths(include: string[], exclude: string[]): string[] {
+  return PUBLIC_SKIPPED_NON_MARKDOWN_PROFILE_PATHS.filter((path) => matchesProfile(path, include, exclude));
+}
+
 function forbiddenSkippedRootCandidate(rootPath: string, configuredCandidates: readonly string[], includePattern: string, exclude: string[]): string | null {
   const candidates = [...new Set([
     ...configuredCandidates.filter((path) => matchesGlob(path, includePattern)),
@@ -2210,7 +2240,11 @@ function profileRequiredVisibility(profile: Record<string, unknown>): string {
 }
 
 function escapeTableCell(value: string): string {
-  return value.replaceAll("|", "\\|");
+  return normalizeIndexLabel(value).replaceAll("|", "\\|");
+}
+
+function normalizeIndexLabel(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function sourceIndexSourceCell(card: SourceCard, indexVisibility: string): string {

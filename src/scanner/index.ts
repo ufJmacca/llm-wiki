@@ -973,6 +973,11 @@ function parseInlineMarkdownLinks(path: string, line: string, scanLine: string, 
       break;
     }
 
+    if (isEscapedMarkdownOpener(scanLine, labelStart)) {
+      searchIndex = labelStart + 1;
+      continue;
+    }
+
     const labelEnd = findMarkdownLinkLabelEnd(scanLine, labelStart);
     if (labelEnd === -1) {
       searchIndex = labelStart + 1;
@@ -1033,6 +1038,11 @@ function parseMultilineInlineMarkdownLinks(path: string, lines: HtmlAttributeSca
     const labelStart = scanContent.indexOf("[", searchIndex);
     if (labelStart === -1) {
       break;
+    }
+
+    if (isEscapedMarkdownOpener(scanContent, labelStart)) {
+      searchIndex = labelStart + 1;
+      continue;
     }
 
     const labelEnd = findMarkdownLinkLabelEnd(scanContent, labelStart);
@@ -1294,6 +1304,15 @@ function parseNestedMarkdownShortcutImages(
   }
 
   return links;
+}
+
+function isEscapedMarkdownOpener(value: string, openerIndex: number): boolean {
+  let backslashCount = 0;
+  for (let index = openerIndex - 1; index >= 0 && value[index] === "\\"; index -= 1) {
+    backslashCount += 1;
+  }
+
+  return backslashCount % 2 === 1;
 }
 
 function parseMarkdownAutolinks(path: string, line: string, scanLine: string, lineNumber: number): MarkdownLink[] {

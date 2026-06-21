@@ -318,6 +318,31 @@ export async function validateReadFileInsideRoot(
   return ok({ absolutePath: target.value.absolutePath });
 }
 
+export async function readTextFileInsideRoot(
+  rootDir: string,
+  relativePath: string,
+): Promise<Result<string, BinaryWriteError>> {
+  const target = await validateReadFileInsideRoot(rootDir, relativePath);
+  if (!target.ok) {
+    return target;
+  }
+
+  let file: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    file = await open(target.value.absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const fileStat = await file.stat();
+    if (!fileStat.isFile()) {
+      return err(destinationParentUnsafe(relativePath, `destination is not a regular file: ${relativePath}`));
+    }
+
+    return ok(await file.readFile("utf8"));
+  } catch (error) {
+    return err(destinationParentUnsafe(relativePath, error instanceof Error ? error.message : String(error)));
+  } finally {
+    await file?.close().catch(() => undefined);
+  }
+}
+
 async function validateWritableScaffoldPaths(
   rootPath: string,
   rootRealPath: string,

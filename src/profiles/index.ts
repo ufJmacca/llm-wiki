@@ -1,8 +1,8 @@
-import { lstat, readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { readFile } from "node:fs/promises";
 
 import { parseProfile } from "../scanner/index.js";
 import type { RepoMarkdownFile, RepoOriginalFile } from "../scanner/repo.js";
+import { validateReadFileInsideRoot } from "../utils/fs.js";
 import { err, ok, type Result } from "../utils/result.js";
 
 export type ExploreProfileName = "local" | "review" | "public" | "github-pages";
@@ -54,43 +54,20 @@ export async function readWikiProfile(
   const profilePath = profilePathResult.value;
   const sourceName = profilePath.match(/\/github-pages\.ya?ml$/) ? "github-pages" : profileName === "github-pages" ? "public" : profileName;
 
-  const absoluteProfilePath = resolve(repoRoot, profilePath);
+  const readableProfile = await readableProfilePath(repoRoot, profileName, profilePath);
+  if (!readableProfile.ok) {
+    return readableProfile;
+  }
+
   let content: string;
   try {
-    const profileStat = await lstat(absoluteProfilePath);
-    if (profileStat.isSymbolicLink()) {
-      return err({
-        code: "PROFILE_INVALID",
-        message: `Profile must be a regular file, not a symlink: ${profileName}.`,
-        path: profilePath,
-        hint: "Replace the profile symlink with a regular YAML file before syncing Quartz content.",
-      });
-    }
-    if (!profileStat.isFile()) {
-      return err({
-        code: "PROFILE_INVALID",
-        message: `Profile must be a regular file: ${profileName}.`,
-        path: profilePath,
-        hint: "Replace the profile path with a regular YAML file before syncing Quartz content.",
-      });
-    }
-
-    content = await readFile(absoluteProfilePath, "utf8");
+    content = await readFile(readableProfile.value, "utf8");
   } catch (error) {
-    if (!isNodeError(error) || error.code !== "ENOENT") {
-      return err({
-        code: "PROFILE_INVALID",
-        message: `Could not inspect profile: ${profileName}.`,
-        path: profilePath,
-        hint: error instanceof Error ? error.message : "Fix filesystem permissions before syncing Quartz content.",
-      });
-    }
-
     return err({
-      code: "PROFILE_MISSING",
-      message: `Profile is missing: ${profileName}.`,
+      code: "PROFILE_INVALID",
+      message: `Could not inspect profile: ${profileName}.`,
       path: profilePath,
-      hint: "Restore the profile YAML before syncing Quartz content.",
+      hint: error instanceof Error ? error.message : "Fix filesystem permissions before syncing Quartz content.",
     });
   }
 
@@ -248,23 +225,87 @@ async function existingProfilePaths(repoRoot: string, profileName: string): Prom
   const paths: string[] = [];
   for (const extension of ["yml", "yaml"]) {
     const profilePath = `.llm-wiki/profiles/${profileName}.${extension}`;
-    try {
-      await lstat(resolve(repoRoot, profilePath));
+    const profileState = await existingReadableProfilePath(repoRoot, profileName, profilePath);
+    if (!profileState.ok) {
+      return profileState;
+    }
+
+    if (profileState.value === "present") {
       paths.push(profilePath);
-    } catch (error) {
-      if (!isNodeError(error) || error.code !== "ENOENT") {
-        return err({
-          code: "PROFILE_INVALID",
-          message: `Could not inspect profile: ${profileName}.`,
-          path: profilePath,
-          hint: error instanceof Error ? error.message : "Fix filesystem permissions before syncing Quartz content.",
-        });
-      }
-      // Try the next supported profile path before reporting the profile as missing.
     }
   }
 
   return ok(paths);
+}
+
+async function existingReadableProfilePath(
+  repoRoot: string,
+  profileName: string,
+  profilePath: string,
+): Promise<Result<"present" | "missing", ProfileError>> {
+  const readableProfile = await readableProfilePath(repoRoot, profileName, profilePath);
+  if (readableProfile.ok) {
+    return ok("present");
+  }
+
+  if (readableProfile.error.code === "PROFILE_MISSING") {
+    return ok("missing");
+  }
+
+  return readableProfile;
+}
+
+async function readableProfilePath(
+  repoRoot: string,
+  profileName: string,
+  profilePath: string,
+): Promise<Result<string, ProfileError>> {
+  const validation = await validateReadFileInsideRoot(repoRoot, profilePath);
+  if (!validation.ok) {
+    return err(profileReadError(profileName, profilePath, validation.error));
+  }
+
+  return ok(validation.value.absolutePath);
+}
+
+function profileReadError(profileName: string, profilePath: string, error: { message: string; hint: string }): ProfileError {
+  if (isMissingProfilePath(error.message)) {
+    return {
+      code: "PROFILE_MISSING",
+      message: `Profile is missing: ${profileName}.`,
+      path: profilePath,
+      hint: "Restore the profile YAML before syncing Quartz content.",
+    };
+  }
+
+  if (error.message.includes("symlink")) {
+    return {
+      code: "PROFILE_INVALID",
+      message: `Profile path must not include symlinks: ${profileName}.`,
+      path: profilePath,
+      hint: "Keep profile YAML as a regular file inside .llm-wiki/profiles without symlinked parent directories.",
+    };
+  }
+
+  if (error.message.includes("not a regular file")) {
+    return {
+      code: "PROFILE_INVALID",
+      message: `Profile must be a regular file: ${profileName}.`,
+      path: profilePath,
+      hint: "Replace the profile path with a regular YAML file before syncing Quartz content.",
+    };
+  }
+
+  return {
+    code: "PROFILE_INVALID",
+    message: `Profile path must stay inside the wiki repository: ${profileName}.`,
+    path: profilePath,
+    hint: error.hint,
+  };
+}
+
+function isMissingProfilePath(message: string): boolean {
+  return message.includes("ENOENT") || message.startsWith("destination parent does not exist:");
 }
 
 function isSelectedVisibilityFrontmatterIssue(issue: { rule_id?: string; message?: string }): boolean {
@@ -285,10 +326,6 @@ function isSelectedVisibilityBlockingIssue(issue: { rule_id?: string; message?: 
     issue.rule_id === "public_private_page_selected" ||
     issue.rule_id === "public_search_private_text_leak"
   );
-}
-
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-  return typeof error === "object" && error !== null && "code" in error;
 }
 
 function matchesProfile(path: string, include: string[], exclude: string[]): boolean {

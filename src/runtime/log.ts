@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { open } from "node:fs/promises";
+import { lstat, open } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { parseLogEntries, type RuntimeLogEntry, type ScannerIssue } from "../scanner/index.js";
@@ -35,8 +35,22 @@ export type RuntimeLogReadError = {
 
 const RUNTIME_LOG_PATH = "curated/log.md";
 
-export async function validateRuntimeLogAppendTarget(repoRoot: string) {
-  return validateAppendFileInsideRoot(repoRoot, RUNTIME_LOG_PATH);
+export async function validateRuntimeLogAppendTarget(repoRoot: string): Promise<Result<void, BinaryWriteError>> {
+  const target = await validateAppendFileInsideRoot(repoRoot, RUNTIME_LOG_PATH);
+  if (!target.ok) {
+    return target;
+  }
+
+  try {
+    const pathStat = await lstat(resolve(repoRoot, RUNTIME_LOG_PATH));
+    if (!pathStat.isFile()) {
+      return err(runtimeLogAppendError(new Error(`destination is not a regular file: ${RUNTIME_LOG_PATH}`)));
+    }
+
+    return ok(undefined);
+  } catch (error) {
+    return err(runtimeLogAppendError(error));
+  }
 }
 
 export async function appendRuntimeLogEntry(
@@ -54,7 +68,7 @@ export async function appendRuntimeLogEntry(
   try {
     file = await open(
       resolve(repoRoot, RUNTIME_LOG_PATH),
-      constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW,
+      constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW,
       0o666,
     );
     previousSize = (await file.stat()).size;
@@ -140,10 +154,23 @@ function formatLogScalar(value: string): string {
 }
 
 function runtimeLogAppendError(error: unknown): BinaryWriteError {
+  if (isNodeError(error) && error.code === "ENOENT") {
+    return {
+      code: "DESTINATION_PARENT_UNSAFE",
+      message: `Required runtime log file is missing: ${RUNTIME_LOG_PATH}.`,
+      path: RUNTIME_LOG_PATH,
+      hint: "Restore curated/log.md from the scaffold before running workflows that append runtime log entries.",
+    };
+  }
+
   return {
     code: "DESTINATION_PARENT_UNSAFE",
     message: error instanceof Error ? error.message : String(error),
     path: RUNTIME_LOG_PATH,
     hint: "Capture writes must stay inside the wiki repository and must not follow symlinks.",
   };
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }

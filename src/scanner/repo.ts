@@ -286,6 +286,10 @@ async function listInputFiles(
 }
 
 function shouldSkipRoot(path: string): boolean {
+  if (path.split("/").includes("node_modules")) {
+    return true;
+  }
+
   return SKIPPED_ROOTS.some((skippedRoot) => path === skippedRoot || path.startsWith(`${skippedRoot}/`));
 }
 

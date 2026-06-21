@@ -15,6 +15,7 @@ import {
   type SourceCaptureError,
   type SourceCaptureSuccess,
 } from "../sourceCapture/index.js";
+import { gitCommandEnv } from "../utils/git.js";
 import { err, ok, type Result } from "../utils/result.js";
 
 const execFileAsync = promisify(execFile);
@@ -753,11 +754,12 @@ async function commitUploadWithGit(request: UploadCommitRequest): Promise<Upload
   }
 
   try {
-    await execFileAsync("git", ["add", "--", ...paths], { cwd: request.repoRoot });
+    const gitEnv = gitCommandEnv();
+    await execFileAsync("git", ["add", "--", ...paths], { cwd: request.repoRoot, env: gitEnv });
     await execFileAsync(
       "git",
       ["commit", "-m", `chore: upload raw source ${request.source_id}`, "--", ...paths],
-      { cwd: request.repoRoot },
+      { cwd: request.repoRoot, env: gitEnv },
     );
 
     return {

@@ -6,7 +6,7 @@ import { parse } from "yaml";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parseLogEntries } from "../src/scanner/index.js";
-import { captureFileSource } from "../src/sourceCapture/index.js";
+import { captureFileSource, captureTextSource } from "../src/sourceCapture/index.js";
 import { writeBinaryFileNoOverwriteInsideRoot } from "../src/utils/fs.js";
 import {
   parseInitJson,
@@ -576,6 +576,102 @@ describe("source capture core", () => {
     });
   });
 
+  it("does not return a queue duplicate when the referenced source card is missing", async () => {
+    await withTempWorkspace("llm-wiki-add-stale-duplicate-card-", async (workspaceDir) => {
+      // Arrange
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(capturedAt));
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const content = "Duplicate content with a stale queue card reference.\n";
+      const recoveredTitle = "Recovered Missing Card";
+      const recoveredSourceId = expectedSourceId(recoveredTitle, content);
+      await initializeWiki(wikiDir);
+      const firstAdd = await captureTextSource({
+        repoRoot: wikiDir,
+        text: content,
+        title: "Original Missing Card",
+        now: new Date(capturedAt),
+      });
+      if (!firstAdd.ok) {
+        throw new Error(firstAdd.error.message);
+      }
+      await rm(resolve(wikiDir, firstAdd.value.source.source_card_path));
+
+      // Act
+      const recovered = await captureTextSource({
+        repoRoot: wikiDir,
+        text: content,
+        title: recoveredTitle,
+        now: new Date(capturedAt),
+      });
+
+      // Assert
+      expect(recovered).toEqual({
+        ok: true,
+        value: expect.objectContaining({
+          status: "added",
+          source: expect.objectContaining({
+            source_id: recoveredSourceId,
+            title: recoveredTitle,
+          }),
+          created_paths: [
+            `raw/inputs/2026/06/${recoveredSourceId}/original.md`,
+            `raw/inputs/2026/06/${recoveredSourceId}/_source.md`,
+            `raw/queue/${recoveredSourceId}.json`,
+          ],
+        }),
+      });
+    });
+  });
+
+  it("does not return a queue duplicate when the referenced original hash has drifted", async () => {
+    await withTempWorkspace("llm-wiki-add-stale-duplicate-original-", async (workspaceDir) => {
+      // Arrange
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(capturedAt));
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const content = "Duplicate content with a drifted original reference.\n";
+      const recoveredTitle = "Recovered Drifted Original";
+      const recoveredSourceId = expectedSourceId(recoveredTitle, content);
+      await initializeWiki(wikiDir);
+      const firstAdd = await captureTextSource({
+        repoRoot: wikiDir,
+        text: content,
+        title: "Original Drifted Original",
+        now: new Date(capturedAt),
+      });
+      if (!firstAdd.ok) {
+        throw new Error(firstAdd.error.message);
+      }
+      await writeFile(resolve(wikiDir, firstAdd.value.source.original_path), "drifted original\n", "utf8");
+
+      // Act
+      const recovered = await captureTextSource({
+        repoRoot: wikiDir,
+        text: content,
+        title: recoveredTitle,
+        now: new Date(capturedAt),
+      });
+
+      // Assert
+      expect(recovered).toEqual({
+        ok: true,
+        value: expect.objectContaining({
+          status: "added",
+          source: expect.objectContaining({
+            source_id: recoveredSourceId,
+            title: recoveredTitle,
+          }),
+          created_paths: [
+            `raw/inputs/2026/06/${recoveredSourceId}/original.md`,
+            `raw/inputs/2026/06/${recoveredSourceId}/_source.md`,
+            `raw/queue/${recoveredSourceId}.json`,
+          ],
+        }),
+      });
+    });
+  });
+
   it("detects duplicate content after queue items leave the queued state", async () => {
     const statusTransitions = [
       { status: "ingesting", transitions: ["ingesting"] },
@@ -648,6 +744,80 @@ describe("source capture core", () => {
         expect(afterDuplicate).toEqual(beforeDuplicate);
       });
     }
+  });
+
+  it("detects duplicate ingested content after its queue record is removed", async () => {
+    await withTempWorkspace("llm-wiki-add-duplicate-ingested-card-", async (workspaceDir) => {
+      // Arrange
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(capturedAt));
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const title = "Duplicate Ingested Card";
+      const content = "Duplicate content whose queue record was removed after ingest.\n";
+      const sourceId = expectedSourceId(title, content);
+      await initializeWiki(wikiDir);
+      const firstAdd = await runCliBuffered([
+        "add-text",
+        content,
+        "--repo",
+        wikiDir,
+        "--title",
+        title,
+        "--json",
+      ]);
+      expect(firstAdd.exitCode).toBe(0);
+
+      for (const status of ["ingesting", "ingested"]) {
+        const transitionResult = await runCliBuffered([
+          "queue",
+          "set-status",
+          sourceId,
+          status,
+          "--repo",
+          wikiDir,
+          "--json",
+        ]);
+        expect(transitionResult.exitCode).toBe(0);
+      }
+
+      await mkdir(resolve(wikiDir, "curated/sources"), { recursive: true });
+      await writeFile(
+        resolve(wikiDir, `curated/sources/${sourceId}.md`),
+        `---\ntype: source_summary\ntitle: ${title}\nvisibility: private\nsource_ids:\n  - ${sourceId}\n---\n\n# ${title}\n\nValidated ingested summary.\n`,
+        "utf8",
+      );
+      await rm(resolve(wikiDir, `raw/queue/${sourceId}.json`));
+      const beforeDuplicate = await readTreeSnapshot(wikiDir);
+
+      // Act
+      const duplicateResult = await runCliBuffered([
+        "add-text",
+        content,
+        "--repo",
+        wikiDir,
+        "--title",
+        "Duplicate Ingested Card Again",
+        "--json",
+      ]);
+      const payload = parseJsonEnvelope<SourceCaptureData>(duplicateResult.stdout);
+      const afterDuplicate = await readTreeSnapshot(wikiDir);
+
+      // Assert
+      expect(duplicateResult.exitCode).toBe(0);
+      expect(duplicateResult.stderr).toEqual([]);
+      expect(payload.data).toMatchObject({
+        status: "duplicate",
+        source: {
+          source_id: sourceId,
+          title,
+          source_kind: "text",
+          queue_status: "ingested",
+          queue_path: `raw/queue/${sourceId}.json`,
+        },
+        created_paths: [],
+      });
+      expect(afterDuplicate).toEqual(beforeDuplicate);
+    });
   });
 
   it("skips malformed queue JSON while scanning for duplicates", async () => {
@@ -1067,6 +1237,53 @@ describe("source capture core", () => {
         ],
       });
       expect(await readFile(outsideLogPath, "utf8")).toBe("outside\n");
+      expect(await pathExists(resolve(wikiDir, `${sourceDir}/original.md`))).toBe(false);
+      expect(await pathExists(resolve(wikiDir, `${sourceDir}/_source.md`))).toBe(false);
+      expect(await pathExists(resolve(wikiDir, `raw/queue/${sourceId}.json`))).toBe(false);
+    });
+  });
+
+  it("rejects missing runtime logs before writing source artifacts", async () => {
+    await withTempWorkspace("llm-wiki-add-log-missing-", async (workspaceDir) => {
+      // Arrange
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(capturedAt));
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const sourcePath = resolve(workspaceDir, "missing-log.md");
+      const content = "# Missing Log\n";
+      const sourceId = expectedSourceId("Missing Log", content);
+      const sourceDir = `raw/inputs/2026/06/${sourceId}`;
+      await initializeWiki(wikiDir);
+      await writeFile(sourcePath, content, "utf8");
+      await rm(resolve(wikiDir, "curated/log.md"));
+
+      // Act
+      const result = await runCliBuffered(["add", sourcePath, "--repo", wikiDir, "--title", "Missing Log", "--json"]);
+      const payload = parseJsonFailureEnvelope(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload).toMatchObject({
+        ok: false,
+        command: "add",
+        repo: wikiDir,
+        error: {
+          code: "DESTINATION_PARENT_UNSAFE",
+          message: "Required runtime log file is missing: curated/log.md.",
+          hint: "Restore curated/log.md from the scaffold before running workflows that append runtime log entries.",
+        },
+        issues: [
+          {
+            severity: "error",
+            code: "DESTINATION_PARENT_UNSAFE",
+            message: "Required runtime log file is missing: curated/log.md.",
+            path: "curated/log.md",
+            hint: "Restore curated/log.md from the scaffold before running workflows that append runtime log entries.",
+          },
+        ],
+      });
+      expect(await pathExists(resolve(wikiDir, "curated/log.md"))).toBe(false);
       expect(await pathExists(resolve(wikiDir, `${sourceDir}/original.md`))).toBe(false);
       expect(await pathExists(resolve(wikiDir, `${sourceDir}/_source.md`))).toBe(false);
       expect(await pathExists(resolve(wikiDir, `raw/queue/${sourceId}.json`))).toBe(false);

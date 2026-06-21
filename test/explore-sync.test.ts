@@ -374,9 +374,8 @@ describe("explore sync command", () => {
           path: ".llm-wiki/profiles/public.yml",
         }),
       ]);
-      expect(await pathExists(resolve(wikiDir, "quartz/content"))).toBe(false);
-      expect(await pathExists(resolve(wikiDir, `quartz/content/${capture.source.source_card_path}`))).toBe(false);
-      expect(await pathExists(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.local.json"))).toBe(false);
+      expect(await pathExists(resolve(wikiDir, `quartz/content/${capture.source.source_card_path}`))).toBe(true);
+      expect(await pathExists(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.local.json"))).toBe(true);
       expect(await pathExists(resolve(wikiDir, `.llm-wiki/cache/quartz-manifest.${profile}.json`))).toBe(false);
     });
   });
@@ -553,6 +552,48 @@ visibility:
           severity: "error",
           code: "PROFILE_INVALID",
           path: ".llm-wiki/profiles/public.yml",
+        }),
+      ]);
+      expect(await pathExists(resolve(wikiDir, "quartz/content/curated/topics/public-topic.md"))).toBe(false);
+    });
+  });
+
+  it.each(["public", "github-pages"] as const)("rejects symlinked profile parent directories for %s sync", async (profile) => {
+    await withTempWorkspace(`llm-wiki-explore-sync-${profile}-symlink-profile-parent-`, async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const profilesPath = resolve(wikiDir, ".llm-wiki/profiles");
+      const outsideProfilesPath = resolve(workspaceDir, "outside-profiles");
+      await rename(profilesPath, outsideProfilesPath);
+      await symlink(outsideProfilesPath, profilesPath, "dir");
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/public-topic.md",
+        {
+          type: "topic",
+          title: "Public Topic",
+          visibility: "public",
+          source_ids: [],
+        },
+        "# Public Topic\n\nPublic body.\n",
+      );
+
+      // Act
+      const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", profile, "--json"]);
+      const payload = parseExploreSyncFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("PROFILE_INVALID");
+      expect(payload.error.message).toContain("symlink");
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "PROFILE_INVALID",
+          path: `.llm-wiki/profiles/${profile === "github-pages" ? "github-pages" : "public"}.yml`,
         }),
       ]);
       expect(await pathExists(resolve(wikiDir, "quartz/content/curated/topics/public-topic.md"))).toBe(false);
@@ -1041,7 +1082,7 @@ visibility:
   );
 
   it.each(["public", "github-pages"] as const)(
-    "fails %s sync before materialization when strict leak checks fail",
+    "fails %s sync without deleting an existing Explorer materialization when strict leak checks fail",
     async (profile) => {
       await withTempWorkspace(`llm-wiki-explore-sync-${profile}-leak-`, async (workspaceDir) => {
         // Arrange
@@ -1075,6 +1116,7 @@ visibility:
         const localResult = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "local", "--json"]);
         expect(localResult.exitCode).toBe(0);
         expect(await pathExists(resolve(wikiDir, "quartz/content/curated/topics/private-topic.md"))).toBe(true);
+        expect(await pathExists(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.local.json"))).toBe(true);
 
         // Act
         const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", profile, "--json"]);
@@ -1091,7 +1133,8 @@ visibility:
             path: "curated/topics/public-topic.md",
           }),
         ]);
-        expect(await pathExists(resolve(wikiDir, "quartz/content"))).toBe(false);
+        expect(await pathExists(resolve(wikiDir, "quartz/content/curated/topics/private-topic.md"))).toBe(true);
+        expect(await pathExists(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.local.json"))).toBe(true);
         expect(await pathExists(resolve(wikiDir, `.llm-wiki/cache/quartz-manifest.${profile}.json`))).toBe(false);
       });
     },
@@ -1185,7 +1228,7 @@ visibility:
   );
 
   it.each(["public", "github-pages"] as const)(
-    "removes stale %s manifest when leak checks fail after a successful sync",
+    "preserves last successful %s output when leak checks fail after a successful sync",
     async (profile) => {
       await withTempWorkspace(`llm-wiki-explore-sync-${profile}-stale-manifest-`, async (workspaceDir) => {
         // Arrange
@@ -1225,6 +1268,11 @@ visibility:
           "curated/topics/public-topic.md",
         );
         expect(await pathExists(resolve(wikiDir, "quartz/content/curated/topics/public-topic.md"))).toBe(true);
+        const previousManifest = await readFile(manifestPath, "utf8");
+        const previousPublicTopic = await readFile(
+          resolve(wikiDir, "quartz/content/curated/topics/public-topic.md"),
+          "utf8",
+        );
 
         await writeCuratedPage(
           wikiDir,
@@ -1245,8 +1293,10 @@ visibility:
         // Assert
         expect(result.exitCode).toBe(1);
         expect(payload.error.code).toBe("PUBLIC_PROFILE_LEAK_CHECK_FAILED");
-        expect(await pathExists(resolve(wikiDir, "quartz/content"))).toBe(false);
-        expect(await pathExists(manifestPath)).toBe(false);
+        expect(await readFile(manifestPath, "utf8")).toBe(previousManifest);
+        await expect(readFile(resolve(wikiDir, "quartz/content/curated/topics/public-topic.md"), "utf8")).resolves.toBe(
+          previousPublicTopic,
+        );
       });
     },
   );

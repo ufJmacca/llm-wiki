@@ -315,6 +315,14 @@ Current lint rules detect raw source hash drift, malformed source cards, queue/s
 
 `llm-wiki index rebuild` writes `.llm-wiki/cache/pages.json`, `sources.json`, `queue.json`, `graph.json`, and `metadata.json`. These caches are rebuildable and non-authoritative; existing `.llm-wiki/cache/*` files are ignored as scan inputs.
 
+## Public Strict Threat Model
+
+`llm-wiki lint --profile public --strict` treats the public profile as a publishing boundary. It fails closed before public output can include or point at raw originals, raw source cards, raw assets, private curated pages, private source summaries, queue files, runtime logs, generated cache data, local filesystem paths, or links that can expose those targets.
+
+The shared scanners treat leak checks as parser work, not string search. Public strict lint scans inline Markdown links, reference links, collapsed and shortcut reference links, image links, Obsidian wikilinks, and HTML href, src, srcset, poster, data, and data-* resource attributes, including multiline tags and individual `srcset` and `data-srcset` candidates.
+
+Path and URL normalization is shared across Markdown, HTML, wikilinks, and autolinks. It handles POSIX paths, Windows drive-letter paths, backslash separators, `file: URLs`, percent-encoded and entity-encoded destinations, query strings, fragments, balanced brackets, and balanced parentheses before evaluating whether a public page selected or linked private/raw/generated content.
+
 ## Generated Scaffold Semantics
 
 `llm-wiki init` creates a wiki repository scaffold, not a completed knowledge base.

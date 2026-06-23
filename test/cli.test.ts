@@ -95,6 +95,56 @@ describe("llm-wiki CLI baseline", () => {
     expect(stderr).toEqual([]);
   });
 
+  it("describes ingest manual, local agent, auto, validation, and HTTP provider modes in help", async () => {
+    // Arrange
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+
+    // Act
+    const exitCode = await runCli(["ingest", "--help"], {
+      stdout: (message) => stdout.push(message),
+      stderr: (message) => stderr.push(message),
+    });
+    const help = stdout.join("\n");
+
+    // Assert
+    expect(exitCode).toBe(0);
+    expect(stderr).toEqual([]);
+    expect(help).toContain("manual prompt");
+    expect(help).toContain("--agent <name>");
+    expect(help).toContain("local agent execution");
+    expect(help).toContain("--auto");
+    expect(help).toMatch(/configured default local\s+agent/);
+    expect(help).toContain("--provider <name>");
+    expect(help).toContain("HTTP provider");
+    expect(help).toContain("--validate");
+  });
+
+  it("describes query manual, local agent, auto, validation, and HTTP provider modes in help", async () => {
+    // Arrange
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+
+    // Act
+    const exitCode = await runCli(["query", "--help"], {
+      stdout: (message) => stdout.push(message),
+      stderr: (message) => stderr.push(message),
+    });
+    const help = stdout.join("\n");
+
+    // Assert
+    expect(exitCode).toBe(0);
+    expect(stderr).toEqual([]);
+    expect(help).toContain("manual prompt");
+    expect(help).toContain("--agent <name>");
+    expect(help).toContain("local agent execution");
+    expect(help).toContain("--auto");
+    expect(help).toMatch(/configured default local\s+agent/);
+    expect(help).toContain("--provider <name>");
+    expect(help).toContain("HTTP provider");
+    expect(help).toContain("--validate");
+  });
+
   it("runs the built package binary from a clean working directory", async () => {
     // Arrange
     const manifest = await readPackageManifest();

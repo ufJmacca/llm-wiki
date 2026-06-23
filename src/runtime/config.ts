@@ -76,6 +76,7 @@ export type WikiGitConfig = {
 };
 
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const LOCAL_AGENT_OUTPUT_MODE_GIT_DIFF = "git-diff";
 const ALLOWED_SECRET_ENV_KEYS = new Set(["api_key_env"]);
 const FORBIDDEN_SECRET_KEY_PATTERNS = [
   /(^|_)api_keys?($|_)/,
@@ -569,6 +570,13 @@ function parseLocalAgentConfig(name: string, value: unknown): Result<LocalAgentC
   );
   if (!outputMode.ok) {
     return outputMode;
+  }
+  if (outputMode.value !== null && outputMode.value !== LOCAL_AGENT_OUTPUT_MODE_GIT_DIFF) {
+    return invalidAgentConfig(
+      "Agent output_mode must be git-diff when present.",
+      `${basePath}.output_mode`,
+      "Set output_mode: git-diff to use temporary workspace diff extraction, or omit it.",
+    );
   }
 
   const timeoutSeconds = parseOptionalTimeoutSeconds(agentRecord.timeout_seconds, `${basePath}.timeout_seconds`);

@@ -181,8 +181,10 @@ export async function checkLocalAgentAvailability(
 
 export async function runLocalAgentCommand(input: RunLocalAgentCommandInput): Promise<LocalAgentCommandResult> {
   const outputLimitBytes = normalizeOutputLimit(input.outputLimitBytes);
-  const args = [...input.agent.args, input.taskPrompt];
-  const argsSummary = summarizeArgs(input.agent.args);
+  const executionArgs = buildLocalAgentExecutionArgs(input.agent);
+  const args = [...executionArgs, input.taskPrompt];
+  const argsSummary = summarizeArgs(executionArgs);
+  const commandIsCodex = isCodexExecutable(input.agent.command);
   const availability = await checkLocalAgentAvailability(input.agent, {
     cwd: input.cwd,
     env: input.env,
@@ -209,19 +211,22 @@ export async function runLocalAgentCommand(input: RunLocalAgentCommandInput): Pr
   const stdout = createTailCapture(outputLimitBytes);
   const stderr = createTailCapture(outputLimitBytes);
   const spawnPlan = createSpawnPlan({
-    agentName: input.agent.name,
+    isCodexExecutable: commandIsCodex || isCodexExecutable(availability.value.executablePath),
     executablePath: availability.value.executablePath,
-    args: input.agent.args,
+    args: executionArgs,
     taskPrompt: input.taskPrompt,
     env: input.env,
     platform: input.platform ?? process.platform,
   });
+  const spawnEnv = createSpawnEnvironment(input.env, input.cwd);
 
   return new Promise((resolveRun, rejectRun) => {
     let timedOut = false;
     let timeout: NodeJS.Timeout | null = null;
     let killTimeout: NodeJS.Timeout | null = null;
     let settled = false;
+    let timeoutTermination = Promise.resolve();
+    let timeoutSettlementQueued = false;
 
     const clearRunTimers = (): void => {
       if (timeout !== null) {
@@ -233,6 +238,17 @@ export async function runLocalAgentCommand(input: RunLocalAgentCommandInput): Pr
         clearTimeout(killTimeout);
         killTimeout = null;
       }
+    };
+
+    const clearKillTimer = (): void => {
+      if (killTimeout !== null) {
+        clearTimeout(killTimeout);
+        killTimeout = null;
+      }
+    };
+
+    const appendTimeoutTermination = (termination: Promise<void>): void => {
+      timeoutTermination = Promise.allSettled([timeoutTermination, termination]).then(() => undefined);
     };
 
     const rejectWithExecutionError = (options: {
@@ -263,7 +279,7 @@ export async function runLocalAgentCommand(input: RunLocalAgentCommandInput): Pr
     try {
       child = spawn(spawnPlan.command, spawnPlan.args, {
         cwd: input.cwd,
-        env: input.env,
+        env: spawnEnv,
         shell: false,
         stdio: [spawnPlan.stdin === null ? "ignore" : "pipe", "pipe", "pipe"],
         windowsHide: true,
@@ -310,6 +326,22 @@ export async function runLocalAgentCommand(input: RunLocalAgentCommandInput): Pr
       });
     };
 
+    const queueTimeoutSettle = (
+      exitCode: number | null,
+      signal: NodeJS.Signals | null,
+      destroyOutput: boolean,
+    ): void => {
+      if (settled || timeoutSettlementQueued) {
+        return;
+      }
+
+      timeoutSettlementQueued = true;
+      void timeoutTermination.finally(() => {
+        timeoutSettlementQueued = false;
+        settleTimeout(exitCode, signal, destroyOutput);
+      });
+    };
+
     child.stdout?.on("data", (chunk: Buffer | string) => {
       stdout.append(chunk);
     });
@@ -340,7 +372,8 @@ export async function runLocalAgentCommand(input: RunLocalAgentCommandInput): Pr
       }
 
       if (timedOut) {
-        settleTimeout(exitCode, signal, false);
+        clearKillTimer();
+        queueTimeoutSettle(exitCode, signal, false);
         return;
       }
 
@@ -381,10 +414,10 @@ export async function runLocalAgentCommand(input: RunLocalAgentCommandInput): Pr
     if (input.agent.timeoutSeconds !== null) {
       timeout = setTimeout(() => {
         timedOut = true;
-        terminateSpawnedProcess(child, spawnPlan, "SIGTERM", input.env);
+        appendTimeoutTermination(terminateSpawnedProcess(child, spawnPlan, "SIGTERM", spawnEnv));
         killTimeout = setTimeout(() => {
-          terminateSpawnedProcess(child, spawnPlan, "SIGKILL", input.env);
-          settleTimeout(null, "SIGKILL", true);
+          appendTimeoutTermination(terminateSpawnedProcess(child, spawnPlan, "SIGKILL", spawnEnv));
+          queueTimeoutSettle(null, "SIGKILL", true);
         }, normalizeTimeoutKillGraceMs(input.timeoutKillGraceMs));
         killTimeout.unref();
       }, Math.max(1, input.agent.timeoutSeconds * 1000));
@@ -393,8 +426,46 @@ export async function runLocalAgentCommand(input: RunLocalAgentCommandInput): Pr
   });
 }
 
+function createSpawnEnvironment(env: NodeJS.ProcessEnv | undefined, cwd: string): NodeJS.ProcessEnv {
+  return {
+    ...(env ?? process.env),
+    PWD: cwd,
+  };
+}
+
+function buildLocalAgentExecutionArgs(agent: LocalAgentConfig): string[] {
+  const codexConfigArgs = isCodexExecutable(agent.command) ? buildCodexExecutionConfigArgs(agent) : [];
+  if (codexConfigArgs.length === 0) {
+    return [...agent.args];
+  }
+
+  const execIndex = findCodexExecSubcommandIndex(agent.args);
+  if (execIndex === null) {
+    return [...codexConfigArgs, ...agent.args];
+  }
+
+  return [
+    ...agent.args.slice(0, execIndex),
+    ...codexConfigArgs,
+    ...agent.args.slice(execIndex),
+  ];
+}
+
+function buildCodexExecutionConfigArgs(agent: LocalAgentConfig): string[] {
+  const args: string[] = [];
+  if (agent.approvalPolicy !== null) {
+    args.push("--ask-for-approval", agent.approvalPolicy);
+  }
+
+  if (agent.sandboxMode !== null) {
+    args.push("--sandbox", agent.sandboxMode);
+  }
+
+  return args;
+}
+
 function createSpawnPlan(input: {
-  agentName: string;
+  isCodexExecutable: boolean;
   executablePath: string;
   args: string[];
   taskPrompt: string;
@@ -435,10 +506,20 @@ function isWindowsBatchShim(path: string): boolean {
 }
 
 function supportsCodexExecStdinPrompt(input: {
-  agentName: string;
+  isCodexExecutable: boolean;
   args: string[];
 }): boolean {
-  return input.agentName === "codex" && findCodexExecSubcommandIndex(input.args) !== null;
+  return input.isCodexExecutable && findCodexExecSubcommandIndex(input.args) !== null;
+}
+
+function isCodexExecutable(commandOrPath: string): boolean {
+  const commandName = commandOrPath.split(/[\\/]/u).pop()?.toLowerCase() ?? "";
+  if (commandName === "codex") {
+    return true;
+  }
+
+  const extension = extname(commandName);
+  return WINDOWS_LAUNCHABLE_EXTENSIONS.has(extension) && commandName.slice(0, -extension.length) === "codex";
 }
 
 function findCodexExecSubcommandIndex(args: string[]): number | null {
@@ -596,20 +677,21 @@ function terminateSpawnedProcess(
   spawnPlan: { timeoutKillStrategy: "posix-process-group" | "windows-process-tree" },
   signal: NodeJS.Signals,
   env: NodeJS.ProcessEnv | undefined,
-): void {
+): Promise<void> {
   if (spawnPlan.timeoutKillStrategy === "windows-process-tree") {
-    killWindowsProcessTree(child.pid, env);
+    const processTreeTermination = killWindowsProcessTree(child.pid, env);
     if (process.platform !== "win32") {
       child.kill(signal);
     }
-    return;
+    return processTreeTermination;
   }
 
   if (process.platform !== "win32" && killPosixProcessGroup(child.pid, signal)) {
-    return;
+    return Promise.resolve();
   }
 
   child.kill(signal);
+  return Promise.resolve();
 }
 
 function killPosixProcessGroup(pid: number | undefined, signal: NodeJS.Signals): boolean {
@@ -636,21 +718,40 @@ function isProcessAlreadyGone(error: unknown): boolean {
     && (error as { code?: unknown }).code === "ESRCH";
 }
 
-function killWindowsProcessTree(pid: number | undefined, env: NodeJS.ProcessEnv | undefined): void {
+function killWindowsProcessTree(pid: number | undefined, env: NodeJS.ProcessEnv | undefined): Promise<void> {
   if (pid === undefined) {
-    return;
+    return Promise.resolve();
   }
 
-  const command = process.platform === "win32"
-    ? win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe")
-    : "taskkill";
-  const killer = spawn(command, ["/pid", String(pid), "/t", "/f"], {
-    env,
-    stdio: "ignore",
-    windowsHide: true,
+  return new Promise((resolveKill) => {
+    const command = process.platform === "win32"
+      ? win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe")
+      : "taskkill";
+    let settled = false;
+    const settleKill = (): void => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      resolveKill();
+    };
+
+    let killer: ChildProcess;
+    try {
+      killer = spawn(command, ["/pid", String(pid), "/t", "/f"], {
+        env,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } catch {
+      settleKill();
+      return;
+    }
+
+    killer.once("error", settleKill);
+    killer.once("close", settleKill);
   });
-  killer.once("error", () => {});
-  killer.unref();
 }
 
 function createTailCapture(maxBytes: number): { append: (chunk: Buffer | string) => void; value: () => CapturedAgentOutput } {

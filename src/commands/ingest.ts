@@ -2,13 +2,23 @@ import { posix } from "node:path";
 
 import { CommanderError, type Command } from "commander";
 
+import {
+  checkLocalAgentAvailability,
+  LocalAgentExecutionError,
+  runLocalAgentInTemporaryWorkspace,
+} from "../agents/index.js";
 import type { CliIo } from "../cli.js";
 import { buildIngestTask, type IngestTask } from "../agentTasks/ingest.js";
 import {
   applyProviderProposalsWithValidation,
   requestProviderFileProposals,
-  validateProposalsOnTemporaryRepo,
+  validateProposalsOnTemporaryRepo as validateProviderProposalsOnTemporaryRepo,
 } from "../providers/index.js";
+import {
+  applyProposalsWithValidation,
+  createIngestProposalPolicy,
+  validateProposalsOnTemporaryRepo,
+} from "../proposals/index.js";
 import {
   loadDefaultLocalAgentConfig,
   loadLocalAgentConfig,
@@ -91,7 +101,25 @@ type IngestProviderData = {
   };
 };
 
-type IngestData = IngestTaskData | IngestValidationData | IngestProviderData;
+type IngestAgentData = {
+  mode: "agent";
+  agent: string;
+  source: {
+    source_id: string;
+    status: "ingested";
+  };
+  applied_paths: string[];
+  validation: {
+    passed: true;
+    issues: [];
+  };
+  queue: {
+    previous_status: QueueStatus;
+    status: "ingested";
+  };
+};
+
+type IngestData = IngestTaskData | IngestValidationData | IngestProviderData | IngestAgentData;
 
 type IngestStateSnapshot = {
   sourceCardPath: string;
@@ -100,6 +128,17 @@ type IngestStateSnapshot = {
   queueContent: string;
   logContent: string;
 };
+
+const AGENT_INGEST_PROPOSAL_POLICY = createIngestProposalPolicy({
+  rejectionCode: "AGENT_PROPOSAL_REJECTED",
+  writeFailedCode: "AGENT_PROPOSAL_WRITE_FAILED",
+  rejectedPathHint: "Agent proposals may only write Markdown files under curated/.",
+  duplicatePathHint: "Return one file proposal per path.",
+  writeRejectedHint: "Agent file proposals must target safe Markdown files inside curated/.",
+  writeFailedHint: "Fix filesystem permissions or unsafe proposal paths, then rerun local agent mode.",
+  pathRejectedMessage: (path) => `Agent proposal path is not allowed: ${path}.`,
+  duplicatePathMessage: (path) => `Agent proposed the same path more than once: ${path}.`,
+});
 
 export function registerIngestCommand(program: Command, io: CliIo): void {
   addRuntimeOptions(
@@ -227,18 +266,91 @@ function isAgentModeRequested(rawOptions: RawIngestOptions): boolean {
 
 async function executeAgentIngest(
   repoRoot: string,
-  _sourceId: string,
+  sourceId: string,
   rawOptions: RawIngestOptions,
-): Promise<never> {
+): Promise<IngestAgentData> {
   const agent = await resolveLocalAgentConfig(repoRoot, rawOptions);
-  const agentConfigPath = `.llm-wiki/config.yml:agents.${agent.name}`;
-
-  throw new RuntimeCommandError({
-    code: "AGENT_EXECUTION_UNAVAILABLE",
-    message: `Local agent execution is not implemented for ingest yet: ${agent.name}.`,
-    hint: `Resolved local agent config at ${agentConfigPath}. Use manual prompt generation without --agent/--auto, or use --provider <name> for an HTTP proposal provider until the local Codex adapter is enabled.`,
-    path: agentConfigPath,
+  const preflightTask = await buildIngestTask({
+    repoRoot,
+    sourceId,
   });
+  if (!preflightTask.ok) {
+    throw new RuntimeCommandError({
+      code: preflightTask.error.code,
+      message: preflightTask.error.message,
+      hint: preflightTask.error.hint,
+      path: preflightTask.error.path,
+    });
+  }
+
+  ensureIngestTaskCanStart(preflightTask.value);
+  await assertLocalAgentCommandAvailable(agent);
+  await ensureIngesting(repoRoot, sourceId, agentIngestCommand(sourceId, agent.name, rawOptions));
+
+  try {
+    const task = await buildIngestTask({
+      repoRoot,
+      sourceId,
+      previousStatus: preflightTask.value.source.status,
+      promptMode: "local-agent",
+    });
+    if (!task.ok) {
+      throw new RuntimeCommandError({
+        code: task.error.code,
+        message: task.error.message,
+        hint: task.error.hint,
+        path: task.error.path,
+      });
+    }
+
+    const result = await runLocalAgentInTemporaryWorkspace({
+      repoRoot,
+      agent,
+      taskPrompt: task.value.task.prompt,
+      policy: AGENT_INGEST_PROPOSAL_POLICY,
+    });
+
+    await validateProposalsOnTemporaryRepo(
+      repoRoot,
+      result.proposals,
+      AGENT_INGEST_PROPOSAL_POLICY,
+      async (tempRepoRoot) => {
+        const validation = await validateIngestReadiness(tempRepoRoot, sourceId);
+        if (!validation.passed) {
+          throw new IngestValidationFailedError(validation.issues);
+        }
+      },
+    );
+
+    const { appliedPaths, validation: completed } = await applyProposalsWithValidation(
+      repoRoot,
+      result.proposals,
+      AGENT_INGEST_PROPOSAL_POLICY,
+      async () => validateAndCompleteIngest(repoRoot, sourceId),
+    );
+
+    return {
+      mode: "agent",
+      agent: agent.name,
+      source: {
+        source_id: sourceId,
+        status: "ingested",
+      },
+      applied_paths: appliedPaths,
+      validation: {
+        passed: true,
+        issues: [],
+      },
+      queue: completed.queue,
+    };
+  } catch (error) {
+    await markBlockedIfIngesting(repoRoot, sourceId, agentIngestCommand(sourceId, agent.name, rawOptions));
+    if (error instanceof LocalAgentExecutionError) {
+      throw localAgentExecutionRuntimeError(error);
+    }
+
+    throw error;
+  }
 }
 
 async function executeProviderIngest(
@@ -267,7 +379,7 @@ async function executeProviderIngest(
     task: task.value,
   });
 
-  await validateProposalsOnTemporaryRepo(repoRoot, proposals, async (tempRepoRoot) => {
+  await validateProviderProposalsOnTemporaryRepo(repoRoot, proposals, async (tempRepoRoot) => {
     const validation = await validateIngestReadiness(tempRepoRoot, sourceId);
     if (!validation.passed) {
       throw new IngestValidationFailedError(validation.issues);
@@ -530,7 +642,11 @@ async function validateAndCompleteIngest(repoRoot: string, sourceId: string): Pr
   };
 }
 
-async function ensureIngesting(repoRoot: string, sourceId: string): Promise<IngestQueueTransitionData> {
+async function ensureIngesting(
+  repoRoot: string,
+  sourceId: string,
+  command = `llm-wiki ingest ${sourceId}`,
+): Promise<IngestQueueTransitionData> {
   const shown = await showQueueSource(repoRoot, sourceId);
   if (!shown.ok) {
     throw queueRuntimeError(shown.error.code, shown.error.message, shown.error.hint, shown.error.path);
@@ -563,7 +679,7 @@ async function ensureIngesting(repoRoot: string, sourceId: string): Promise<Inge
   }
 
   const updated = await setQueueStatus(repoRoot, sourceId, "ingesting", {
-    command: `llm-wiki ingest ${sourceId}`,
+    command,
   });
   if (!updated.ok) {
     throw queueRuntimeError(updated.error.code, updated.error.message, updated.error.hint, updated.error.path);
@@ -573,6 +689,22 @@ async function ensureIngesting(repoRoot: string, sourceId: string): Promise<Inge
     previous_status: updated.value.previous_status,
     status: updated.value.status,
   };
+}
+
+async function markBlockedIfIngesting(repoRoot: string, sourceId: string, command: string): Promise<void> {
+  const shown = await showQueueSource(repoRoot, sourceId);
+  if (!shown.ok) {
+    throw queueRuntimeError(shown.error.code, shown.error.message, shown.error.hint, shown.error.path);
+  }
+
+  if (shown.value.queue_record.status !== "ingesting") {
+    return;
+  }
+
+  const blocked = await setQueueStatus(repoRoot, sourceId, "blocked", { command });
+  if (!blocked.ok) {
+    throw queueRuntimeError(blocked.error.code, blocked.error.message, blocked.error.hint, blocked.error.path);
+  }
 }
 
 async function markIngested(repoRoot: string, sourceId: string): Promise<{ previous_status: QueueStatus; status: "ingested" }> {
@@ -645,6 +777,18 @@ async function resolveLocalAgentConfig(repoRoot: string, rawOptions: RawIngestOp
   return result.value;
 }
 
+async function assertLocalAgentCommandAvailable(agent: LocalAgentConfig): Promise<void> {
+  const availability = await checkLocalAgentAvailability(agent);
+  if (!availability.ok) {
+    throw new RuntimeCommandError({
+      code: availability.error.code,
+      message: availability.error.message,
+      hint: availability.error.hint,
+      path: availability.error.executablePath,
+    });
+  }
+}
+
 function agentConfigRuntimeError(error: LocalAgentConfigError): RuntimeCommandError {
   return new RuntimeCommandError({
     code: error.code,
@@ -652,6 +796,30 @@ function agentConfigRuntimeError(error: LocalAgentConfigError): RuntimeCommandEr
     hint: error.hint,
     path: error.path,
   });
+}
+
+function localAgentExecutionRuntimeError(error: LocalAgentExecutionError): RuntimeCommandError {
+  const exitCode = error.exitCode === null ? "null" : String(error.exitCode);
+  const signal = error.signal === null ? "null" : error.signal;
+  const stderrTail = error.stderrTail.trim() === "" ? "(empty)" : error.stderrTail.trim();
+
+  return new RuntimeCommandError({
+    code: error.code,
+    message: [
+      error.message,
+      `Executable: ${error.executablePath}.`,
+      `exit code ${exitCode}; signal ${signal}; timed out: ${error.timedOut}; changes observed: ${error.changesObserved}.`,
+      `Stderr tail: ${stderrTail}`,
+    ].join(" "),
+    hint: error.hint,
+    path: error.executablePath,
+  });
+}
+
+function agentIngestCommand(sourceId: string, agentName: string, rawOptions: RawIngestOptions): string {
+  return rawOptions.auto === true
+    ? `llm-wiki ingest ${sourceId} --auto`
+    : `llm-wiki ingest ${sourceId} --agent ${agentName}`;
 }
 
 async function resolveProviderConfig(repoRoot: string, providerName: string): Promise<HttpProviderConfig> {
@@ -746,6 +914,16 @@ function formatHumanIngest(data: IngestData): string {
       `Status: ${data.queue.previous_status} -> ${data.queue.status}`,
       "Applied paths:",
       ...data.proposals.applied_paths.map((path) => `- ${path}`),
+    ].join("\n");
+  }
+
+  if (data.mode === "agent") {
+    return [
+      `Agent ingest applied: ${data.agent}`,
+      `Source ID: ${data.source.source_id}`,
+      `Status: ${data.queue.previous_status} -> ${data.queue.status}`,
+      "Applied paths:",
+      ...data.applied_paths.map((path) => `- ${path}`),
     ].join("\n");
   }
 

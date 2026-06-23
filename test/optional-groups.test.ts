@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { relative, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
+import { parse } from "yaml";
 
 import { createWiki, type CreateWikiOptions } from "../src/scaffold/createWiki.js";
 
@@ -58,6 +59,10 @@ describe("optional init scaffold groups", () => {
     try {
       // Act
       const result = await createWiki(targetDir, defaultOptions);
+      const config = parse(await readGeneratedFile(targetDir, ".llm-wiki/config.yml")) as {
+        agent: { default: string };
+        agents?: Record<string, unknown>;
+      };
 
       // Assert
       expect(result.ok).toBe(true);
@@ -67,6 +72,8 @@ describe("optional init scaffold groups", () => {
       expect(await readGeneratedFile(targetDir, "AGENTS.md")).toContain(
         "AGENTS.md is the canonical instruction source",
       );
+      expect(config.agent.default).toBe("generic");
+      expect(config.agents).toBeUndefined();
     } finally {
       await rm(parent, { force: true, recursive: true });
     }
@@ -82,6 +89,10 @@ describe("optional init scaffold groups", () => {
       // Act
       const result = await createWiki(targetDir, options);
       const codexInstructions = await readGeneratedFile(targetDir, "CODEX.md");
+      const config = parse(await readGeneratedFile(targetDir, ".llm-wiki/config.yml")) as {
+        agent: { default: string };
+        agents?: Record<string, unknown>;
+      };
 
       // Assert
       expect(result.ok).toBe(true);
@@ -91,6 +102,18 @@ describe("optional init scaffold groups", () => {
       expect(codexInstructions).toContain("# Codex Instructions");
       expect(codexInstructions).toContain("AGENTS.md is authoritative");
       expect(codexInstructions).not.toContain("## Ingest workflow");
+      expect(config.agent.default).toBe("codex");
+      expect(config.agents).toEqual({
+        codex: {
+          type: "local-exec",
+          command: "codex",
+          args: ["exec"],
+          approval_policy: "never",
+          sandbox_mode: "workspace-write",
+          output_mode: "git-diff",
+          timeout_seconds: 900,
+        },
+      });
     } finally {
       await rm(parent, { force: true, recursive: true });
     }
@@ -106,6 +129,10 @@ describe("optional init scaffold groups", () => {
       // Act
       const result = await createWiki(targetDir, options);
       const claudeInstructions = await readGeneratedFile(targetDir, "CLAUDE.md");
+      const config = parse(await readGeneratedFile(targetDir, ".llm-wiki/config.yml")) as {
+        agent: { default: string };
+        agents?: Record<string, unknown>;
+      };
 
       // Assert
       expect(result.ok).toBe(true);
@@ -115,6 +142,8 @@ describe("optional init scaffold groups", () => {
       expect(claudeInstructions).toContain("# Claude Instructions");
       expect(claudeInstructions).toContain("AGENTS.md is authoritative");
       expect(claudeInstructions).not.toContain("## Ingest workflow");
+      expect(config.agent.default).toBe("claude");
+      expect(config.agents).toBeUndefined();
     } finally {
       await rm(parent, { force: true, recursive: true });
     }

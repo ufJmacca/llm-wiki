@@ -29,6 +29,8 @@ const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_UPLOAD_FIELD_BYTES = MAX_UPLOAD_BYTES;
 const MAX_UPLOAD_FIELDS = 20;
 const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+const CORS_ALLOWED_METHODS = "POST, OPTIONS";
+const CORS_ALLOWED_HEADERS = `${UPLOAD_TOKEN_HEADER}, content-type`;
 const repoUploadQueues = new Map<string, Promise<void>>();
 
 export type UploadDaemon = {
@@ -300,6 +302,16 @@ async function handleDaemonRequest(
       return;
     }
 
+    applyUploadCorsHeaders(request, response);
+
+    if (request.method === "OPTIONS") {
+      response.writeHead(204, {
+        "content-length": 0,
+      });
+      response.end();
+      return;
+    }
+
     if (request.method !== "POST") {
       writeJson(response, 405, failureEnvelope(new UploadDaemonError({
         code: "UPLOAD_METHOD_NOT_ALLOWED",
@@ -349,6 +361,44 @@ async function handleDaemonRequest(
         });
     writeJson(response, daemonError.statusCode, failureEnvelope(daemonError));
   }
+}
+
+function applyUploadCorsHeaders(request: IncomingMessage, response: ServerResponse): void {
+  const origin = allowedLoopbackOrigin(request.headers.origin);
+  if (origin === undefined) {
+    return;
+  }
+
+  response.setHeader("access-control-allow-origin", origin);
+  response.setHeader("access-control-allow-methods", CORS_ALLOWED_METHODS);
+  response.setHeader("access-control-allow-headers", CORS_ALLOWED_HEADERS);
+  response.setHeader("vary", "Origin");
+}
+
+function allowedLoopbackOrigin(originHeader: string | string[] | undefined): string | undefined {
+  if (typeof originHeader !== "string") {
+    return undefined;
+  }
+
+  const origin = originHeader.trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return undefined;
+  }
+
+  const hostname = parsed.hostname === "[::1]" ? "::1" : parsed.hostname;
+  if (
+    parsed.protocol !== "http:" ||
+    parsed.port === "" ||
+    parsed.origin !== origin ||
+    !LOCAL_HOSTS.has(hostname)
+  ) {
+    return undefined;
+  }
+
+  return origin;
 }
 
 async function runInRepoUploadQueue<T>(repoRoot: string, work: () => Promise<T>): Promise<T> {

@@ -2,7 +2,8 @@ import { parse } from "yaml";
 import { describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
 import { writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { parseInitJson, pathExists, readGeneratedFile, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
@@ -87,6 +88,7 @@ const REQUIRED_SECRETS = [
 ] as const;
 
 const execFileAsync = promisify(execFile);
+const require = createRequire(import.meta.url);
 
 async function initializeWiki(targetDir: string): Promise<void> {
   const result = await runCliBuffered(["init", targetDir, "--no-git", "--json"]);
@@ -110,6 +112,7 @@ function parseUploadFailure(stdout: string[]): UploadFailureEnvelope {
 async function expectGeneratedServerlessTypescriptCompiles(wikiDir: string): Promise<void> {
   const serverlessDir = resolve(wikiDir, "upload/github/serverless");
   const tsconfigPath = resolve(serverlessDir, "tsconfig.json");
+  const nodeTypesRoot = dirname(dirname(require.resolve("@types/node/package.json")));
   await writeFile(
     tsconfigPath,
     JSON.stringify(
@@ -121,7 +124,7 @@ async function expectGeneratedServerlessTypescriptCompiles(wikiDir: string): Pro
           strict: true,
           skipLibCheck: true,
           types: ["node"],
-          typeRoots: [resolve(process.cwd(), "node_modules/@types")],
+          typeRoots: [nodeTypesRoot],
         },
         include: ["*.ts"],
       },
@@ -130,7 +133,7 @@ async function expectGeneratedServerlessTypescriptCompiles(wikiDir: string): Pro
     ),
   );
 
-  await execFileAsync(process.execPath, [resolve(process.cwd(), "node_modules/typescript/bin/tsc"), "-p", tsconfigPath, "--noEmit"], {
+  await execFileAsync(process.execPath, [require.resolve("typescript/bin/tsc"), "-p", tsconfigPath, "--noEmit"], {
     cwd: serverlessDir,
   });
 }

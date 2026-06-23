@@ -27,9 +27,14 @@ type CommandResult = {
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packageJsonPath = resolve(repoRoot, "package.json");
+const ciWorkflowPath = resolve(repoRoot, ".github/workflows/ci.yml");
 
 async function readPackageManifest(): Promise<PackageManifest> {
   return JSON.parse(await readFile(packageJsonPath, "utf8")) as PackageManifest;
+}
+
+async function readCiWorkflow(): Promise<string> {
+  return readFile(ciWorkflowPath, "utf8");
 }
 
 function runNodeScript(scriptPath: string, args: string[], cwd: string): Promise<CommandResult> {
@@ -76,6 +81,27 @@ describe("llm-wiki CLI baseline", () => {
     for (const script of expectedScripts) {
       expect(manifest.scripts?.[script]).toEqual(expect.any(String));
     }
+  });
+
+  it("keeps package scripts and CI aligned with the Node 22 merge gate", async () => {
+    // Arrange
+    const expectedCiRuns = ["npm ci", "npm run lint", "npm test", "npm run build"];
+
+    // Act
+    const manifest = await readPackageManifest();
+    const ciWorkflow = await readCiWorkflow();
+    const runIndexes = expectedCiRuns.map((command) => ciWorkflow.indexOf(`run: ${command}`));
+
+    // Assert
+    expect(manifest.engines?.node).toBe(">=22");
+    expect(manifest.scripts).toMatchObject({
+      lint: "tsc -p tsconfig.json --noEmit",
+      test: "npm run build && vitest run",
+      build: "tsc -p tsconfig.json",
+    });
+    expect(ciWorkflow).toContain("node-version: 22");
+    expect(runIndexes.every((index) => index >= 0)).toBe(true);
+    expect(runIndexes).toEqual([...runIndexes].sort((left, right) => left - right));
   });
 
   it("prints version information without invoking scaffold behavior", async () => {

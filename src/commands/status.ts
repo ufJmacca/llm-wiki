@@ -74,6 +74,9 @@ function formatHumanStatus(repo: string, data: StatusData): string {
     `Repo: ${repo}`,
     `Config: ${formatConfigStatus(data)}`,
     ...formatConfigErrorLines(data),
+    `Default agent: ${data.config.agent_default ?? "none"}`,
+    `Local agents: ${formatNamedCount(data.config.local_agents.count, data.config.local_agents.names)}`,
+    `HTTP providers: ${formatNamedCount(data.config.providers.count, data.config.providers.names)}`,
     `Health: ${data.health.state}`,
     `Lint: ${data.lint.counts.error} errors, ${data.lint.counts.warning} warnings`,
     `Queue: ${data.queue.counts.total} total, ${data.queue.counts.queued} queued, ${data.queue.counts.ingesting} ingesting, ${data.queue.counts.ingested} ingested, ${data.queue.counts.blocked} blocked`,
@@ -93,6 +96,14 @@ function formatConfigStatus(data: StatusData): string {
   }
 
   return `${data.config.errors.length} config error(s)`;
+}
+
+function formatNamedCount(count: number, names: string[]): string {
+  if (count === 0) {
+    return "none";
+  }
+
+  return `${count} (${names.join(", ")})`;
 }
 
 function formatGitStatus(data: StatusData): string {

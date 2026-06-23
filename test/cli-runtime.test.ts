@@ -119,6 +119,15 @@ describe("non-init CLI runtime contracts", () => {
             path: ".llm-wiki/config.yml",
             valid: true,
             git_enabled: false,
+            agent_default: "generic",
+            local_agents: {
+              count: 0,
+              names: [],
+            },
+            providers: {
+              count: 0,
+              names: [],
+            },
             errors: [],
           },
           health: expect.objectContaining({

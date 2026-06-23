@@ -527,6 +527,43 @@ describe("explicit provider proposal mode", () => {
     });
   });
 
+  it("keeps the default-agent provider hint on supported workflows", async () => {
+    await withTempWorkspace("llm-wiki-provider-agent-confusion-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureTextSource(wikiDir);
+      const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+      const config = await readFile(configPath, "utf8");
+      await writeFile(configPath, config.replace("default: generic", "default: codex"), "utf8");
+      const before = await readTreeSnapshot(wikiDir);
+
+      // Act
+      const result = await runCliBuffered([
+        "ingest",
+        source.source_id,
+        "--repo",
+        wikiDir,
+        "--provider",
+        "codex",
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"ingest">(result.stdout);
+      const after = await readTreeSnapshot(wikiDir);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "PROVIDER_CONFIG_MISSING",
+        hint: expect.stringContaining("--provider only runs HTTP providers"),
+      });
+      expect(payload.error.hint).toContain("omit --provider");
+      expect(payload.error.hint).not.toContain("--agent");
+      expect(after).toEqual(before);
+    });
+  });
+
   it("rejects provider configs that contain literal secret material", async () => {
     await withTempWorkspace("llm-wiki-provider-literal-secret-", async (workspaceDir) => {
       // Arrange

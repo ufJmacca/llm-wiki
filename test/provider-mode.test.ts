@@ -527,7 +527,7 @@ describe("explicit provider proposal mode", () => {
     });
   });
 
-  it("keeps the default-agent provider hint on supported workflows", async () => {
+  it("keeps provider lookup separate from configured Codex local agents and suggests agent mode", async () => {
     await withTempWorkspace("llm-wiki-provider-agent-confusion-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
@@ -535,7 +535,20 @@ describe("explicit provider proposal mode", () => {
       const source = await captureTextSource(wikiDir);
       const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
       const config = await readFile(configPath, "utf8");
-      await writeFile(configPath, config.replace("default: generic", "default: codex"), "utf8");
+      await writeFile(
+        configPath,
+        [
+          config.replace("default: generic", "default: codex").trimEnd(),
+          "agents:",
+          "  codex:",
+          "    type: local-exec",
+          "    command: codex",
+          "    args:",
+          "      - exec",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
       const before = await readTreeSnapshot(wikiDir);
 
       // Act
@@ -558,8 +571,7 @@ describe("explicit provider proposal mode", () => {
         code: "PROVIDER_CONFIG_MISSING",
         hint: expect.stringContaining("--provider only runs HTTP providers"),
       });
-      expect(payload.error.hint).toContain("omit --provider");
-      expect(payload.error.hint).not.toContain("--agent");
+      expect(payload.error.hint).toContain("--agent codex");
       expect(after).toEqual(before);
     });
   });

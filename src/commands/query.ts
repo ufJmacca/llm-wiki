@@ -9,7 +9,15 @@ import {
   requestProviderFileProposals,
   validateProposalsOnTemporaryRepo,
 } from "../providers/index.js";
-import { loadProviderConfig, type HttpProviderConfig, type ProviderConfigError } from "../runtime/config.js";
+import {
+  loadDefaultLocalAgentConfig,
+  loadLocalAgentConfig,
+  loadProviderConfig,
+  type HttpProviderConfig,
+  type LocalAgentConfig,
+  type LocalAgentConfigError,
+  type ProviderConfigError,
+} from "../runtime/config.js";
 import { addRuntimeOptions, type RawRuntimeCommandOptions, type RuntimeCommandOptions } from "../runtime/command.js";
 import { buildRuntimeFailureEnvelope, buildRuntimeSuccessEnvelope, type RuntimeIssue } from "../runtime/envelope.js";
 import { RuntimeCommandError } from "../runtime/errors.js";
@@ -20,6 +28,8 @@ type RawQueryOptions = RawRuntimeCommandOptions & {
   save?: unknown;
   validate?: unknown;
   provider?: unknown;
+  agent?: unknown;
+  auto?: unknown;
 };
 
 type QueryValidationData = {
@@ -55,11 +65,13 @@ export function registerQueryCommand(program: Command, io: CliIo): void {
   addRuntimeOptions(
     program
       .command("query")
-      .description("Generate an agent query task and validate durable saved answers")
+      .description("Generate a manual prompt, execute local agents/providers, or validate durable saved answers")
       .argument("<question>", "question to answer from local wiki context")
       .option("--save <path>", "required durable question page path, for example curated/questions/<slug>.md")
       .option("--validate", "validate a completed saved question page", false)
-      .option("--provider <name>", "execute an explicitly configured provider and apply validated file proposals"),
+      .option("--agent <name>", "run local agent execution with a configured agent such as codex")
+      .option("--auto", "run local agent execution with the configured default local agent", false)
+      .option("--provider <name>", "run HTTP provider mode with an explicitly configured provider"),
   ).action(async (question: string, rawOptions: RawQueryOptions) => {
     await runQueryCommand(question, rawOptions, io);
   });
@@ -81,7 +93,17 @@ async function runQueryCommand(question: string, rawOptions: RawQueryOptions, io
   }
 
   try {
+    validateQueryModeOptions(rawOptions);
     const savePath = typeof rawOptions.save === "string" ? rawOptions.save : null;
+    if (isAgentModeRequested(rawOptions) && savePath === null) {
+      throw new RuntimeCommandError({
+        code: "QUERY_SAVE_REQUIRED",
+        message: "Query agent mode requires --save <path>.",
+        hint: "Run llm-wiki query \"<question>\" --save curated/questions/<slug>.md --agent <name>, or use --auto when agent.default is configured.",
+        path: "--save",
+      });
+    }
+
     if (rawOptions.validate === true && savePath === null) {
       throw new RuntimeCommandError({
         code: "QUERY_SAVE_REQUIRED",
@@ -107,6 +129,8 @@ async function runQueryCommand(question: string, rawOptions: RawQueryOptions, io
       ? await validateCompletedQuery(resolvedRepo.value.rootDir, question, savePath ?? "")
       : typeof rawOptions.provider === "string"
         ? await executeProviderQuery(resolvedRepo.value.rootDir, question, savePath, rawOptions.provider)
+        : isAgentModeRequested(rawOptions)
+          ? await executeAgentQuery(resolvedRepo.value.rootDir, question, savePath, rawOptions)
         : await createQueryTask(resolvedRepo.value.rootDir, question, savePath);
     const envelope = buildRuntimeSuccessEnvelope("query", resolvedRepo.value.rootDir, data, []);
 
@@ -159,6 +183,53 @@ async function runQueryCommand(question: string, rawOptions: RawQueryOptions, io
 
     throw new CommanderError(1, "llm-wiki.query", envelope.error.message);
   }
+}
+
+function validateQueryModeOptions(rawOptions: RawQueryOptions): void {
+  const executionModes = [
+    typeof rawOptions.agent === "string",
+    rawOptions.auto === true,
+    typeof rawOptions.provider === "string",
+  ].filter(Boolean).length;
+
+  if (executionModes > 1) {
+    throw new RuntimeCommandError({
+      code: "QUERY_MODE_CONFLICT",
+      message: "Choose only one query execution mode.",
+      hint: "Use exactly one of --agent <name>, --auto, or --provider <name>; omit all three to generate the manual prompt.",
+      path: "query",
+    });
+  }
+
+  if (rawOptions.validate === true && executionModes > 0) {
+    throw new RuntimeCommandError({
+      code: "QUERY_MODE_CONFLICT",
+      message: "Query validation cannot be combined with execution mode.",
+      hint: "Use --validate by itself to check a completed saved answer, or use exactly one of --agent <name>, --auto, or --provider <name> to execute.",
+      path: "--validate",
+    });
+  }
+}
+
+function isAgentModeRequested(rawOptions: RawQueryOptions): boolean {
+  return rawOptions.auto === true || typeof rawOptions.agent === "string";
+}
+
+async function executeAgentQuery(
+  repoRoot: string,
+  _question: string,
+  _savePath: string | null,
+  rawOptions: RawQueryOptions,
+): Promise<never> {
+  const agent = await resolveLocalAgentConfig(repoRoot, rawOptions);
+  const agentConfigPath = `.llm-wiki/config.yml:agents.${agent.name}`;
+
+  throw new RuntimeCommandError({
+    code: "AGENT_EXECUTION_UNAVAILABLE",
+    message: `Local agent execution is not implemented for query yet: ${agent.name}.`,
+    hint: `Resolved local agent config at ${agentConfigPath}. Use manual prompt generation without --agent/--auto, or use --provider <name> for an HTTP proposal provider until the local Codex adapter is enabled.`,
+    path: agentConfigPath,
+  });
 }
 
 async function executeProviderQuery(
@@ -260,6 +331,26 @@ function normalizeRuntimeOptions(rawOptions: RawRuntimeCommandOptions): RuntimeC
     json: rawOptions.json === true,
     quiet: rawOptions.quiet === true,
   };
+}
+
+async function resolveLocalAgentConfig(repoRoot: string, rawOptions: RawQueryOptions): Promise<LocalAgentConfig> {
+  const result = rawOptions.auto === true
+    ? await loadDefaultLocalAgentConfig(repoRoot)
+    : await loadLocalAgentConfig(repoRoot, String(rawOptions.agent));
+  if (!result.ok) {
+    throw agentConfigRuntimeError(result.error);
+  }
+
+  return result.value;
+}
+
+function agentConfigRuntimeError(error: LocalAgentConfigError): RuntimeCommandError {
+  return new RuntimeCommandError({
+    code: error.code,
+    message: error.message,
+    hint: error.hint,
+    path: error.path,
+  });
 }
 
 async function resolveProviderConfig(repoRoot: string, providerName: string): Promise<HttpProviderConfig> {

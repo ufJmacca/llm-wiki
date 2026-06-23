@@ -130,12 +130,15 @@ export async function loadProviderConfig(
   const provider = asRecord(providers)?.[providerName];
   if (provider === undefined) {
     const agentDefault = readAgentDefaultName(document);
+    const localAgentConfigured = hasLocalAgentEntry(document, providerName);
     return err({
       code: "PROVIDER_CONFIG_MISSING",
       message: `Provider is not configured: ${providerName}.`,
       path: `${WIKI_CONFIG_RELATIVE_PATH}:providers.${providerName}`,
-      hint: agentDefault === providerName
-        ? `No HTTP provider named ${providerName} is configured. --provider only runs HTTP providers; add providers.${providerName} with type, endpoint, api_key_env, and optional model, or omit --provider to generate the manual task prompt.`
+      hint: localAgentConfigured
+        ? `No HTTP provider named ${providerName} is configured. --provider only runs HTTP providers; use --agent ${providerName} for local agent execution, use --auto when agent.default is ${providerName}, or add providers.${providerName} with type, endpoint, api_key_env, and optional model.`
+        : agentDefault === providerName
+          ? `No HTTP provider named ${providerName} is configured. --provider only runs HTTP providers; agent.default is ${providerName}, but agents.${providerName} is not configured for local agent mode. Add agents.${providerName} with type: local-exec and command, add providers.${providerName} for HTTP provider mode, or omit --provider to generate the manual task prompt.`
         : "Add a provider config with type, endpoint, api_key_env, and optional model.",
     });
   }
@@ -885,6 +888,10 @@ function readAgentDefaultName(document: unknown): string | null {
   const agent = asRecord(asRecord(document)?.agent);
   const defaultAgent = agent?.default;
   return typeof defaultAgent === "string" && defaultAgent.trim() !== "" ? defaultAgent.trim() : null;
+}
+
+function hasLocalAgentEntry(document: unknown, agentName: string): boolean {
+  return findLocalAgentEntry(asRecord(asRecord(document)?.agents) ?? {}, agentName) !== undefined;
 }
 
 function isCommandReference(command: string): boolean {

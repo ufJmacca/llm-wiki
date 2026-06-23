@@ -103,8 +103,7 @@ function configContent(options: WikiScaffoldOptions): string {
   return `version: 1
 agent:
   default: ${options.agent}
-${agentConfigContent(options)}
-features:
+${localAgentConfigContent(options.agent)}features:
   obsidian: ${options.obsidian}
   dataview: ${options.dataview}
   git: ${options.git}
@@ -135,8 +134,8 @@ privacy:
 `;
 }
 
-function agentConfigContent(options: WikiScaffoldOptions): string {
-  if (options.agent !== "codex") {
+function localAgentConfigContent(agent: InitAgent): string {
+  if (agent !== "codex") {
     return "";
   }
 

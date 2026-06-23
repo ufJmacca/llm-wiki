@@ -148,6 +148,58 @@ describe("core wiki scaffold templates", () => {
     }
   });
 
+  it("scaffolds executable Codex config only for the Codex agent", () => {
+    // Arrange
+    const codexEntries = new Map(
+      planWikiScaffold({ ...defaultOptions, agent: "codex" }).map((entry) => [entry.path, entry.content]),
+    );
+    const genericEntries = new Map(planWikiScaffold(defaultOptions).map((entry) => [entry.path, entry.content]));
+    const expectedCodexBlock = [
+      "agent:",
+      "  default: codex",
+      "agents:",
+      "  codex:",
+      "    type: local-exec",
+      "    command: codex",
+      "    args:",
+      "      - exec",
+      "    approval_policy: never",
+      "    sandbox_mode: workspace-write",
+      "    output_mode: git-diff",
+      "    timeout_seconds: 900",
+    ].join("\n");
+
+    // Act
+    const codexConfigSource = codexEntries.get(".llm-wiki/config.yml");
+    const codexConfig = parse(codexConfigSource ?? "") as {
+      agent: { default: string };
+      agents?: Record<string, unknown>;
+    };
+    const genericConfig = parse(genericEntries.get(".llm-wiki/config.yml") ?? "") as {
+      agent: { default: string };
+      agents?: Record<string, unknown>;
+    };
+
+    // Assert
+    expect(codexConfigSource).toContain(expectedCodexBlock);
+    expect(codexConfig).toMatchObject({
+      agent: { default: "codex" },
+      agents: {
+        codex: {
+          type: "local-exec",
+          command: "codex",
+          args: ["exec"],
+          approval_policy: "never",
+          sandbox_mode: "workspace-write",
+          output_mode: "git-diff",
+          timeout_seconds: 900,
+        },
+      },
+    });
+    expect(genericConfig).toMatchObject({ agent: { default: "generic" } });
+    expect(genericConfig.agents).toBeUndefined();
+  });
+
   it("generates stable parseable index and log control-plane pages", () => {
     // Arrange
     const plannedEntries = new Map(planWikiScaffold(defaultOptions).map((entry) => [entry.path, entry.content]));

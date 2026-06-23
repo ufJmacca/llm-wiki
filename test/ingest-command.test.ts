@@ -145,6 +145,32 @@ async function captureTextSource(wikiDir: string): Promise<SourceCaptureData["so
   return payload.data.source;
 }
 
+async function configureCodexLocalAgent(
+  wikiDir: string,
+  input: { defaultAgent: "generic" | "codex" },
+): Promise<void> {
+  const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+  const config = await readFile(configPath, "utf8");
+  const baseConfig = input.defaultAgent === "codex"
+    ? config.replace("default: generic", "default: codex")
+    : config;
+  await writeFile(
+    configPath,
+    [
+      baseConfig.trimEnd(),
+      "agents:",
+      "  codex:",
+      "    type: local-exec",
+      "    command: codex",
+      "    args:",
+      "      - exec",
+      "    timeout_seconds: 900",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+}
+
 async function writeCuratedPage(
   wikiDir: string,
   path: string,
@@ -232,6 +258,189 @@ async function installFakeGit(
 }
 
 describe("ingest command task scaffolding", () => {
+  it.each([
+    {
+      name: "agent and provider",
+      args: ["--agent", "codex", "--provider", "local"],
+      message: "Choose only one ingest execution mode.",
+    },
+    {
+      name: "auto and provider",
+      args: ["--auto", "--provider", "local"],
+      message: "Choose only one ingest execution mode.",
+    },
+    {
+      name: "auto and agent",
+      args: ["--auto", "--agent", "codex"],
+      message: "Choose only one ingest execution mode.",
+    },
+    {
+      name: "provider and validate",
+      args: ["--provider", "local", "--validate"],
+      message: "Ingest validation cannot be combined with execution mode.",
+    },
+    {
+      name: "agent and validate",
+      args: ["--agent", "codex", "--validate"],
+      message: "Ingest validation cannot be combined with execution mode.",
+    },
+    {
+      name: "auto and validate",
+      args: ["--auto", "--validate"],
+      message: "Ingest validation cannot be combined with execution mode.",
+    },
+  ])("rejects conflicting ingest mode flags: $name", async ({ args, message }) => {
+    await withTempWorkspace("llm-wiki-ingest-mode-conflict-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureTextSource(wikiDir);
+
+      // Act
+      const result = await runCliBuffered([
+        "ingest",
+        source.source_id,
+        "--repo",
+        wikiDir,
+        ...args,
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"ingest">(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "INGEST_MODE_CONFLICT",
+        message,
+      });
+      expect(payload.error.hint).toContain("--agent");
+      expect(payload.error.hint).toContain("--auto");
+      expect(payload.error.hint).toContain("--provider");
+    });
+  });
+
+  it("fails --auto early when the default agent has no local agent config", async () => {
+    await withTempWorkspace("llm-wiki-ingest-auto-missing-agent-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureTextSource(wikiDir);
+
+      // Act
+      const result = await runCliBuffered([
+        "ingest",
+        source.source_id,
+        "--repo",
+        wikiDir,
+        "--auto",
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"ingest">(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "AGENT_CONFIG_MISSING",
+        message: "Local agent is not configured: generic.",
+        hint: expect.stringContaining("local agent mode"),
+      });
+      expect(payload.issues[0]).toMatchObject({
+        path: ".llm-wiki/config.yml:agents.generic",
+      });
+    });
+  });
+
+  it("fails --auto early when the configured default agent is not local-exec", async () => {
+    await withTempWorkspace("llm-wiki-ingest-auto-unsupported-agent-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureTextSource(wikiDir);
+      const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+      const config = await readFile(configPath, "utf8");
+      await writeFile(
+        configPath,
+        [
+          config.replace("default: generic", "default: codex").trimEnd(),
+          "agents:",
+          "  codex:",
+          "    type: http",
+          "    command: codex",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered([
+        "ingest",
+        source.source_id,
+        "--repo",
+        wikiDir,
+        "--auto",
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"ingest">(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "AGENT_CONFIG_INVALID",
+        message: "Agent type must be local-exec.",
+      });
+      expect(payload.issues[0]).toMatchObject({
+        path: ".llm-wiki/config.yml:agents.codex.type",
+      });
+    });
+  });
+
+  it.each([
+    {
+      name: "explicit --agent codex",
+      args: ["--agent", "codex"],
+      defaultAgent: "generic" as const,
+    },
+    {
+      name: "--auto with agent.default",
+      args: ["--auto"],
+      defaultAgent: "codex" as const,
+    },
+  ])("resolves a valid local agent config before deferred ingest handoff: $name", async ({ args, defaultAgent }) => {
+    await withTempWorkspace("llm-wiki-ingest-agent-handoff-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureTextSource(wikiDir);
+      await configureCodexLocalAgent(wikiDir, { defaultAgent });
+
+      // Act
+      const result = await runCliBuffered([
+        "ingest",
+        source.source_id,
+        "--repo",
+        wikiDir,
+        ...args,
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"ingest">(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "AGENT_EXECUTION_UNAVAILABLE",
+        message: "Local agent execution is not implemented for ingest yet: codex.",
+      });
+      expect(payload.error.hint).toContain(".llm-wiki/config.yml:agents.codex");
+      expect(payload.issues[0]).toMatchObject({
+        path: ".llm-wiki/config.yml:agents.codex",
+      });
+    });
+  });
+
   it("builds an agent prompt from source, raw content, queue, agents, index, and related pages", async () => {
     await withTempWorkspace("llm-wiki-ingest-task-", async (workspaceDir) => {
       // Arrange

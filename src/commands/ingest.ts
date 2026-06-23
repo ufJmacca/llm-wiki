@@ -9,7 +9,15 @@ import {
   requestProviderFileProposals,
   validateProposalsOnTemporaryRepo,
 } from "../providers/index.js";
-import { loadProviderConfig, type HttpProviderConfig, type ProviderConfigError } from "../runtime/config.js";
+import {
+  loadDefaultLocalAgentConfig,
+  loadLocalAgentConfig,
+  loadProviderConfig,
+  type HttpProviderConfig,
+  type LocalAgentConfig,
+  type LocalAgentConfigError,
+  type ProviderConfigError,
+} from "../runtime/config.js";
 import { addRuntimeOptions, type RawRuntimeCommandOptions, type RuntimeCommandOptions } from "../runtime/command.js";
 import { buildRuntimeFailureEnvelope, buildRuntimeSuccessEnvelope, type RuntimeIssue } from "../runtime/envelope.js";
 import { RuntimeCommandError } from "../runtime/errors.js";
@@ -24,6 +32,8 @@ type RawIngestOptions = RawRuntimeCommandOptions & {
   taskOut?: unknown;
   createBranch?: unknown;
   provider?: unknown;
+  agent?: unknown;
+  auto?: unknown;
 };
 
 type IngestGitData = {
@@ -95,12 +105,14 @@ export function registerIngestCommand(program: Command, io: CliIo): void {
   addRuntimeOptions(
     program
       .command("ingest")
-      .description("Generate an agent ingest task and validate completed curated edits")
+      .description("Generate a manual prompt, execute local agents/providers, or validate completed curated edits")
       .argument("<source_id>", "source ID to ingest")
       .option("--validate", "validate completed ingest output and mark source ingested", false)
-      .option("--task-out <path>", "write the generated task prompt to a repository-relative path")
+      .option("--task-out <path>", "write the manual prompt to a repository-relative path")
       .option("--create-branch", "create the recommended ingest branch when Git is enabled", false)
-      .option("--provider <name>", "execute an explicitly configured provider and apply validated file proposals"),
+      .option("--agent <name>", "run local agent execution with a configured agent such as codex")
+      .option("--auto", "run local agent execution with the configured default local agent", false)
+      .option("--provider <name>", "run HTTP provider mode with an explicitly configured provider"),
   ).action(async (sourceId: string, rawOptions: RawIngestOptions) => {
     await runIngestCommand(sourceId, rawOptions, io);
   });
@@ -122,10 +134,13 @@ async function runIngestCommand(sourceId: string, rawOptions: RawIngestOptions, 
   }
 
   try {
+    validateIngestModeOptions(rawOptions);
     const data = rawOptions.validate === true
       ? await validateAndCompleteIngest(resolvedRepo.value.rootDir, sourceId)
       : typeof rawOptions.provider === "string"
         ? await executeProviderIngest(resolvedRepo.value.rootDir, sourceId, rawOptions.provider)
+        : isAgentModeRequested(rawOptions)
+          ? await executeAgentIngest(resolvedRepo.value.rootDir, sourceId, rawOptions)
         : await createIngestTask(resolvedRepo.value.rootDir, sourceId, rawOptions);
     const envelope = buildRuntimeSuccessEnvelope("ingest", resolvedRepo.value.rootDir, data, []);
 
@@ -178,6 +193,52 @@ async function runIngestCommand(sourceId: string, rawOptions: RawIngestOptions, 
 
     throw new CommanderError(1, "llm-wiki.ingest", envelope.error.message);
   }
+}
+
+function validateIngestModeOptions(rawOptions: RawIngestOptions): void {
+  const executionModes = [
+    typeof rawOptions.agent === "string",
+    rawOptions.auto === true,
+    typeof rawOptions.provider === "string",
+  ].filter(Boolean).length;
+
+  if (executionModes > 1) {
+    throw new RuntimeCommandError({
+      code: "INGEST_MODE_CONFLICT",
+      message: "Choose only one ingest execution mode.",
+      hint: "Use exactly one of --agent <name>, --auto, or --provider <name>; omit all three to generate the manual prompt.",
+      path: "ingest",
+    });
+  }
+
+  if (rawOptions.validate === true && executionModes > 0) {
+    throw new RuntimeCommandError({
+      code: "INGEST_MODE_CONFLICT",
+      message: "Ingest validation cannot be combined with execution mode.",
+      hint: "Use --validate by itself to check completed curated edits, or use exactly one of --agent <name>, --auto, or --provider <name> to execute.",
+      path: "--validate",
+    });
+  }
+}
+
+function isAgentModeRequested(rawOptions: RawIngestOptions): boolean {
+  return rawOptions.auto === true || typeof rawOptions.agent === "string";
+}
+
+async function executeAgentIngest(
+  repoRoot: string,
+  _sourceId: string,
+  rawOptions: RawIngestOptions,
+): Promise<never> {
+  const agent = await resolveLocalAgentConfig(repoRoot, rawOptions);
+  const agentConfigPath = `.llm-wiki/config.yml:agents.${agent.name}`;
+
+  throw new RuntimeCommandError({
+    code: "AGENT_EXECUTION_UNAVAILABLE",
+    message: `Local agent execution is not implemented for ingest yet: ${agent.name}.`,
+    hint: `Resolved local agent config at ${agentConfigPath}. Use manual prompt generation without --agent/--auto, or use --provider <name> for an HTTP proposal provider until the local Codex adapter is enabled.`,
+    path: agentConfigPath,
+  });
 }
 
 async function executeProviderIngest(
@@ -570,6 +631,26 @@ function queueRuntimeError(code: string, message: string, hint: string, path: st
     message,
     hint,
     path,
+  });
+}
+
+async function resolveLocalAgentConfig(repoRoot: string, rawOptions: RawIngestOptions): Promise<LocalAgentConfig> {
+  const result = rawOptions.auto === true
+    ? await loadDefaultLocalAgentConfig(repoRoot)
+    : await loadLocalAgentConfig(repoRoot, String(rawOptions.agent));
+  if (!result.ok) {
+    throw agentConfigRuntimeError(result.error);
+  }
+
+  return result.value;
+}
+
+function agentConfigRuntimeError(error: LocalAgentConfigError): RuntimeCommandError {
+  return new RuntimeCommandError({
+    code: error.code,
+    message: error.message,
+    hint: error.hint,
+    path: error.path,
   });
 }
 

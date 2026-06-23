@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -177,6 +177,39 @@ describe("shared proposal core", () => {
       await expect(apply).rejects.toThrow("validation failed");
       await expect(readFile(resolve(repoRoot, "curated/index.md"), "utf8")).resolves.toBe("# Index\n\n- original\n");
       await expect(pathExists(resolve(repoRoot, "curated/topics/new.md"))).resolves.toBe(false);
+    });
+  });
+
+  it("aborts before proposal writes when an existing target cannot be snapshotted", async () => {
+    await withTempWorkspace("llm-wiki-proposal-snapshot-read-failure-", async (repoRoot) => {
+      // Arrange
+      await writeRepoFile(repoRoot, "curated/index.md", "# Index\n\n- original\n");
+      await writeRepoFile(repoRoot, "curated/topics/write-only.md", "# Existing\n");
+      const writeOnlyPath = resolve(repoRoot, "curated/topics/write-only.md");
+      await chmod(writeOnlyPath, 0o200);
+      const policy = createIngestProposalPolicy();
+
+      // Act
+      const apply = applyProposalsWithValidation(
+        repoRoot,
+        {
+          files: [
+            { path: "curated/index.md", content: "# Index\n\n- rewritten\n" },
+            { path: "curated/topics/write-only.md", content: "# Replacement\n" },
+          ],
+        },
+        policy,
+        async () => "validated",
+      );
+
+      // Assert
+      await expect(apply).rejects.toMatchObject({
+        code: "PROPOSAL_WRITE_FAILED",
+        path: "curated/topics/write-only.md",
+      });
+      await chmod(writeOnlyPath, 0o600);
+      await expect(readFile(resolve(repoRoot, "curated/index.md"), "utf8")).resolves.toBe("# Index\n\n- original\n");
+      await expect(readFile(writeOnlyPath, "utf8")).resolves.toBe("# Existing\n");
     });
   });
 

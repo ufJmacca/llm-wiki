@@ -49,6 +49,7 @@ export type LocalAgentCommandResult = {
 export type RunLocalAgentCommandInput = {
   agent: LocalAgentConfig;
   cwd: string;
+  pathResolutionCwd?: string;
   taskPrompt: string;
   changesObserved: boolean;
   env?: NodeJS.ProcessEnv;
@@ -186,7 +187,7 @@ export async function runLocalAgentCommand(input: RunLocalAgentCommandInput): Pr
   const argsSummary = summarizeArgs(executionArgs);
   const commandIsCodex = isCodexExecutable(input.agent.command);
   const availability = await checkLocalAgentAvailability(input.agent, {
-    cwd: input.cwd,
+    cwd: input.pathResolutionCwd ?? input.cwd,
     env: input.env,
     platform: input.platform,
   });

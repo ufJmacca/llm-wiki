@@ -36,13 +36,24 @@ export type LocalAgentWorkspaceResult = {
 type SnapshotEntry =
   | {
     kind: "file";
+    metadata: FileSnapshotMetadata;
     content: Buffer;
+  }
+  | {
+    kind: "file_metadata";
+    metadata: FileSnapshotMetadata;
   }
   | {
     kind: "symlink" | "other";
   };
 
 type WorkspaceSnapshot = Map<string, SnapshotEntry>;
+type FileSnapshotMetadata = {
+  size: number;
+  mode: number;
+  mtimeMs: number;
+  ctimeMs: number;
+};
 
 const COPY_EXCLUDED_DIRECTORY_NAMES = new Set([".git", "node_modules"]);
 const COPY_EXCLUDED_QUARTZ_PATHS = new Set([
@@ -64,7 +75,7 @@ export async function runLocalAgentInTemporaryWorkspace(
   let beforeSnapshot: WorkspaceSnapshot | null = null;
   try {
     await copyRepoForAgent(repoRoot, tempRepoRoot, input.policy);
-    beforeSnapshot = await readWorkspaceSnapshot(tempRepoRoot);
+    beforeSnapshot = await readWorkspaceSnapshot(tempRepoRoot, input.policy);
 
     const execution = await runLocalAgentCommand({
       agent: input.agent,
@@ -81,7 +92,8 @@ export async function runLocalAgentInTemporaryWorkspace(
     return { execution, proposals };
   } catch (error) {
     if (error instanceof LocalAgentExecutionError && beforeSnapshot !== null) {
-      const changesObserved = await hasWorkspaceChanges(tempRepoRoot, beforeSnapshot).catch(() => error.changesObserved);
+      const changesObserved = await hasWorkspaceChanges(tempRepoRoot, beforeSnapshot, input.policy)
+        .catch(() => error.changesObserved);
       throw localAgentErrorWithObservedChanges(error, changesObserved);
     }
 
@@ -96,7 +108,7 @@ async function extractWorkspaceFileProposals(
   beforeSnapshot: WorkspaceSnapshot,
   policy: ProposalPolicy,
 ): Promise<ProposalSet> {
-  const afterSnapshot = await readWorkspaceSnapshot(workspaceRoot);
+  const afterSnapshot = await readWorkspaceSnapshot(workspaceRoot, policy);
   const proposalCandidates: FileProposal[] = [];
   const changedPaths = new Set([...beforeSnapshot.keys(), ...afterSnapshot.keys()]);
 
@@ -109,6 +121,11 @@ async function extractWorkspaceFileProposals(
 
     if (after === undefined || snapshotEntriesEqual(before, after)) {
       continue;
+    }
+
+    const pathRejection = proposalPathRejection(policy, path);
+    if (pathRejection !== null) {
+      throw rejectedWorkspaceProposalPath(policy, pathRejection);
     }
 
     if (after.kind !== "file") {
@@ -179,9 +196,9 @@ function shouldCopyRepoPath(repoRoot: string, sourcePath: string): boolean {
   return !(segments[0] === "quartz" && segments[1] !== undefined && COPY_EXCLUDED_QUARTZ_PATHS.has(segments[1]));
 }
 
-async function readWorkspaceSnapshot(root: string): Promise<WorkspaceSnapshot> {
+async function readWorkspaceSnapshot(root: string, policy: ProposalPolicy): Promise<WorkspaceSnapshot> {
   const snapshot: WorkspaceSnapshot = new Map();
-  await readWorkspaceSnapshotDirectory(resolve(root), resolve(root), snapshot);
+  await readWorkspaceSnapshotDirectory(resolve(root), resolve(root), snapshot, policy);
 
   return snapshot;
 }
@@ -190,6 +207,7 @@ async function readWorkspaceSnapshotDirectory(
   root: string,
   directory: string,
   snapshot: WorkspaceSnapshot,
+  policy: ProposalPolicy,
 ): Promise<void> {
   const entries = await readdir(directory);
   for (const entry of entries.sort()) {
@@ -201,15 +219,22 @@ async function readWorkspaceSnapshotDirectory(
     }
 
     if (pathStat.isDirectory()) {
-      await readWorkspaceSnapshotDirectory(root, absolutePath, snapshot);
+      await readWorkspaceSnapshotDirectory(root, absolutePath, snapshot, policy);
       continue;
     }
 
     if (pathStat.isFile()) {
-      snapshot.set(relativePath, {
-        kind: "file",
-        content: await readFile(absolutePath),
-      });
+      const metadata = fileSnapshotMetadata(pathStat);
+      if (proposalPathRejection(policy, relativePath) === null) {
+        snapshot.set(relativePath, {
+          kind: "file",
+          metadata,
+          content: await readFile(absolutePath),
+        });
+        continue;
+      }
+
+      snapshot.set(relativePath, { kind: "file_metadata", metadata });
       continue;
     }
 
@@ -220,8 +245,9 @@ async function readWorkspaceSnapshotDirectory(
 async function hasWorkspaceChanges(
   workspaceRoot: string,
   beforeSnapshot: WorkspaceSnapshot,
+  policy: ProposalPolicy,
 ): Promise<boolean> {
-  const afterSnapshot = await readWorkspaceSnapshot(workspaceRoot);
+  const afterSnapshot = await readWorkspaceSnapshot(workspaceRoot, policy);
   const changedPaths = new Set([...beforeSnapshot.keys(), ...afterSnapshot.keys()]);
 
   for (const path of changedPaths) {
@@ -242,11 +268,63 @@ function snapshotEntriesEqual(left: SnapshotEntry | undefined, right: SnapshotEn
     return false;
   }
 
-  if (left.kind !== "file" || right.kind !== "file") {
-    return true;
+  if (left.kind === "file" && right.kind === "file") {
+    return left.content.equals(right.content);
   }
 
-  return left.content.equals(right.content);
+  if (left.kind === "file_metadata" && right.kind === "file_metadata") {
+    return fileSnapshotMetadataEqual(left.metadata, right.metadata);
+  }
+
+  return true;
+}
+
+function fileSnapshotMetadata(stats: { size: number; mode: number; mtimeMs: number; ctimeMs: number }): FileSnapshotMetadata {
+  return {
+    size: stats.size,
+    mode: stats.mode,
+    mtimeMs: stats.mtimeMs,
+    ctimeMs: stats.ctimeMs,
+  };
+}
+
+function fileSnapshotMetadataEqual(left: FileSnapshotMetadata, right: FileSnapshotMetadata): boolean {
+  return left.size === right.size
+    && left.mode === right.mode
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+function proposalPathRejection(policy: ProposalPolicy, path: string): { message: string; hint: string; path?: string } | null {
+  if (path.trim() === "" || path.includes("\0") || path.includes("\\") || path.startsWith("/")) {
+    return {
+      message: policy.pathRejectedMessage(path),
+      hint: policy.rejectedPathHint,
+      path,
+    };
+  }
+
+  if (path.split("/").includes("..")) {
+    return {
+      message: policy.pathRejectedMessage(path),
+      hint: policy.rejectedPathHint,
+      path,
+    };
+  }
+
+  return policy.allowPath(path.replace(/\/+$/u, ""), path);
+}
+
+function rejectedWorkspaceProposalPath(
+  policy: ProposalPolicy,
+  rejection: { message: string; hint: string; path?: string },
+): RuntimeCommandError {
+  return new RuntimeCommandError({
+    code: policy.rejectionCode,
+    message: rejection.message,
+    hint: rejection.hint,
+    path: rejection.path ?? ".",
+  });
 }
 
 function relativePathFromRoot(root: string, path: string): string | null {

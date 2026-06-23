@@ -80,6 +80,7 @@ export async function runLocalAgentInTemporaryWorkspace(
     const execution = await runLocalAgentCommand({
       agent: input.agent,
       cwd: tempRepoRoot,
+      pathResolutionCwd: repoRoot,
       taskPrompt: input.taskPrompt,
       changesObserved: false,
       env: input.env,

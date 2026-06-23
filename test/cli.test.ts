@@ -117,6 +117,7 @@ describe("llm-wiki CLI baseline", () => {
     expect(help).toMatch(/configured default local\s+agent/);
     expect(help).toContain("--provider <name>");
     expect(help).toContain("HTTP provider");
+    expect(help).not.toContain("--provider codex");
     expect(help).toContain("--validate");
   });
 
@@ -142,6 +143,7 @@ describe("llm-wiki CLI baseline", () => {
     expect(help).toMatch(/configured default local\s+agent/);
     expect(help).toContain("--provider <name>");
     expect(help).toContain("HTTP provider");
+    expect(help).not.toContain("--provider codex");
     expect(help).toContain("--validate");
   });
 

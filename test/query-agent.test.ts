@@ -138,19 +138,20 @@ async function configureCodexLocalAgent(
 async function createFakeCodex(
   workspaceDir: string,
   input: {
+    binDir?: string;
     requiredPromptFragments?: string[];
     writes?: Array<{ path: string; content: string }>;
     stderr?: string;
     exitCode?: number;
   },
 ): Promise<string> {
-  const binDir = resolve(workspaceDir, "bin");
+  const binDir = input.binDir ?? resolve(workspaceDir, "bin");
   const executablePath = resolve(binDir, "codex");
   await mkdir(binDir, { recursive: true });
   await writeFile(
     executablePath,
     [
-      "#!/usr/bin/env node",
+      `#!${process.execPath}`,
       "const fs = require('node:fs');",
       "const path = require('node:path');",
       "const prompt = fs.readFileSync(0, 'utf8');",
@@ -376,6 +377,73 @@ describe("query local agent automation", () => {
       expect(savedQuestion).toContain(`- ${source.source_id}`);
       expect(logAfter).toContain(`query | agent-answer | ${question}`);
       expect(await readFile(resolve(wikiDir, source.original_path), "utf8")).toBe(rawOriginalBefore);
+    });
+  });
+
+  it("runs when PATH contains a repo-relative entry excluded from the temp workspace", async () => {
+    await withTempWorkspace("llm-wiki-query-agent-relative-path-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const runDir = resolve(workspaceDir, "outside");
+      const question = "What can a repo-relative PATH agent answer?";
+      const savePath = "curated/questions/relative-path-agent-answer.md";
+      await initializeWiki(wikiDir);
+      await mkdir(runDir);
+      await createFakeCodex(workspaceDir, {
+        binDir: resolve(wikiDir, "node_modules/.bin"),
+        requiredPromptFragments: [
+          `# Query task: ${question}`,
+          "## Available source IDs\n- None available",
+          "source_ids: []",
+        ],
+        writes: [
+          { path: savePath, content: queryAnswerWithoutEvidenceContent(question) },
+          { path: "curated/index.md", content: queryIndexContent(question, savePath) },
+          { path: "curated/log.md", content: queryLogContent(question, savePath) },
+        ],
+      });
+      await configureCodexLocalAgent(wikiDir, { command: "codex" });
+
+      const oldCwd = process.cwd();
+      try {
+        process.chdir(runDir);
+        process.env.PATH = "node_modules/.bin";
+
+        // Act
+        const result = await runCliBuffered([
+          "query",
+          question,
+          "--repo",
+          wikiDir,
+          "--save",
+          savePath,
+          "--agent",
+          "codex",
+          "--json",
+        ]);
+        const payload = parseJsonSuccess<"query", QueryAgentData>(result.stdout);
+
+        // Assert
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toEqual([]);
+        expect(payload.data).toMatchObject({
+          mode: "agent",
+          agent: "codex",
+          save_path: savePath,
+          saved_path: savePath,
+          validation: {
+            passed: true,
+            issues: [],
+          },
+        });
+        expect(payload.data.applied_paths).toEqual([
+          "curated/index.md",
+          "curated/log.md",
+          savePath,
+        ]);
+      } finally {
+        process.chdir(oldCwd);
+      }
     });
   });
 

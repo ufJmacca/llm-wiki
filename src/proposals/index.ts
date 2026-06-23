@@ -1,4 +1,4 @@
-import { cp, mkdtemp, rm } from "node:fs/promises";
+import { cp, lstat, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { posix, relative, resolve } from "node:path";
 
@@ -217,11 +217,7 @@ export async function applyProposalsWithValidation<ValidationResult>(
   }
 
   for (const proposal of normalizedProposals) {
-    const existing = await readTextFileInsideRoot(repoRoot, proposal.path);
-    snapshots.push({
-      path: proposal.path,
-      content: existing.ok ? existing.value : null,
-    });
+    snapshots.push(await readProposalSnapshot(repoRoot, proposal.path, policy));
   }
 
   const writtenPaths: string[] = [];
@@ -345,6 +341,47 @@ function appendLogProposal(existingContent: string, proposedContent: string): st
   return `${existingWithNewline}${separator}${proposedAppend}`;
 }
 
+async function readProposalSnapshot(
+  repoRoot: string,
+  path: string,
+  policy: ProposalPolicy,
+): Promise<ProposalSnapshot> {
+  const existing = await readTextFileInsideRoot(repoRoot, path);
+  if (existing.ok) {
+    return {
+      path,
+      content: existing.value,
+    };
+  }
+
+  if (!(await proposalTargetExists(repoRoot, path))) {
+    return {
+      path,
+      content: null,
+    };
+  }
+
+  throw new RuntimeCommandError({
+    code: policy.writeFailedCode,
+    message: `Could not snapshot existing proposal target before writing: ${existing.error.message}`,
+    hint: policy.writeFailedHint,
+    path: existing.error.path,
+  });
+}
+
+async function proposalTargetExists(repoRoot: string, path: string): Promise<boolean> {
+  try {
+    await lstat(resolve(repoRoot, path));
+    return true;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return false;
+    }
+
+    return true;
+  }
+}
+
 function stripLogTitle(content: string): string {
   return content.replaceAll("\r\n", "\n").replaceAll("\r", "\n").replace(/^# Log[ \t]*\n+/, "");
 }
@@ -362,4 +399,8 @@ async function rollbackProposalWrites(repoRoot: string, snapshots: ProposalSnaps
 
     await writeTextFileInsideRoot(repoRoot, snapshot.path, snapshot.content);
   }
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }

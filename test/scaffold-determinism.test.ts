@@ -67,6 +67,36 @@ describe("scaffold determinism contract", () => {
     }
   });
 
+  it("plans the Codex scaffold path set in lexical order with only the Codex variant added", () => {
+    // Arrange
+    const expectedPaths = [...approvedDefaultScaffoldPaths, "CODEX.md"].sort();
+
+    // Act
+    const plannedPaths = planWikiScaffold({ ...defaultCreateWikiOptions, agent: "codex" }).map((entry) => entry.path);
+
+    // Assert
+    expect(plannedPaths).toEqual(expectedPaths);
+    expect(plannedPaths).toEqual([...plannedPaths].sort());
+    expect(plannedPaths).toContain(".llm-wiki/config.yml");
+    expect(plannedPaths).toContain("CODEX.md");
+    expect(plannedPaths).not.toContain("CLAUDE.md");
+  });
+
+  it("keeps Codex scaffold content stable and free of literal secrets", () => {
+    // Arrange
+    const secretLikePattern = /api[_-]?key|secret|token|password|sk-/i;
+
+    // Act
+    const firstPlan = planWikiScaffold({ ...defaultCreateWikiOptions, agent: "codex" });
+    const secondPlan = planWikiScaffold({ ...defaultCreateWikiOptions, agent: "codex" });
+    const config = firstPlan.find((entry) => entry.path === ".llm-wiki/config.yml");
+
+    // Assert
+    expect(secondPlan).toEqual(firstPlan);
+    expect(config?.content).toBeDefined();
+    expect(config?.content).not.toMatch(secretLikePattern);
+  });
+
   it("keeps scaffold content stable and free of generated timestamps", () => {
     // Arrange
     const generatedTimestampPattern = /\b\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+-]+)?\b/;

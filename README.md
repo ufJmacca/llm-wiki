@@ -314,7 +314,7 @@ llm-wiki ingest <source_id> --validate
 llm-wiki query "What changed in the PRD?" --save curated/questions/prd-changes.md --validate
 ```
 
-After manual Codex execution, review `git diff` before validation. If automated ingest or query validation fails, the real repository is left unchanged by the rejected proposal set. Fix the underlying curated files manually or rerun the local agent after updating the prompt/context. Run the matching `--validate` command after making manual fixes so queue state, index requirements, and log entries are checked before the work is treated as complete.
+After manual Codex execution, review `git diff` before validation. If automated ingest or query validation fails, curated proposal writes are rejected or rolled back before the result is accepted. Ingest agent failures can still move the source queue item to `blocked` so the failed run is visible; query agent failures leave queue state untouched. Fix the underlying curated files manually or rerun the local agent after updating the prompt/context. Run the matching `--validate` command after making manual fixes so queue state, index requirements, and log entries are checked before the work is treated as complete.
 
 ## Provider Proposal Mode
 

@@ -100,12 +100,10 @@ quartz/public/
 }
 
 function configContent(options: WikiScaffoldOptions): string {
-  const localAgentConfig = options.agent === "codex" ? codexAgentConfigContent() : "";
-
   return `version: 1
 agent:
   default: ${options.agent}
-${localAgentConfig}features:
+${localAgentConfigContent(options.agent)}features:
   obsidian: ${options.obsidian}
   dataview: ${options.dataview}
   git: ${options.git}
@@ -136,7 +134,11 @@ privacy:
 `;
 }
 
-function codexAgentConfigContent(): string {
+function localAgentConfigContent(agent: InitAgent): string {
+  if (agent !== "codex") {
+    return "";
+  }
+
   return `agents:
   codex:
     type: local-exec

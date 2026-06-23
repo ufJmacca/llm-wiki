@@ -1,12 +1,33 @@
 import { lstat, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 
+import { checkLocalAgentAvailability, type LocalAgentAvailabilityError } from "../agents/index.js";
 import { lintWiki, type LintResult } from "../lint/index.js";
 import { scanWikiRepository, type RepoScan } from "../scanner/repo.js";
 import { readGitState, type GitState } from "../utils/git.js";
-import { readWikiConfigSummary, type WikiConfigIssue } from "./config.js";
+import {
+  readWikiConfigSummary,
+  readWikiStatusConfigReadiness,
+  type LocalAgentConfig,
+  type WikiConfigIssue,
+  type WikiStatusConfigReadiness,
+} from "./config.js";
 import { listQueue, type QueueListItem, type QueueListResult } from "./queue.js";
 import { WIKI_CONFIG_RELATIVE_PATH } from "./repo.js";
+
+export type StatusLocalAgentItem = {
+  name: string;
+  type: "local-exec";
+  command: string;
+  available: boolean;
+  availability_error: {
+    code: LocalAgentAvailabilityError["code"];
+    message: string;
+    hint: string;
+    executable_path: string;
+  } | null;
+  timeout_seconds: number | null;
+};
 
 export type StatusData = {
   configPath: typeof WIKI_CONFIG_RELATIVE_PATH;
@@ -24,6 +45,23 @@ export type StatusData = {
       names: string[];
     };
     errors: WikiConfigIssue[];
+  };
+  agents: {
+    default: string | null;
+    local: {
+      count: number;
+      names: string[];
+      items: StatusLocalAgentItem[];
+    };
+  };
+  providers: {
+    count: number;
+    names: string[];
+  };
+  auto: {
+    can_run: boolean;
+    agent: string | null;
+    reason: string | null;
   };
   health: {
     state: "ok" | "warning" | "error";
@@ -72,15 +110,22 @@ const EMPTY_QUEUE_COUNTS: QueueListResult["counts"] = {
   blocked: 0,
 };
 
+const LOCAL_AGENT_EXECUTION_UNAVAILABLE_REASON =
+  "Local agent execution is not implemented yet. Use manual prompt generation without --auto, or use --provider <name> for an HTTP proposal provider until the local Codex adapter is enabled.";
+
 export async function getWikiStatus(repoRoot: string): Promise<StatusData> {
-  const configSummary = await readWikiConfigSummary(repoRoot);
-  const [scan, lint, queue, explorer] = await Promise.all([
+  const [configSummary, configReadiness, scan, lint, queue, explorer] = await Promise.all([
+    readWikiConfigSummary(repoRoot),
+    readWikiStatusConfigReadiness(repoRoot),
     scanWikiRepository(repoRoot),
     lintWiki(repoRoot),
     readQueueStatus(repoRoot),
     readExplorerStatus(repoRoot),
   ]);
   const config = summarizeConfig(configSummary);
+  const agents = await summarizeAgents(configReadiness, repoRoot);
+  const providers = configReadiness.providers;
+  const auto = summarizeAutoReadiness(agents);
   const git = configSummary.ok ? await readGitState(repoRoot, configSummary.value.gitEnabled) : unknownGitState();
   const profiles = summarizeProfiles(scan);
   const warningCount = lint.counts.warning + git.errors.length + queue.errors.length;
@@ -89,6 +134,9 @@ export async function getWikiStatus(repoRoot: string): Promise<StatusData> {
   return {
     configPath: WIKI_CONFIG_RELATIVE_PATH,
     config,
+    agents,
+    providers,
+    auto,
     health: {
       state: errorCount > 0 ? "error" : warningCount > 0 ? "warning" : "ok",
       ok: errorCount === 0,
@@ -109,6 +157,80 @@ export async function getWikiStatus(repoRoot: string): Promise<StatusData> {
 }
 
 type WikiConfigSummaryResult = Awaited<ReturnType<typeof readWikiConfigSummary>>;
+
+async function summarizeAgents(config: WikiStatusConfigReadiness, repoRoot: string): Promise<StatusData["agents"]> {
+  const items = await Promise.all(config.localAgents.map((agent) => readLocalAgentStatus(agent, repoRoot)));
+
+  return {
+    default: config.agentDefault,
+    local: {
+      count: items.length,
+      names: items.map((item) => item.name).sort(),
+      items: items.sort((left, right) => left.name.localeCompare(right.name)),
+    },
+  };
+}
+
+async function readLocalAgentStatus(agent: LocalAgentConfig, repoRoot: string): Promise<StatusLocalAgentItem> {
+  const availability = await checkLocalAgentAvailability(agent, { cwd: repoRoot });
+  if (availability.ok) {
+    return {
+      name: agent.name,
+      type: agent.type,
+      command: agent.command,
+      available: true,
+      availability_error: null,
+      timeout_seconds: agent.timeoutSeconds,
+    };
+  }
+
+  return {
+    name: agent.name,
+    type: agent.type,
+    command: agent.command,
+    available: false,
+    availability_error: {
+      code: availability.error.code,
+      message: availability.error.message,
+      hint: availability.error.hint,
+      executable_path: availability.error.executablePath,
+    },
+    timeout_seconds: agent.timeoutSeconds,
+  };
+}
+
+function summarizeAutoReadiness(agents: StatusData["agents"]): StatusData["auto"] {
+  if (agents.default === null) {
+    return {
+      can_run: false,
+      agent: null,
+      reason: "Default agent is not configured.",
+    };
+  }
+
+  const defaultAgent = agents.local.items.find((agent) => agent.name === agents.default);
+  if (defaultAgent === undefined) {
+    return {
+      can_run: false,
+      agent: agents.default,
+      reason: `Default agent ${agents.default} is not configured as a local agent.`,
+    };
+  }
+
+  if (!defaultAgent.available) {
+    return {
+      can_run: false,
+      agent: agents.default,
+      reason: defaultAgent.availability_error?.message ?? `Default agent ${agents.default} command is unavailable.`,
+    };
+  }
+
+  return {
+    can_run: false,
+    agent: agents.default,
+    reason: LOCAL_AGENT_EXECUTION_UNAVAILABLE_REASON,
+  };
+}
 
 function summarizeConfig(config: WikiConfigSummaryResult): StatusData["config"] {
   if (!config.ok) {

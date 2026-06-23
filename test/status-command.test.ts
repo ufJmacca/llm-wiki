@@ -54,6 +54,35 @@ type StatusData = {
       hint: string;
     }>;
   };
+  agents: {
+    default: string | null;
+    local: {
+      count: number;
+      names: string[];
+      items: Array<{
+        name: string;
+        type: "local-exec";
+        command: string;
+        available: boolean;
+        availability_error: null | {
+          code: string;
+          message: string;
+          hint: string;
+          executable_path: string;
+        };
+        timeout_seconds: number | null;
+      }>;
+    };
+  };
+  providers: {
+    count: number;
+    names: string[];
+  };
+  auto: {
+    can_run: boolean;
+    agent: string | null;
+    reason: string | null;
+  };
   health: {
     state: "ok" | "warning" | "error";
     ok: boolean;
@@ -119,6 +148,12 @@ type SourceCaptureData = {
 type FakeGitCall = {
   args: string[];
   cwd: string;
+};
+
+type FakeAgent = {
+  binDir: string;
+  logPath: string;
+  restore: () => void;
 };
 
 const supportsUnreadableFileTest =
@@ -217,6 +252,41 @@ process.exit(0);
         process.env.PATH = oldPath;
       }
       delete process.env.LLM_WIKI_FAKE_GIT_LOG;
+    },
+  };
+}
+
+async function createFakeAgentCommand(commandName = "codex"): Promise<FakeAgent> {
+  const binDir = await mkdtemp(resolve(tmpdir(), "llm-wiki-status-fake-agent-bin-"));
+  const executableName = process.platform === "win32" ? `${commandName}.cmd` : commandName;
+  const commandPath = resolve(binDir, executableName);
+  const logPath = resolve(binDir, `${commandName}.log`);
+  const oldPath = process.env.PATH;
+  const oldLog = process.env.LLM_WIKI_FAKE_AGENT_LOG;
+  const script = process.platform === "win32"
+    ? "@echo off\r\necho executed>>\"%LLM_WIKI_FAKE_AGENT_LOG%\"\r\nexit /b 0\r\n"
+    : "#!/usr/bin/env sh\nprintf executed >> \"$LLM_WIKI_FAKE_AGENT_LOG\"\n";
+
+  await writeFile(commandPath, script, "utf8");
+  await chmod(commandPath, 0o755);
+  process.env.PATH = `${binDir}${delimiter}${oldPath ?? ""}`;
+  process.env.LLM_WIKI_FAKE_AGENT_LOG = logPath;
+
+  return {
+    binDir,
+    logPath,
+    restore: () => {
+      if (oldPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = oldPath;
+      }
+
+      if (oldLog === undefined) {
+        delete process.env.LLM_WIKI_FAKE_AGENT_LOG;
+      } else {
+        process.env.LLM_WIKI_FAKE_AGENT_LOG = oldLog;
+      }
     },
   };
 }
@@ -341,6 +411,381 @@ describe("status command", () => {
           names: ["remote"],
         },
       });
+    });
+  });
+
+  it("reports local agent readiness, provider summary, and auto readiness in JSON without executing agents", async () => {
+    await withTempWorkspace("llm-wiki-status-agent-ready-json-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const fakeAgent = await createFakeAgentCommand("codex");
+      try {
+        delete process.env.LLM_WIKI_STATUS_PROVIDER_SECRET;
+        const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+        const config = await readFile(configPath, "utf8");
+        await writeFile(
+          configPath,
+          [
+            config.replace("default: generic", "default: codex").trimEnd(),
+            "agents:",
+            "  codex:",
+            "    type: local-exec",
+            "    command: codex",
+            "    args:",
+            "      - exec",
+            "    timeout_seconds: 900",
+            "providers:",
+            "  remote:",
+            "    type: http",
+            "    endpoint: https://provider.example.invalid/proposals",
+            "    api_key_env: LLM_WIKI_STATUS_PROVIDER_SECRET",
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+
+        // Act
+        const result = await runCliBuffered(["status", "--repo", wikiDir, "--json"]);
+        const payload = parseJsonSuccess<"status", StatusData>(result.stdout);
+
+        // Assert
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toEqual([]);
+        expect(payload.data.agents).toEqual({
+          default: "codex",
+          local: {
+            count: 1,
+            names: ["codex"],
+            items: [
+              {
+                name: "codex",
+                type: "local-exec",
+                command: "codex",
+                available: true,
+                availability_error: null,
+                timeout_seconds: 900,
+              },
+            ],
+          },
+        });
+        expect(payload.data.providers).toEqual({
+          count: 1,
+          names: ["remote"],
+        });
+        expect(payload.data.auto).toEqual({
+          can_run: false,
+          agent: "codex",
+          reason: expect.stringContaining("Local agent execution is not implemented yet"),
+        });
+        await expect(readFile(fakeAgent.logPath, "utf8")).rejects.toThrow();
+      } finally {
+        fakeAgent.restore();
+        await rm(fakeAgent.binDir, { force: true, recursive: true });
+      }
+    });
+  });
+
+  it("resolves relative PATH entries from the target repo root when status runs from another directory", async () => {
+    await withTempWorkspace("llm-wiki-status-agent-relative-path-json-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const runDir = resolve(workspaceDir, "outside");
+      await initializeWiki(wikiDir);
+      await mkdir(runDir);
+
+      const binDir = resolve(wikiDir, "bin");
+      const executableName = process.platform === "win32" ? "codex.cmd" : "codex";
+      const commandPath = resolve(binDir, executableName);
+      await mkdir(binDir);
+      await writeFile(
+        commandPath,
+        process.platform === "win32" ? "@echo off\r\nexit /b 0\r\n" : "#!/usr/bin/env sh\nexit 0\n",
+        "utf8",
+      );
+      await chmod(commandPath, 0o755);
+
+      const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+      const config = await readFile(configPath, "utf8");
+      await writeFile(
+        configPath,
+        [
+          config.replace("default: generic", "default: codex").trimEnd(),
+          "agents:",
+          "  codex:",
+          "    type: local-exec",
+          "    command: codex",
+          "    timeout_seconds: 900",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const oldCwd = process.cwd();
+      const oldPath = process.env.PATH;
+      try {
+        process.chdir(runDir);
+        process.env.PATH = "bin";
+
+        // Act
+        const result = await runCliBuffered(["status", "--repo", wikiDir, "--json"]);
+        const payload = parseJsonSuccess<"status", StatusData>(result.stdout);
+
+        // Assert
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toEqual([]);
+        expect(payload.data.agents.local.items).toEqual([
+          expect.objectContaining({
+            name: "codex",
+            command: "codex",
+            available: true,
+            availability_error: null,
+            timeout_seconds: 900,
+          }),
+        ]);
+        expect(payload.data.auto).toEqual({
+          can_run: false,
+          agent: "codex",
+          reason: expect.stringContaining("Local agent execution is not implemented yet"),
+        });
+      } finally {
+        process.chdir(oldCwd);
+        if (oldPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = oldPath;
+        }
+      }
+    });
+  });
+
+  it("reports missing local agent commands and explains why --auto cannot run", async () => {
+    await withTempWorkspace("llm-wiki-status-agent-missing-json-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const oldPath = process.env.PATH;
+      const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+      const config = await readFile(configPath, "utf8");
+      await writeFile(
+        configPath,
+        [
+          config.replace("default: generic", "default: codex").trimEnd(),
+          "agents:",
+          "  codex:",
+          "    type: local-exec",
+          "    command: llm-wiki-status-missing-codex",
+          "    timeout_seconds: 120",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      try {
+        process.env.PATH = "";
+
+        // Act
+        const result = await runCliBuffered(["status", "--repo", wikiDir, "--json"]);
+        const payload = parseJsonSuccess<"status", StatusData>(result.stdout);
+
+        // Assert
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toEqual([]);
+        expect(payload.data.agents.local.items).toEqual([
+          expect.objectContaining({
+            name: "codex",
+            command: "llm-wiki-status-missing-codex",
+            available: false,
+            availability_error: expect.objectContaining({
+              code: "AGENT_COMMAND_UNAVAILABLE",
+              executable_path: "llm-wiki-status-missing-codex",
+              message: expect.stringContaining("Agent command is not available"),
+            }),
+            timeout_seconds: 120,
+          }),
+        ]);
+        expect(payload.data.auto).toEqual({
+          can_run: false,
+          agent: "codex",
+          reason: expect.stringContaining("Agent command is not available"),
+        });
+      } finally {
+        if (oldPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = oldPath;
+        }
+      }
+    });
+  });
+
+  it("reports a missing default agent target as an --auto readiness failure", async () => {
+    await withTempWorkspace("llm-wiki-status-auto-missing-default-target-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["status", "--repo", wikiDir, "--json"]);
+      const payload = parseJsonSuccess<"status", StatusData>(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.agents).toMatchObject({
+        default: "generic",
+        local: {
+          count: 0,
+          names: [],
+          items: [],
+        },
+      });
+      expect(payload.data.auto).toEqual({
+        can_run: false,
+        agent: "generic",
+        reason: "Default agent generic is not configured as a local agent.",
+      });
+    });
+  });
+
+  it("keeps status JSON stable when the configured default agent has an unsupported type", async () => {
+    await withTempWorkspace("llm-wiki-status-auto-unsupported-agent-type-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+      const config = await readFile(configPath, "utf8");
+      await writeFile(
+        configPath,
+        [
+          config.replace("default: generic", "default: codex").trimEnd(),
+          "agents:",
+          "  codex:",
+          "    type: http",
+          "    command: codex",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["status", "--repo", wikiDir, "--json"]);
+      const payload = parseJsonSuccess<"status", StatusData>(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.health).toMatchObject({
+        state: "error",
+        ok: false,
+      });
+      expect(payload.data.config.errors).toEqual([
+        expect.objectContaining({
+          message: expect.stringContaining("Agent type must be local-exec"),
+          hint: expect.stringContaining("type: local-exec"),
+        }),
+      ]);
+      expect(payload.data.agents).toMatchObject({
+        default: "codex",
+        local: {
+          count: 0,
+          names: [],
+          items: [],
+        },
+      });
+      expect(payload.data.auto).toEqual({
+        can_run: false,
+        agent: "codex",
+        reason: "Default agent codex is not configured as a local agent.",
+      });
+    });
+  });
+
+  it("keeps status JSON stable when provider config is malformed", async () => {
+    await withTempWorkspace("llm-wiki-status-provider-malformed-json-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+      const config = await readFile(configPath, "utf8");
+      await writeFile(
+        configPath,
+        [
+          config.trimEnd(),
+          "providers:",
+          "  - remote",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["status", "--repo", wikiDir, "--json"]);
+      const payload = parseJsonSuccess<"status", StatusData>(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.health).toMatchObject({
+        state: "error",
+        ok: false,
+      });
+      expect(payload.data.providers).toEqual({
+        count: 0,
+        names: [],
+      });
+      expect(payload.data.config.errors).toEqual([
+        expect.objectContaining({
+          message: expect.stringContaining("providers must be a mapping"),
+        }),
+      ]);
+    });
+  });
+
+  it("reports agent, provider, and --auto readiness in human status output", async () => {
+    await withTempWorkspace("llm-wiki-status-agent-ready-human-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const fakeAgent = await createFakeAgentCommand("codex");
+      try {
+        const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+        const config = await readFile(configPath, "utf8");
+        await writeFile(
+          configPath,
+          [
+            config.replace("default: generic", "default: codex").trimEnd(),
+            "agents:",
+            "  codex:",
+            "    type: local-exec",
+            "    command: codex",
+            "    timeout_seconds: 900",
+            "providers:",
+            "  remote:",
+            "    type: http",
+            "    endpoint: https://provider.example.invalid/proposals",
+            "    api_key_env: LLM_WIKI_STATUS_PROVIDER_SECRET",
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+
+        // Act
+        const result = await runCliBuffered(["status", "--repo", wikiDir]);
+
+        // Assert
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toEqual([]);
+        expect(result.stdout).toHaveLength(1);
+        expect(result.stdout[0]).toContain("Default agent: codex");
+        expect(result.stdout[0]).toContain("Codex executable: available");
+        expect(result.stdout[0]).toContain("HTTP providers: 1 (remote)");
+        expect(result.stdout[0]).toContain("--auto: blocked (Local agent execution is not implemented yet");
+        await expect(readFile(fakeAgent.logPath, "utf8")).rejects.toThrow();
+      } finally {
+        fakeAgent.restore();
+        await rm(fakeAgent.binDir, { force: true, recursive: true });
+      }
     });
   });
 

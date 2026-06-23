@@ -16,7 +16,45 @@ type RuntimeSuccessEnvelope = {
       path: ".llm-wiki/config.yml";
       valid: boolean;
       git_enabled: boolean | null;
+      agent_default: string | null;
+      local_agents: {
+        count: number;
+        names: string[];
+      };
+      providers: {
+        count: number;
+        names: string[];
+      };
       errors: unknown[];
+    };
+    agents: {
+      default: string | null;
+      local: {
+        count: number;
+        names: string[];
+        items: Array<{
+          name: string;
+          type: "local-exec";
+          command: string;
+          available: boolean;
+          availability_error: null | {
+            code: string;
+            message: string;
+            hint: string;
+            executable_path: string;
+          };
+          timeout_seconds: number | null;
+        }>;
+      };
+    };
+    providers: {
+      count: number;
+      names: string[];
+    };
+    auto: {
+      can_run: boolean;
+      agent: string | null;
+      reason: string | null;
     };
     health: {
       state: "ok" | "warning" | "error";
@@ -129,6 +167,23 @@ describe("non-init CLI runtime contracts", () => {
               names: [],
             },
             errors: [],
+          },
+          agents: {
+            default: "generic",
+            local: {
+              count: 0,
+              names: [],
+              items: [],
+            },
+          },
+          providers: {
+            count: 0,
+            names: [],
+          },
+          auto: {
+            can_run: false,
+            agent: "generic",
+            reason: "Default agent generic is not configured as a local agent.",
           },
           health: expect.objectContaining({
             state: "ok",

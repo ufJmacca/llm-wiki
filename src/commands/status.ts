@@ -74,9 +74,11 @@ function formatHumanStatus(repo: string, data: StatusData): string {
     `Repo: ${repo}`,
     `Config: ${formatConfigStatus(data)}`,
     ...formatConfigErrorLines(data),
-    `Default agent: ${data.config.agent_default ?? "none"}`,
-    `Local agents: ${formatNamedCount(data.config.local_agents.count, data.config.local_agents.names)}`,
-    `HTTP providers: ${formatNamedCount(data.config.providers.count, data.config.providers.names)}`,
+    `Default agent: ${data.agents.default ?? "none"}`,
+    `Local agents: ${formatNamedCount(data.agents.local.count, data.agents.local.names)}`,
+    ...formatCodexAvailabilityLines(data),
+    `HTTP providers: ${formatNamedCount(data.providers.count, data.providers.names)}`,
+    `--auto: ${formatAutoReadiness(data)}`,
     `Health: ${data.health.state}`,
     `Lint: ${data.lint.counts.error} errors, ${data.lint.counts.warning} warnings`,
     `Queue: ${data.queue.counts.total} total, ${data.queue.counts.queued} queued, ${data.queue.counts.ingesting} ingesting, ${data.queue.counts.ingested} ingested, ${data.queue.counts.blocked} blocked`,
@@ -104,6 +106,27 @@ function formatNamedCount(count: number, names: string[]): string {
   }
 
   return `${count} (${names.join(", ")})`;
+}
+
+function formatCodexAvailabilityLines(data: StatusData): string[] {
+  const codex = data.agents.local.items.find((agent) => agent.name === "codex");
+  if (codex === undefined) {
+    return [];
+  }
+
+  if (codex.available) {
+    return ["Codex executable: available"];
+  }
+
+  return [`Codex executable: unavailable (${codex.availability_error?.message ?? "command unavailable"})`];
+}
+
+function formatAutoReadiness(data: StatusData): string {
+  if (data.auto.can_run) {
+    return `ready (${data.auto.agent})`;
+  }
+
+  return `blocked (${data.auto.reason ?? "default local agent is not ready"})`;
 }
 
 function formatGitStatus(data: StatusData): string {

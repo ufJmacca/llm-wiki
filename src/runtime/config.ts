@@ -40,6 +40,16 @@ export type WikiConfigSummary = {
   };
 };
 
+export type WikiStatusConfigReadiness = {
+  agentDefault: string | null;
+  localAgents: LocalAgentConfig[];
+  providers: {
+    count: number;
+    names: string[];
+  };
+  errors: WikiConfigIssue[];
+};
+
 export type ProviderConfigErrorCode =
   | "PROVIDER_CONFIG_INVALID"
   | "PROVIDER_CONFIG_MISSING"
@@ -298,6 +308,94 @@ export async function readWikiConfigSummary(repoRoot: string): Promise<Result<Wi
   });
 }
 
+export async function readWikiStatusConfigReadiness(repoRoot: string): Promise<WikiStatusConfigReadiness> {
+  let source: string;
+  try {
+    source = await readFile(resolve(repoRoot, WIKI_CONFIG_RELATIVE_PATH), "utf8");
+  } catch (error) {
+    return {
+      agentDefault: null,
+      localAgents: [],
+      providers: {
+        count: 0,
+        names: [],
+      },
+      errors: [
+        {
+          severity: "error",
+          code: "wiki_config_unreadable",
+          message: `Could not read ${WIKI_CONFIG_RELATIVE_PATH}: ${formatConfigError(error)}`,
+          path: WIKI_CONFIG_RELATIVE_PATH,
+          hint: "Ensure .llm-wiki/config.yml is readable and was created by llm-wiki init.",
+        },
+      ],
+    };
+  }
+
+  let config: unknown;
+  try {
+    config = parse(source) as unknown;
+  } catch (error) {
+    return {
+      agentDefault: null,
+      localAgents: [],
+      providers: {
+        count: 0,
+        names: [],
+      },
+      errors: [
+        {
+          severity: "error",
+          code: "wiki_config_invalid",
+          message: `Could not parse ${WIKI_CONFIG_RELATIVE_PATH}: ${formatConfigError(error)}`,
+          path: WIKI_CONFIG_RELATIVE_PATH,
+          hint: "Fix the YAML syntax in .llm-wiki/config.yml or recreate it with llm-wiki init.",
+        },
+      ],
+    };
+  }
+
+  const configRecord = asRecord(config);
+  if (configRecord === null) {
+    return {
+      agentDefault: null,
+      localAgents: [],
+      providers: {
+        count: 0,
+        names: [],
+      },
+      errors: [
+        {
+          severity: "error",
+          code: "wiki_config_invalid",
+          message: `Invalid ${WIKI_CONFIG_RELATIVE_PATH}: config root must be a mapping.`,
+          path: WIKI_CONFIG_RELATIVE_PATH,
+          hint: "Recreate .llm-wiki/config.yml with llm-wiki init or restore the generated mapping structure.",
+        },
+      ],
+    };
+  }
+
+  const errors: WikiConfigIssue[] = [];
+  const agentDefault = parseAgentDefaultForIssue(configRecord);
+  if (!agentDefault.ok) {
+    errors.push(agentDefault.error);
+  }
+
+  const localAgents = parseLocalAgentsForStatus(configRecord, errors);
+  const providerNames = parseProviderNamesForStatus(configRecord, errors);
+
+  return {
+    agentDefault: agentDefault.ok ? agentDefault.value : null,
+    localAgents,
+    providers: {
+      count: providerNames.length,
+      names: providerNames,
+    },
+    errors,
+  };
+}
+
 export async function readWikiGitConfig(repoRoot: string): Promise<Result<WikiGitConfig, WikiConfigIssue>> {
   let source: string;
   try {
@@ -498,6 +596,41 @@ function parseLocalAgentsForIssue(configRecord: Record<string, unknown>): Result
   return ok([...agents.value.keys()].sort());
 }
 
+function parseLocalAgentsForStatus(
+  configRecord: Record<string, unknown>,
+  errors: WikiConfigIssue[],
+): LocalAgentConfig[] {
+  const agentsRecord = parseLocalAgentRecordForAgentConfig(configRecord);
+  if (!agentsRecord.ok) {
+    errors.push(agentConfigIssue(agentsRecord.error));
+    return [];
+  }
+
+  const agents: LocalAgentConfig[] = [];
+  for (const [rawName, rawAgent] of Object.entries(agentsRecord.value)) {
+    const name = rawName.trim();
+    if (name === "") {
+      errors.push(agentConfigIssue({
+        code: "AGENT_CONFIG_INVALID",
+        message: "Agent name must not be empty.",
+        path: `${WIKI_CONFIG_RELATIVE_PATH}:agents`,
+        hint: "Configure local agents under non-empty keys such as agents.codex.",
+      }));
+      continue;
+    }
+
+    const agent = parseLocalAgentConfig(name, rawAgent);
+    if (!agent.ok) {
+      errors.push(agentConfigIssue(agent.error));
+      continue;
+    }
+
+    agents.push(agent.value);
+  }
+
+  return agents.sort((left, right) => left.name.localeCompare(right.name));
+}
+
 function parseLocalAgentConfig(name: string, value: unknown): Result<LocalAgentConfig, LocalAgentConfigError> {
   const agentRecord = asRecord(value);
   const basePath = `${WIKI_CONFIG_RELATIVE_PATH}:agents.${name}`;
@@ -686,6 +819,52 @@ function parseProviderSummaryForIssue(configRecord: Record<string, unknown>): Re
   }
 
   return ok(Object.keys(providersRecord).map((name) => name.trim()).sort());
+}
+
+function parseProviderNamesForStatus(
+  configRecord: Record<string, unknown>,
+  errors: WikiConfigIssue[],
+): string[] {
+  if (!("providers" in configRecord)) {
+    return [];
+  }
+
+  const providersRecord = asRecord(configRecord.providers);
+  if (providersRecord === null) {
+    errors.push({
+      severity: "error",
+      code: "wiki_config_invalid",
+      message: `Invalid ${WIKI_CONFIG_RELATIVE_PATH}: providers must be a mapping when present.`,
+      path: WIKI_CONFIG_RELATIVE_PATH,
+      hint: "Configure HTTP providers under providers.<name>, or remove the providers field.",
+    });
+    return [];
+  }
+
+  const names: string[] = [];
+  for (const [rawProviderName, rawProvider] of Object.entries(providersRecord)) {
+    const name = rawProviderName.trim();
+    if (name === "") {
+      errors.push({
+        severity: "error",
+        code: "wiki_config_invalid",
+        message: `Invalid ${WIKI_CONFIG_RELATIVE_PATH}: Provider name must not be empty.`,
+        path: WIKI_CONFIG_RELATIVE_PATH,
+        hint: "Configure providers under non-empty keys such as providers.local.",
+      });
+      continue;
+    }
+
+    const provider = parseProviderStaticConfig(name, rawProvider);
+    if (!provider.ok) {
+      errors.push(providerConfigIssue(provider.error));
+      continue;
+    }
+
+    names.push(name);
+  }
+
+  return names.sort();
 }
 
 type ProviderStaticConfig = {

@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { lintWiki, type LintResult } from "../lint/index.js";
 import { scanWikiRepository, type RepoScan } from "../scanner/repo.js";
 import { readGitState, type GitState } from "../utils/git.js";
-import { readWikiGitConfig, type WikiConfigIssue } from "./config.js";
+import { readWikiConfigSummary, type WikiConfigIssue } from "./config.js";
 import { listQueue, type QueueListItem, type QueueListResult } from "./queue.js";
 import { WIKI_CONFIG_RELATIVE_PATH } from "./repo.js";
 
@@ -14,6 +14,15 @@ export type StatusData = {
     path: typeof WIKI_CONFIG_RELATIVE_PATH;
     valid: boolean;
     git_enabled: boolean | null;
+    agent_default: string | null;
+    local_agents: {
+      count: number;
+      names: string[];
+    };
+    providers: {
+      count: number;
+      names: string[];
+    };
     errors: WikiConfigIssue[];
   };
   health: {
@@ -64,15 +73,15 @@ const EMPTY_QUEUE_COUNTS: QueueListResult["counts"] = {
 };
 
 export async function getWikiStatus(repoRoot: string): Promise<StatusData> {
-  const gitConfig = await readWikiGitConfig(repoRoot);
+  const configSummary = await readWikiConfigSummary(repoRoot);
   const [scan, lint, queue, explorer] = await Promise.all([
     scanWikiRepository(repoRoot),
     lintWiki(repoRoot),
     readQueueStatus(repoRoot),
     readExplorerStatus(repoRoot),
   ]);
-  const config = summarizeConfig(gitConfig);
-  const git = gitConfig.ok ? await readGitState(repoRoot, gitConfig.value.gitEnabled) : unknownGitState();
+  const config = summarizeConfig(configSummary);
+  const git = configSummary.ok ? await readGitState(repoRoot, configSummary.value.gitEnabled) : unknownGitState();
   const profiles = summarizeProfiles(scan);
   const warningCount = lint.counts.warning + git.errors.length + queue.errors.length;
   const errorCount = lint.counts.error + config.errors.length;
@@ -99,14 +108,23 @@ export async function getWikiStatus(repoRoot: string): Promise<StatusData> {
   };
 }
 
-type WikiGitConfigResult = Awaited<ReturnType<typeof readWikiGitConfig>>;
+type WikiConfigSummaryResult = Awaited<ReturnType<typeof readWikiConfigSummary>>;
 
-function summarizeConfig(config: WikiGitConfigResult): StatusData["config"] {
+function summarizeConfig(config: WikiConfigSummaryResult): StatusData["config"] {
   if (!config.ok) {
     return {
       path: WIKI_CONFIG_RELATIVE_PATH,
       valid: false,
       git_enabled: null,
+      agent_default: null,
+      local_agents: {
+        count: 0,
+        names: [],
+      },
+      providers: {
+        count: 0,
+        names: [],
+      },
       errors: [config.error],
     };
   }
@@ -115,6 +133,9 @@ function summarizeConfig(config: WikiGitConfigResult): StatusData["config"] {
     path: WIKI_CONFIG_RELATIVE_PATH,
     valid: true,
     git_enabled: config.value.gitEnabled,
+    agent_default: config.value.agentDefault,
+    local_agents: config.value.localAgents,
+    providers: config.value.providers,
     errors: [],
   };
 }

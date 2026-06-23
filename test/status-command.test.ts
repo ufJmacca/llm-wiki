@@ -37,6 +37,15 @@ type StatusData = {
     path: ".llm-wiki/config.yml";
     valid: boolean;
     git_enabled: boolean | null;
+    agent_default: string | null;
+    local_agents: {
+      count: number;
+      names: string[];
+    };
+    providers: {
+      count: number;
+      names: string[];
+    };
     errors: Array<{
       severity: "error";
       code: string;
@@ -284,6 +293,54 @@ describe("status command", () => {
         manifest_paths: [],
       });
       expect(JSON.stringify(payload.data)).toContain(sourceId);
+    });
+  });
+
+  it("reports configured provider and local agent names without requiring provider secrets", async () => {
+    await withTempWorkspace("llm-wiki-status-config-summary-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      delete process.env.LLM_WIKI_STATUS_PROVIDER_SECRET;
+      const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+      const config = await readFile(configPath, "utf8");
+      await writeFile(
+        configPath,
+        [
+          config.replace("default: generic", "default: codex").trimEnd(),
+          "agents:",
+          "  codex:",
+          "    type: local-exec",
+          "    command: codex",
+          "providers:",
+          "  remote:",
+          "    type: http",
+          "    endpoint: https://provider.example.invalid/proposals",
+          "    api_key_env: LLM_WIKI_STATUS_PROVIDER_SECRET",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["status", "--repo", wikiDir, "--json"]);
+      const payload = parseJsonSuccess<"status", StatusData>(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.config).toMatchObject({
+        valid: true,
+        agent_default: "codex",
+        local_agents: {
+          count: 1,
+          names: ["codex"],
+        },
+        providers: {
+          count: 1,
+          names: ["remote"],
+        },
+      });
     });
   });
 

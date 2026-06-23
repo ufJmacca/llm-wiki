@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
+import { parse } from "yaml";
 
 import { runCli } from "../src/cli.js";
 
@@ -141,12 +142,15 @@ describe("llm-wiki init command surface", () => {
   it("parses supported agent and feature options", async () => {
     // Arrange
     const parent = await mkdtemp(resolve(tmpdir(), "llm-wiki-init-options-"));
+    const codexTargetDir = resolve(parent, "codex-wiki");
+    const claudeTargetDir = resolve(parent, "claude-wiki");
+    const genericTargetDir = resolve(parent, "generic-wiki");
 
     try {
       // Act
       const codex = await runCliBuffered([
         "init",
-        resolve(parent, "codex-wiki"),
+        codexTargetDir,
         "--agent",
         "codex",
         "--obsidian",
@@ -158,13 +162,26 @@ describe("llm-wiki init command surface", () => {
       ]);
       const claude = await runCliBuffered([
         "init",
-        resolve(parent, "claude-wiki"),
+        claudeTargetDir,
         "--agent",
         "claude",
         "--no-git",
         "--json",
       ]);
-      const generic = await runCliBuffered(["init", resolve(parent, "generic-wiki"), "--agent", "generic", "--json"]);
+      const generic = await runCliBuffered(["init", genericTargetDir, "--agent", "generic", "--json"]);
+      const codexConfigSource = await readFile(resolve(codexTargetDir, ".llm-wiki/config.yml"), "utf8");
+      const codexConfig = parse(codexConfigSource) as {
+        agent: { default: string };
+        agents?: Record<string, unknown>;
+      };
+      const claudeConfig = parse(await readFile(resolve(claudeTargetDir, ".llm-wiki/config.yml"), "utf8")) as {
+        agent: { default: string };
+        agents?: Record<string, unknown>;
+      };
+      const genericConfig = parse(await readFile(resolve(genericTargetDir, ".llm-wiki/config.yml"), "utf8")) as {
+        agent: { default: string };
+        agents?: Record<string, unknown>;
+      };
 
       // Assert
       expect(codex.exitCode).toBe(0);
@@ -187,6 +204,25 @@ describe("llm-wiki init command surface", () => {
       });
       expect(parseInitJson(codex.stdout).createdPaths).toContain("CODEX.md");
       expect(parseInitJson(claude.stdout).createdPaths).toContain("CLAUDE.md");
+      expect(codexConfig).toMatchObject({
+        agent: { default: "codex" },
+        agents: {
+          codex: {
+            type: "local-exec",
+            command: "codex",
+            args: ["exec"],
+            approval_policy: "never",
+            sandbox_mode: "workspace-write",
+            output_mode: "git-diff",
+            timeout_seconds: 900,
+          },
+        },
+      });
+      expect(codexConfigSource).not.toMatch(/api[_-]?key|secret|token|password|sk-/i);
+      expect(claudeConfig).toMatchObject({ agent: { default: "claude" } });
+      expect(claudeConfig.agents).toBeUndefined();
+      expect(genericConfig).toMatchObject({ agent: { default: "generic" } });
+      expect(genericConfig.agents).toBeUndefined();
     } finally {
       await rm(parent, { force: true, recursive: true });
     }

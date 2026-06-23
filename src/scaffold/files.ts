@@ -103,7 +103,7 @@ function configContent(options: WikiScaffoldOptions): string {
   return `version: 1
 agent:
   default: ${options.agent}
-features:
+${localAgentConfigContent(options.agent)}features:
   obsidian: ${options.obsidian}
   dataview: ${options.dataview}
   git: ${options.git}
@@ -131,6 +131,24 @@ control_plane:
 privacy:
   raw_public_by_default: false
   public_requires_visibility: public
+`;
+}
+
+function localAgentConfigContent(agent: InitAgent): string {
+  if (agent !== "codex") {
+    return "";
+  }
+
+  return `agents:
+  codex:
+    type: local-exec
+    command: codex
+    args:
+      - exec
+    approval_policy: never
+    sandbox_mode: workspace-write
+    output_mode: git-diff
+    timeout_seconds: 900
 `;
 }
 

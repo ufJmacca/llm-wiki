@@ -576,6 +576,58 @@ describe("explicit provider proposal mode", () => {
     });
   });
 
+  it("keeps query provider lookup separate from configured Codex local agents and suggests agent mode", async () => {
+    await withTempWorkspace("llm-wiki-query-provider-agent-confusion-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const question = "Does --provider codex mean local Codex?";
+      const savePath = "curated/questions/provider-codex-confusion.md";
+      await initializeWiki(wikiDir);
+      const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+      const config = await readFile(configPath, "utf8");
+      await writeFile(
+        configPath,
+        [
+          config.replace("default: generic", "default: codex").trimEnd(),
+          "agents:",
+          "  codex:",
+          "    type: local-exec",
+          "    command: codex",
+          "    args:",
+          "      - exec",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const before = await readTreeSnapshot(wikiDir);
+
+      // Act
+      const result = await runCliBuffered([
+        "query",
+        question,
+        "--repo",
+        wikiDir,
+        "--save",
+        savePath,
+        "--provider",
+        "codex",
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"query">(result.stdout);
+      const after = await readTreeSnapshot(wikiDir);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "PROVIDER_CONFIG_MISSING",
+        hint: expect.stringContaining("--provider only runs HTTP providers"),
+      });
+      expect(payload.error.hint).toContain("--agent codex");
+      expect(after).toEqual(before);
+    });
+  });
+
   it("rejects provider configs that contain literal secret material", async () => {
     await withTempWorkspace("llm-wiki-provider-literal-secret-", async (workspaceDir) => {
       // Arrange

@@ -139,6 +139,20 @@ describe("explore init command", () => {
       expect(quartzConfig).toContain("pageTitle: \"LLM Wiki\"");
       expect(quartzConfig).toContain("enableSiteMap: false");
       expect(quartzConfig).toContain("enableRSS: false");
+      const layout = await readGeneratedFile(wikiDir, "quartz/quartz.layout.ts");
+      const uploadComponent = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiUploadForm.tsx");
+      expect(layout).toContain('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"');
+      expect(layout).toContain("LlmWikiUploadForm()");
+      expect(layout).toContain("llm_wiki_upload");
+      expect(layout).toContain('llm_wiki_component === "LlmWikiUploadForm"');
+      expect(uploadComponent).toContain("const LlmWikiUploadForm");
+      expect(uploadComponent).toContain("/_llm-wiki/runtime/local-daemon.json");
+      expect(uploadComponent).toContain('encType="multipart/form-data"');
+      expect(uploadComponent).toContain("x-llm-wiki-upload-token");
+      expect(uploadComponent).toContain("LlmWikiUploadForm.afterDOMLoaded = uploadFormScript");
+      expect(uploadComponent).toContain("bindLlmWikiUploadForms");
+      expect(uploadComponent).toContain('document.addEventListener(\\"nav\\", bindLlmWikiUploadForms)');
+      expect(uploadComponent).not.toContain("dangerouslySetInnerHTML");
       await expect(readGeneratedFile(wikiDir, "quartz/components/LlmWikiReviewPanel.tsx")).resolves.toContain(
         "llm-wiki-review-panel",
       );
@@ -342,6 +356,101 @@ export const defaultContentPageLayout = {
       expect(migratedConfig).toContain("enableRSS: false");
       expect(migratedConfig).not.toContain("enableSiteMap: true");
       expect(migratedConfig).not.toContain("enableRSS: true");
+    });
+  });
+
+  it("migrates the prior generated layout and upload placeholder to the upload form gate", async () => {
+    await withTempWorkspace("llm-wiki-explore-init-upgrade-upload-layout-", async (workspaceDir) => {
+      // Arrange
+      execFileMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const firstInit = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      expect(firstInit.exitCode).toBe(0);
+      const generatedLayout = await readGeneratedFile(wikiDir, "quartz/quartz.layout.ts");
+      const priorGeneratedLayout = generatedLayout
+        .replace('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"\n', "")
+        .replace(
+          `    Component.ConditionalRender({
+      component: LlmWikiUploadForm(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_upload === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiUploadForm",
+    }),
+`,
+          "",
+        );
+      await writeFile(resolve(wikiDir, "quartz/quartz.layout.ts"), priorGeneratedLayout, "utf8");
+      await writeFile(
+        resolve(wikiDir, "quartz/components/LlmWikiUploadForm.tsx"),
+        `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+
+const LlmWikiUploadForm: QuartzComponent = () => {
+  return <section class="llm-wiki-upload-form" data-llm-wiki-component="LlmWikiUploadForm" />
+}
+
+export default (() => LlmWikiUploadForm) satisfies QuartzComponentConstructor
+`,
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      const payload = parseExploreInit(result.stdout);
+      const migratedLayout = await readGeneratedFile(wikiDir, "quartz/quartz.layout.ts");
+      const migratedUploadComponent = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiUploadForm.tsx");
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      const updatedWarning = payload.warnings.find((warning) =>
+        warning.startsWith("Updated generated Quartz runtime files:"),
+      );
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/components/LlmWikiUploadForm.tsx"));
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/quartz.layout.ts"));
+      expect(migratedLayout).toContain('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"');
+      expect(migratedLayout).toContain("LlmWikiUploadForm()");
+      expect(migratedLayout).toContain("llm_wiki_upload");
+      expect(migratedUploadComponent).toContain("LlmWikiUploadForm.afterDOMLoaded = uploadFormScript");
+      expect(migratedUploadComponent).toContain("/_llm-wiki/runtime/local-daemon.json");
+    });
+  });
+
+  it("migrates the old upload form Component placeholder to the default export expected by the layout", async () => {
+    await withTempWorkspace("llm-wiki-explore-init-upgrade-old-upload-placeholder-", async (workspaceDir) => {
+      // Arrange
+      execFileMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const firstInit = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      expect(firstInit.exitCode).toBe(0);
+      await writeFile(
+        resolve(wikiDir, "quartz/components/LlmWikiUploadForm.tsx"),
+        `export function Component() {
+  return <div className="llm-wiki-upload-form" />;
+}
+`,
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      const payload = parseExploreInit(result.stdout);
+      const migratedLayout = await readGeneratedFile(wikiDir, "quartz/quartz.layout.ts");
+      const migratedUploadComponent = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiUploadForm.tsx");
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      const updatedWarning = payload.warnings.find((warning) =>
+        warning.startsWith("Updated generated Quartz runtime files:"),
+      );
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/components/LlmWikiUploadForm.tsx"));
+      expect(migratedLayout).toContain('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"');
+      expect(migratedLayout).toContain("LlmWikiUploadForm()");
+      expect(migratedUploadComponent).toContain("const LlmWikiUploadForm");
+      expect(migratedUploadComponent).toContain("export default (() => LlmWikiUploadForm)");
+      expect(migratedUploadComponent).not.toContain("export function Component()");
     });
   });
 

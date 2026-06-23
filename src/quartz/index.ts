@@ -21,6 +21,7 @@ import {
 } from "../profiles/index.js";
 import { gitCommandEnv } from "../utils/git.js";
 import { validateTextFileWriteInsideRoot, writeTextFileInsideRoot, type ScaffoldEntry } from "../utils/fs.js";
+import { buildReviewDataModel, type ReviewCategory, type ReviewDataModel } from "./reviewData.js";
 
 export { buildReviewDataModel, type ReviewDataModel } from "./reviewData.js";
 
@@ -52,6 +53,22 @@ export type QuartzSyncResult = {
 export type QuartzSyncOptions = {
   preserveContentRoot?: boolean;
 };
+
+export type QuartzLocalDaemonRuntimeMetadata =
+  | {
+      enabled: true;
+      url: string;
+      upload_path: string;
+      token_header: string;
+      upload_token: string;
+      commit_uploads: boolean;
+      auto_ingest_available: boolean;
+      updated_at?: string;
+    }
+  | {
+      enabled: false;
+      updated_at?: string;
+    };
 
 export type QuartzPublicSyncSafetyOptions = {
   lintResult?: LintResult;
@@ -121,6 +138,7 @@ const QUARTZ_GENERATED_BASE_URL_MARKER = "// llm-wiki generated baseUrl";
 export const GITHUB_PAGES_CNAME_CACHE_PATH = ".llm-wiki/cache/github-pages-CNAME";
 const QUARTZ_BUILD_HOMEPAGE_SOURCE_PATH = "curated/index.md";
 const QUARTZ_BUILD_HOMEPAGE_CONTENT_PATH = "quartz/content/index.md";
+const QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH = "quartz/content/_llm-wiki/runtime/local-daemon.json";
 const QUARTZ_PARENT_GITIGNORE_PATH = "quartz/.gitignore";
 const QUARTZ_PARENT_CONTENT_IGNORE_RULE = "content/";
 const QUARTZ_RUNTIME_IGNORE_RULE = "quartz/quartz/";
@@ -285,19 +303,31 @@ export async function syncQuartzContent(
     await removeQuartzManifests(repoRoot);
   }
   await ensureQuartzContentRoot(repoRoot);
-  const staticReviewPages = publicLike ? [] : staticReviewPageDefinitions(profile, scan);
+  const localRootMaterializedPages = publicLike
+    ? []
+    : localRootMaterializedPageDefinitions(selection.markdown, selection.excludedRawOriginals);
+  const privateExplorerPages = publicLike
+    ? []
+    : localExplorerPageDefinitions(profile, scan, selection.markdown);
   const buildHomepagePages = publicLike
     ? quartzBuildHomepageDefinitions(selection.markdown, selection.excludedRawOriginals)
     : [];
-  const generatedPages = [...staticReviewPages, ...buildHomepagePages];
+  const generatedPages = [...privateExplorerPages, ...buildHomepagePages];
   const expectedContentPaths = [
     ...selection.markdown.map((file) => `quartz/content/${file.path}`),
+    ...localRootMaterializedPages.map((page) => page.path),
     ...generatedPages.map((page) => page.path),
   ];
-  warnings.push(...await ensureQuartzContentIgnoredByGit(repoRoot, expectedContentPaths));
+  const ignoreCheckedContentPaths = publicLike
+    ? expectedContentPaths
+    : [...expectedContentPaths, QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH];
+  warnings.push(...await ensureQuartzContentIgnoredByGit(repoRoot, ignoreCheckedContentPaths));
 
   const previousContentPaths = preserveContentRoot ? await readQuartzManifestContentPaths(repoRoot, profileName) : [];
-  const manifestFiles = await materializeMarkdown(repoRoot, selection.markdown, selection.excludedRawOriginals);
+  const manifestFiles = [
+    ...await materializeMarkdown(repoRoot, selection.markdown, selection.excludedRawOriginals),
+    ...await writeMaterializedPages(repoRoot, localRootMaterializedPages),
+  ].sort(compareQuartzManifestFiles);
   const generatedFiles = await writeGeneratedPages(repoRoot, generatedPages);
   if (previousContentPaths.length > 0) {
     await removeStaleQuartzContent(repoRoot, previousContentPaths, new Set(expectedContentPaths));
@@ -339,6 +369,29 @@ export async function syncQuartzContent(
     },
     warnings,
   };
+}
+
+export async function writeLocalDaemonRuntimeMetadata(
+  repoRoot: string,
+  metadata: QuartzLocalDaemonRuntimeMetadata,
+): Promise<void> {
+  const content = `${JSON.stringify(
+    {
+      ...metadata,
+      updated_at: metadata.updated_at ?? new Date().toISOString(),
+    },
+    null,
+    2,
+  )}\n`;
+  const writeResult = await writeTextFileInsideRoot(repoRoot, QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH, content);
+  if (!writeResult.ok) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to write local daemon runtime metadata.",
+      path: QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH,
+      hint: writeResult.error.hint,
+    });
+  }
 }
 
 async function readQuartzManifestContentPaths(
@@ -628,6 +681,43 @@ async function materializeMarkdown(
   return manifestFiles.sort((left, right) => left.source_path.localeCompare(right.source_path));
 }
 
+async function writeMaterializedPages(
+  repoRoot: string,
+  pages: readonly StaticMaterializedPage[],
+): Promise<QuartzManifestFile[]> {
+  const manifestFiles: QuartzManifestFile[] = [];
+  for (const page of pages) {
+    const writeResult = await writeTextFileInsideRoot(repoRoot, page.path, page.content);
+    if (!writeResult.ok) {
+      throw new QuartzOperationError({
+        code: "QUARTZ_WRITE_FAILED",
+        message: `Failed to materialize Quartz content: ${page.path}.`,
+        path: page.path,
+        hint: writeResult.error.hint,
+      });
+    }
+
+    manifestFiles.push(manifestFileForContent(page.source, page.path, page.content));
+  }
+
+  return manifestFiles.sort(compareQuartzManifestFiles);
+}
+
+function manifestFileForContent(file: RepoMarkdownFile, contentPath: string, content: string): QuartzManifestFile {
+  return {
+    source_path: file.path,
+    content_path: contentPath,
+    content_hash: computeContentHash(content),
+    page_type: stringFrontmatterValue(file, "type"),
+    title: stringFrontmatterValue(file, "title"),
+    visibility: stringFrontmatterValue(file, "visibility"),
+  };
+}
+
+function compareQuartzManifestFiles(left: QuartzManifestFile, right: QuartzManifestFile): number {
+  return left.content_path.localeCompare(right.content_path) || left.source_path.localeCompare(right.source_path);
+}
+
 function quartzMaterializedMarkdownContent(file: RepoMarkdownFile, excludedRawOriginals: ReadonlySet<string>): string {
   if (!isRawSourceCard(file) || excludedRawOriginals.size === 0) {
     return file.content;
@@ -657,19 +747,142 @@ type StaticReviewPage = {
   content: string;
 };
 
-function staticReviewPageDefinitions(profile: WikiProfile, scan: RepoScan): StaticReviewPage[] {
+type StaticMaterializedPage = StaticReviewPage & {
+  source: RepoMarkdownFile;
+};
+
+function localExplorerPageDefinitions(
+  profile: WikiProfile,
+  scan: RepoScan,
+  files: readonly RepoMarkdownFile[],
+): StaticReviewPage[] {
+  const reviewData = buildReviewDataModel(scan, { profile });
+  const fallbackHomepage = localGeneratedHomepageDefinition(files);
+
   return [
+    ...(fallbackHomepage === null ? [] : [fallbackHomepage]),
+    {
+      path: "quartz/content/_llm-wiki/upload.md",
+      title: "Upload",
+      content: uploadPageContent(),
+    },
+    {
+      path: "quartz/content/_llm-wiki/review/overview.md",
+      title: "Review Overview",
+      content: reviewOverviewContent(reviewData),
+    },
     {
       path: "quartz/content/_llm-wiki/review/profile-summary.md",
       title: "Profile Summary",
-      content: profileSummaryContent(profile, scan),
+      content: profileSummaryContent(reviewData, scan),
     },
     {
       path: "quartz/content/_llm-wiki/review/source-queue.md",
       title: "Source Queue",
-      content: sourceQueueContent(scan),
+      content: sourceQueueContent(reviewData),
+    },
+    {
+      path: "quartz/content/_llm-wiki/review/recent-ingests.md",
+      title: "Recent Ingests",
+      content: reviewCategoryContent({
+        title: "Recent Ingests",
+        component: "LlmWikiReviewPanel",
+        category: reviewData.recent_ingests,
+      }),
+    },
+    {
+      path: "quartz/content/_llm-wiki/review/needs-review.md",
+      title: "Needs Review",
+      content: reviewCategoryContent({
+        title: "Needs Review",
+        component: "LlmWikiReviewPanel",
+        category: reviewData.needs_review,
+      }),
+    },
+    {
+      path: "quartz/content/_llm-wiki/review/contradictions.md",
+      title: "Contradictions",
+      content: reviewCategoryContent({
+        title: "Contradictions",
+        component: "LlmWikiReviewPanel",
+        category: reviewData.contradictions,
+      }),
+    },
+    {
+      path: "quartz/content/_llm-wiki/review/orphans.md",
+      title: "Orphans",
+      content: reviewCategoryContent({
+        title: "Orphans",
+        component: "LlmWikiReviewPanel",
+        category: reviewData.orphans,
+      }),
+    },
+    {
+      path: "quartz/content/_llm-wiki/review/stale-pages.md",
+      title: "Stale Pages",
+      content: reviewCategoryContent({
+        title: "Stale Pages",
+        component: "LlmWikiReviewPanel",
+        category: reviewData.stale_pages,
+      }),
+    },
+    {
+      path: "quartz/content/_llm-wiki/review/visibility-warnings.md",
+      title: "Visibility Warnings",
+      content: reviewCategoryContent({
+        title: "Visibility Warnings",
+        component: "LlmWikiVisibilityWarning",
+        category: reviewData.visibility_warnings,
+      }),
+    },
+    {
+      path: "quartz/content/_llm-wiki/review/status.md",
+      title: "Review Status",
+      content: reviewStatusContent(reviewData),
     },
   ];
+}
+
+function localRootMaterializedPageDefinitions(
+  files: readonly RepoMarkdownFile[],
+  excludedRawOriginals: readonly string[],
+): StaticMaterializedPage[] {
+  if (files.some(materializesToQuartzBuildHomepage)) {
+    return [];
+  }
+
+  const source = files.find((file) => file.path === QUARTZ_BUILD_HOMEPAGE_SOURCE_PATH);
+  if (source !== undefined) {
+    return [
+      {
+        source,
+        path: QUARTZ_BUILD_HOMEPAGE_CONTENT_PATH,
+        title: stringFrontmatterValue(source, "title") ?? "Index",
+        content: quartzMaterializedMarkdownContent(source, new Set(excludedRawOriginals)),
+      },
+    ];
+  }
+
+  return [];
+}
+
+function localGeneratedHomepageDefinition(files: readonly RepoMarkdownFile[]): StaticReviewPage | null {
+  if (
+    files.some(materializesToQuartzBuildHomepage) ||
+    files.some((file) => file.path === QUARTZ_BUILD_HOMEPAGE_SOURCE_PATH)
+  ) {
+    return null;
+  }
+
+  return {
+    path: QUARTZ_BUILD_HOMEPAGE_CONTENT_PATH,
+    title: "LLM Wiki Home",
+    content: generatedLocalHomeContent(),
+  };
+}
+
+function materializesToQuartzBuildHomepage(file: RepoMarkdownFile): boolean {
+  return `quartz/content/${file.path}` === QUARTZ_BUILD_HOMEPAGE_CONTENT_PATH;
 }
 
 function quartzBuildHomepageDefinitions(
@@ -1481,11 +1694,15 @@ function appendGitignoreLine(content: string, line: string): string {
   return `${content.endsWith("\n") ? content : `${content}\n`}${line}\n`;
 }
 
-async function ensureQuartzContentIgnoredByGit(repoRoot: string, contentPaths: readonly string[]): Promise<string[]> {
+async function ensureQuartzContentIgnoredByGit(
+  repoRoot: string,
+  contentPaths: readonly string[],
+  gitProbePaths: readonly string[] = contentPaths,
+): Promise<string[]> {
   const warnings = await removeGeneratedQuartzContentGitignore(repoRoot);
   await assertQuartzContentGitignoreAllowsSyncedContent(repoRoot, contentPaths);
 
-  const unsafePath = await firstUnignoredGitPath(repoRoot, contentPaths);
+  const unsafePath = await firstUnignoredGitPath(repoRoot, gitProbePaths);
   if (unsafePath === null) {
     return warnings;
   }
@@ -1505,7 +1722,7 @@ async function ensureQuartzContentIgnoredByGit(repoRoot: string, contentPaths: r
     });
   }
 
-  const repairedUnsafePath = await firstUnignoredGitPath(repoRoot, contentPaths);
+  const repairedUnsafePath = await firstUnignoredGitPath(repoRoot, gitProbePaths);
   if (repairedUnsafePath !== null) {
     throw new QuartzOperationError({
       code: "QUARTZ_CONTENT_UNSAFE",
@@ -1825,7 +2042,12 @@ async function shouldMigrateQuartzRuntimeEntry(repoRoot: string, entry: Scaffold
         content === quartzConfigContent({ enableContentIndexFeeds: true })
       );
     case "quartz/quartz.layout.ts":
-      return content === OLD_PLACEHOLDER_QUARTZ_LAYOUT;
+      return content === OLD_PLACEHOLDER_QUARTZ_LAYOUT || content === quartzLayoutContentBeforeUploadForm();
+    case "quartz/components/LlmWikiUploadForm.tsx":
+      return (
+        content === componentPlaceholder("LlmWikiUploadForm", "llm-wiki-upload-form") ||
+        content === oldComponentPlaceholder("llm-wiki-upload-form")
+      );
     default:
       return false;
   }
@@ -1882,11 +2104,11 @@ function npmCommand(): "npm" | "npm.cmd" {
 function quartzRuntimeEntries(): ScaffoldEntry[] {
   return [
     { path: "quartz/README.md", content: quartzReadmeContent() },
-    { path: "quartz/components/LlmWikiQueueDashboard.tsx", content: componentPlaceholder("llm-wiki-queue-dashboard") },
-    { path: "quartz/components/LlmWikiReviewPanel.tsx", content: componentPlaceholder("llm-wiki-review-panel") },
-    { path: "quartz/components/LlmWikiSourceBadge.tsx", content: componentPlaceholder("llm-wiki-source-badge") },
-    { path: "quartz/components/LlmWikiUploadForm.tsx", content: componentPlaceholder("llm-wiki-upload-form") },
-    { path: "quartz/components/LlmWikiVisibilityWarning.tsx", content: componentPlaceholder("llm-wiki-visibility-warning") },
+    { path: "quartz/components/LlmWikiQueueDashboard.tsx", content: componentPlaceholder("LlmWikiQueueDashboard", "llm-wiki-queue-dashboard") },
+    { path: "quartz/components/LlmWikiReviewPanel.tsx", content: componentPlaceholder("LlmWikiReviewPanel", "llm-wiki-review-panel") },
+    { path: "quartz/components/LlmWikiSourceBadge.tsx", content: componentPlaceholder("LlmWikiSourceBadge", "llm-wiki-source-badge") },
+    { path: "quartz/components/LlmWikiUploadForm.tsx", content: uploadFormComponentContent() },
+    { path: "quartz/components/LlmWikiVisibilityWarning.tsx", content: componentPlaceholder("LlmWikiVisibilityWarning", "llm-wiki-visibility-warning") },
     { path: "quartz/package.json", content: quartzPackageJsonContent() },
     { path: "quartz/quartz.config.ts", content: quartzConfigContent() },
     { path: "quartz/quartz.layout.ts", content: quartzLayoutContent() },
@@ -2011,6 +2233,79 @@ export default config
 }
 
 function quartzLayoutContent(): string {
+  return `import { PageLayout, SharedLayout } from "./quartz/cfg"
+import * as Component from "./quartz/components"
+import LlmWikiUploadForm from "./components/LlmWikiUploadForm"
+
+export const sharedPageComponents: SharedLayout = {
+  head: Component.Head(),
+  header: [],
+  afterBody: [],
+  footer: Component.Footer({
+    links: {},
+  }),
+}
+
+export const defaultContentPageLayout = {
+  beforeBody: [
+    Component.ConditionalRender({
+      component: Component.Breadcrumbs(),
+      condition: (page) => page.fileData.slug !== "index",
+    }),
+    Component.ArticleTitle(),
+    Component.ContentMeta(),
+    Component.TagList(),
+    Component.ConditionalRender({
+      component: LlmWikiUploadForm(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_upload === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiUploadForm",
+    }),
+  ],
+  left: [
+    Component.PageTitle(),
+    Component.MobileOnly(Component.Spacer()),
+    Component.Flex({
+      components: [
+        {
+          Component: Component.Search(),
+          grow: true,
+        },
+        { Component: Component.Darkmode() },
+        { Component: Component.ReaderMode() },
+      ],
+    }),
+    Component.Explorer(),
+  ],
+  right: [
+    Component.Graph(),
+    Component.DesktopOnly(Component.TableOfContents()),
+    Component.Backlinks(),
+  ],
+} satisfies PageLayout
+
+export const defaultListPageLayout: PageLayout = {
+  beforeBody: [Component.Breadcrumbs(), Component.ArticleTitle(), Component.ContentMeta()],
+  left: [
+    Component.PageTitle(),
+    Component.MobileOnly(Component.Spacer()),
+    Component.Flex({
+      components: [
+        {
+          Component: Component.Search(),
+          grow: true,
+        },
+        { Component: Component.Darkmode() },
+      ],
+    }),
+    Component.Explorer(),
+  ],
+  right: [],
+}
+`;
+}
+
+function quartzLayoutContentBeforeUploadForm(): string {
   return `import { PageLayout, SharedLayout } from "./quartz/cfg"
 import * as Component from "./quartz/components"
 
@@ -2143,10 +2438,235 @@ net.Server.prototype.listen = function listenWithLlmWikiLoopback(...args) {
 `;
 }
 
-function componentPlaceholder(className: string): string {
+function componentPlaceholder(componentName: string, className: string): string {
+  return `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+
+const ${componentName}: QuartzComponent = () => {
+  return <section class="${className}" data-llm-wiki-component="${componentName}" />
+}
+
+export default (() => ${componentName}) satisfies QuartzComponentConstructor
+`;
+}
+
+function oldComponentPlaceholder(className: string): string {
   return `export function Component() {
   return <div className="${className}" />;
 }
+`;
+}
+
+function uploadFormComponentContent(): string {
+  const clientScript = `const bindLlmWikiUploadForms = () => {
+  for (const root of document.querySelectorAll("[data-llm-wiki-upload-form]")) {
+    if (!(root instanceof HTMLElement) || root.dataset.llmWikiUploadBound === "true") continue;
+
+    const form = root.querySelector("form");
+    const status = root.querySelector("[data-upload-status]");
+    const details = root.querySelector("[data-upload-details]");
+    if (!(form instanceof HTMLFormElement) || !(status instanceof HTMLElement) || !(details instanceof HTMLElement)) continue;
+
+    root.dataset.llmWikiUploadBound = "true";
+    let daemon = null;
+    const controls = Array.from(form.elements).filter((element) => "disabled" in element);
+    const setControlsDisabled = (disabled) => {
+      for (const control of controls) {
+        control.disabled = disabled;
+      }
+    };
+    const setStatus = (message) => {
+      status.textContent = message;
+    };
+    const clearDetails = () => {
+      details.replaceChildren();
+    };
+    const addDetail = (label, value) => {
+      if (value === undefined || value === null || value === "") return;
+      const term = document.createElement("dt");
+      term.textContent = label;
+      const description = document.createElement("dd");
+      description.textContent = String(value);
+      details.append(term, description);
+    };
+    const showDetails = (rows) => {
+      clearDetails();
+      for (const [label, value] of rows) {
+        addDetail(label, value);
+      }
+    };
+    const requireValue = (value, message) => {
+      const text = String(value ?? "").trim();
+      if (text === "") {
+        throw new Error(message);
+      }
+      return text;
+    };
+    const showError = (error, fallback) => {
+      const shown = error && typeof error === "object" ? error : { code: "UPLOAD_FAILED", message: fallback };
+      setStatus(String(shown.message || fallback));
+      showDetails([
+        ["Code", shown.code],
+        ["Message", shown.message],
+        ["Hint", shown.hint],
+        ["Path", shown.path],
+      ]);
+    };
+
+    async function loadDaemonMetadata() {
+      try {
+        const response = await fetch("/_llm-wiki/runtime/local-daemon.json", { cache: "no-store" });
+        if (!response.ok) return null;
+        return await response.json();
+      } catch {
+        return null;
+      }
+    }
+
+    async function initialize() {
+      const metadata = await loadDaemonMetadata();
+      const tokenHeader = typeof metadata?.token_header === "string" ? metadata.token_header : "x-llm-wiki-upload-token";
+      if (
+        metadata?.enabled !== true ||
+        typeof metadata.url !== "string" ||
+        typeof metadata.upload_path !== "string" ||
+        typeof metadata.upload_token !== "string"
+      ) {
+        daemon = null;
+        setControlsDisabled(true);
+        setStatus("Local upload daemon is disabled.");
+        showDetails([
+          ["Hint", "Run llm-wiki explore serve --profile local --with-daemon"],
+        ]);
+        return;
+      }
+
+      daemon = { ...metadata, token_header: tokenHeader };
+      setControlsDisabled(false);
+      setStatus("Local upload daemon is ready.");
+      showDetails([
+        ["Endpoint", String(daemon.url) + String(daemon.upload_path)],
+        ["Token header", daemon.token_header],
+      ]);
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (daemon === null) {
+        showError({ code: "DAEMON_UNAVAILABLE", message: "Local upload daemon metadata is unavailable." }, "Upload daemon unavailable.");
+        return;
+      }
+
+      const formData = new FormData(form);
+      const mode = String(formData.get("mode") || "file");
+      const upload = new FormData();
+      const title = String(formData.get("title") || "").trim();
+
+      try {
+        if (title !== "") upload.set("title", title);
+        if (mode === "file") {
+          const fileInput = form.querySelector('input[name="file"]');
+          const file = fileInput instanceof HTMLInputElement ? fileInput.files?.[0] : null;
+          if (!(file instanceof File)) throw new Error("Choose a file to upload.");
+          upload.set("file", file, file.name);
+        } else if (mode === "text") {
+          upload.set("title", requireValue(title, "Title is required for pasted text uploads."));
+          upload.set("text", requireValue(formData.get("text"), "Paste text before uploading."));
+        } else if (mode === "url") {
+          upload.set("url", requireValue(formData.get("url"), "Enter a URL before uploading."));
+        } else {
+          throw new Error("Choose file, text, or URL upload mode.");
+        }
+      } catch (error) {
+        showError({ code: "UPLOAD_FORM_INVALID", message: error instanceof Error ? error.message : String(error) }, "Upload form is invalid.");
+        return;
+      }
+
+      setControlsDisabled(true);
+      setStatus("Uploading...");
+      clearDetails();
+
+      try {
+        const endpoint = String(daemon.url).replace(/\\/$/, "") + String(daemon.upload_path);
+        const headers = {};
+        headers[String(daemon.token_header)] = String(daemon.upload_token);
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers,
+          body: upload,
+        });
+        const body = await response.json().catch(() => null);
+        if (!response.ok || body?.ok !== true) {
+          showError(body?.error, "Upload failed.");
+          return;
+        }
+
+        const data = body.data || {};
+        setStatus("Upload queued.");
+        showDetails([
+          ["Title", data.title],
+          ["Source ID", data.source_id],
+          ["Source kind", data.source_kind],
+          ["Queue status", data.queue_status],
+          ["Source card", data.source_card_path],
+          ["Original", data.original_path],
+          ["Ingest", data.source_id ? "llm-wiki ingest " + data.source_id : ""],
+          ["Auto ingest", daemon.auto_ingest_available === true && data.source_id ? "llm-wiki ingest " + data.source_id + " --auto" : ""],
+        ]);
+      } catch (error) {
+        showError({ code: "DAEMON_UNAVAILABLE", message: error instanceof Error ? error.message : String(error) }, "Upload daemon unavailable.");
+      } finally {
+        setControlsDisabled(false);
+      }
+    });
+
+    void initialize();
+  }
+};
+
+document.addEventListener("nav", bindLlmWikiUploadForms);
+bindLlmWikiUploadForms();`;
+
+  return `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+
+const uploadFormScript = ${JSON.stringify(clientScript)}
+
+const LlmWikiUploadForm: QuartzComponent = () => {
+  return (
+    <section class="llm-wiki-upload-form" data-llm-wiki-upload-form="true">
+      <form encType="multipart/form-data">
+        <fieldset>
+          <legend>Source type</legend>
+          <label><input type="radio" name="mode" value="file" checked disabled /> File</label>
+          <label><input type="radio" name="mode" value="text" disabled /> Text</label>
+          <label><input type="radio" name="mode" value="url" disabled /> URL</label>
+        </fieldset>
+        <label>
+          Title
+          <input name="title" type="text" autoComplete="off" disabled />
+        </label>
+        <label>
+          File
+          <input name="file" type="file" disabled />
+        </label>
+        <label>
+          Text
+          <textarea name="text" rows={8} disabled />
+        </label>
+        <label>
+          URL
+          <input name="url" type="url" inputMode="url" disabled />
+        </label>
+        <button type="submit" disabled>Upload</button>
+      </form>
+      <p data-upload-status="">Checking local upload daemon...</p>
+      <dl data-upload-details=""></dl>
+    </section>
+  )
+}
+
+LlmWikiUploadForm.afterDOMLoaded = uploadFormScript
+
+export default (() => LlmWikiUploadForm) satisfies QuartzComponentConstructor
 `;
 }
 
@@ -2169,49 +2689,149 @@ llm-wiki explore sync --profile local
 `;
 }
 
-function profileSummaryContent(profile: WikiProfile, scan: RepoScan): string {
-  return `---
-type: dashboard
-title: Profile Summary
-visibility: private
-source_ids: []
----
+function generatedLocalHomeContent(): string {
+  return `${generatedPageFrontmatter("LLM Wiki Home", "LlmWikiReviewPanel")}# LLM Wiki Home
 
-# Profile Summary
+Start from the generated Explorer surfaces below.
+
+- [[curated/home|Curated home]]
+- [[_llm-wiki/upload|Upload]]
+- [[_llm-wiki/review/overview|Review overview]]
+- [[_llm-wiki/review/status|Status]]
+- [[_llm-wiki/review/source-queue|Source queue]]
+`;
+}
+
+function uploadPageContent(): string {
+  return `${generatedPageFrontmatter("Upload", "LlmWikiUploadForm", ["llm_wiki_upload: true"])}# Upload
+`;
+}
+
+function reviewOverviewContent(reviewData: ReviewDataModel): string {
+  return `${generatedPageFrontmatter("Review Overview", "LlmWikiReviewPanel")}# Review Overview
+
+## Status
+
+| Metric | Value |
+|---|---:|
+| Queue total | ${reviewData.queue.counts.total} |
+| Queued | ${reviewData.queue.counts.queued} |
+| Ingesting | ${reviewData.queue.counts.ingesting} |
+| Blocked | ${reviewData.queue.counts.blocked} |
+| Completed | ${reviewData.queue.counts.completed} |
+
+## Review Surfaces
+
+| Surface | Count | Page |
+|---|---:|---|
+| Source queue | ${reviewData.queue.counts.total} | [[source-queue|Source queue]] |
+| Recent ingests | ${reviewData.recent_ingests.count} | [[recent-ingests|Recent ingests]] |
+| Needs review | ${reviewData.needs_review.count} | [[needs-review|Needs review]] |
+| Contradictions | ${reviewData.contradictions.count} | [[contradictions|Contradictions]] |
+| Orphans | ${reviewData.orphans.count} | [[orphans|Orphans]] |
+| Stale pages | ${reviewData.stale_pages.count} | [[stale-pages|Stale pages]] |
+| Visibility warnings | ${reviewData.visibility_warnings.count} | [[visibility-warnings|Visibility warnings]] |
+| Profile summary | ${reviewData.profile === null ? 0 : 1} | [[profile-summary|Profile summary]] |
+| Status | ${reviewData.queue.counts.total} | [[status|Status]] |
+`;
+}
+
+function reviewStatusContent(reviewData: ReviewDataModel): string {
+  return `${generatedPageFrontmatter("Review Status", "LlmWikiReviewPanel")}# Review Status
+
+| Status | Count |
+|---|---:|
+| Queued | ${reviewData.queue.counts.queued} |
+| Ingesting | ${reviewData.queue.counts.ingesting} |
+| Blocked | ${reviewData.queue.counts.blocked} |
+| Ingested | ${reviewData.queue.counts.completed} |
+
+Generated at: ${reviewData.generated_at}
+`;
+}
+
+function profileSummaryContent(reviewData: ReviewDataModel, scan: RepoScan): string {
+  const profile = reviewData.profile;
+
+  return `${generatedPageFrontmatter("Profile Summary", "LlmWikiReviewPanel")}# Profile Summary
 
 | Field | Value |
 |---|---|
-| Profile | ${escapeTableCell(profile.requestedName)} |
-| Source profile | ${escapeTableCell(profile.sourceName)} |
+| Profile | ${escapeTableCell(profile?.requested_name ?? "unknown")} |
+| Source profile | ${escapeTableCell(profile?.source_name ?? "unknown")} |
+| Include private | ${profile?.include_private === true ? "true" : "false"} |
+| Required visibility | ${escapeTableCell(profile?.required_visibility ?? "")} |
 | Markdown pages | ${scan.markdown.length} |
 | Queue items | ${scan.queueItems.length} |
 | Raw source cards | ${scan.sourceCards.length} |
 `;
 }
 
-function sourceQueueContent(scan: RepoScan): string {
-  const rows = scan.queueItems.map((queueFile) =>
+function sourceQueueContent(reviewData: ReviewDataModel): string {
+  const rows = reviewData.queue.items.map((item) =>
     [
-      queueFile.item.source_id,
-      queueFile.item.title,
-      queueFile.item.status,
-      queueFile.item.kind,
-      queueFile.item.path,
+      item.source_id,
+      item.title,
+      item.status,
+      item.source_kind,
+      item.visibility ?? "",
+      item.source_card_path ?? "",
+      item.queue_path,
+      item.original_path ?? "",
     ].map((value) => escapeTableCell(String(value))).join(" | "),
   );
 
+  return `${generatedPageFrontmatter("Source Queue", "LlmWikiQueueDashboard")}# Source Queue
+
+| Status | Count |
+|---|---:|
+| Total | ${reviewData.queue.counts.total} |
+| Queued | ${reviewData.queue.counts.queued} |
+| Ingesting | ${reviewData.queue.counts.ingesting} |
+| Blocked | ${reviewData.queue.counts.blocked} |
+| Ingested | ${reviewData.queue.counts.completed} |
+
+| Source ID | Title | Status | Kind | Visibility | Source card | Queue file | Original |
+|---|---|---|---|---|---|---|---|
+${rows.map((row) => `| ${row} |`).join("\n")}
+`;
+}
+
+function reviewCategoryContent(options: {
+  title: string;
+  component: string;
+  category: ReviewCategory<unknown>;
+}): string {
+  return `${generatedPageFrontmatter(options.title, options.component)}# ${options.title}
+
+Count: ${options.category.count}
+
+${reviewItemsJson(options.category.items)}
+`;
+}
+
+function reviewItemsJson(items: readonly unknown[]): string {
+  if (items.length === 0) {
+    return "No items.\n";
+  }
+
+  return `\`\`\`json
+${JSON.stringify(items, null, 2)}
+\`\`\`
+`;
+}
+
+function generatedPageFrontmatter(title: string, component: string, extraFields: readonly string[] = []): string {
+  const extraFrontmatter = extraFields.length === 0 ? "" : `${extraFields.join("\n")}\n`;
+
   return `---
 type: dashboard
-title: Source Queue
+title: ${title}
 visibility: private
 source_ids: []
----
+llm_wiki_component: ${component}
+${extraFrontmatter}---
 
-# Source Queue
-
-| Source ID | Title | Status | Kind | Source card |
-|---|---|---|---|---|
-${rows.map((row) => `| ${row} |`).join("\n")}
 `;
 }
 

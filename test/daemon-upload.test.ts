@@ -347,6 +347,91 @@ describe("local upload daemon", () => {
     });
   });
 
+  it("handles loopback browser CORS preflight and exposes structured upload errors", async () => {
+    await withTempWorkspace("llm-wiki-daemon-cors-loopback-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const origin = "http://127.0.0.1:8080";
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+      try {
+        const form = new FormData();
+        form.set("title", "CORS Upload");
+        form.set("text", "CORS upload body.\n");
+
+        // Act
+        const preflight = await fetch(`${daemon.url}/api/raw-upload`, {
+          method: "OPTIONS",
+          headers: {
+            Origin: origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": UPLOAD_TOKEN_HEADER,
+          },
+        });
+        const rejectedUpload = await fetch(`${daemon.url}/api/raw-upload`, {
+          method: "POST",
+          headers: {
+            Origin: origin,
+            [UPLOAD_TOKEN_HEADER]: "invalid-token",
+          },
+          body: form,
+        });
+        const rejectedBody = await rejectedUpload.json() as UploadFailureEnvelope;
+
+        // Assert
+        expect(preflight.status).toBe(204);
+        expect(preflight.headers.get("access-control-allow-origin")).toBe(origin);
+        expect(preflight.headers.get("access-control-allow-methods")).toBe("POST, OPTIONS");
+        expect(preflight.headers.get("access-control-allow-headers")).toContain(UPLOAD_TOKEN_HEADER);
+        expect(rejectedUpload.status).toBe(403);
+        expect(rejectedUpload.headers.get("access-control-allow-origin")).toBe(origin);
+        expect(rejectedBody).toMatchObject({
+          ok: false,
+          error: {
+            code: "UPLOAD_CSRF_TOKEN_INVALID",
+          },
+        });
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("does not approve non-loopback browser origins", async () => {
+    await withTempWorkspace("llm-wiki-daemon-cors-non-loopback-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+      try {
+        // Act
+        const preflight = await fetch(`${daemon.url}/api/raw-upload`, {
+          method: "OPTIONS",
+          headers: {
+            Origin: "https://example.com",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": UPLOAD_TOKEN_HEADER,
+          },
+        });
+        const body = await preflight.json() as UploadFailureEnvelope;
+
+        // Assert
+        expect(preflight.status).toBe(403);
+        expect(preflight.headers.get("access-control-allow-origin")).toBeNull();
+        expect(body).toMatchObject({
+          ok: false,
+          error: {
+            code: "UPLOAD_ORIGIN_NOT_ALLOWED",
+          },
+        });
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
   it("captures multipart text notes and reports duplicate uploads without writing new artifacts", async () => {
     await withTempWorkspace("llm-wiki-daemon-text-duplicate-", async (workspaceDir) => {
       // Arrange

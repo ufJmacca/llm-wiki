@@ -29,6 +29,8 @@ const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_UPLOAD_FIELD_BYTES = MAX_UPLOAD_BYTES;
 const MAX_UPLOAD_FIELDS = 20;
 const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+const CORS_ALLOWED_METHODS = "POST, OPTIONS";
+const CORS_ALLOWED_HEADERS = `${UPLOAD_TOKEN_HEADER}, content-type`;
 const repoUploadQueues = new Map<string, Promise<void>>();
 
 export type UploadDaemon = {
@@ -83,6 +85,7 @@ export type UploadDaemonErrorCode =
   | "UPLOAD_METHOD_NOT_ALLOWED"
   | "UPLOAD_MULTIPART_INVALID"
   | "UPLOAD_NOT_FOUND"
+  | "UPLOAD_ORIGIN_NOT_ALLOWED"
   | "UPLOAD_PAYLOAD_INVALID"
   | "UPLOAD_TOO_LARGE"
   | SourceCaptureError["code"];
@@ -182,6 +185,16 @@ type UploadRequestOptions = {
   uploadToken: string;
   pendingUploadCommits: PendingUploadCommits;
 };
+
+type CorsApproval =
+  | {
+      approved: true;
+      origin: string | null;
+    }
+  | {
+      approved: false;
+      origin: string;
+    };
 
 type UploadWorkSuccess = {
   capture: SourceCaptureSuccess;
@@ -289,6 +302,20 @@ async function handleDaemonRequest(
   response: ServerResponse,
 ): Promise<void> {
   try {
+    const cors = approveCorsOrigin(request);
+    if (!cors.approved) {
+      writeJson(response, 403, failureEnvelope(new UploadDaemonError({
+        code: "UPLOAD_ORIGIN_NOT_ALLOWED",
+        message: "Upload daemon only accepts loopback browser origins.",
+        path: "origin",
+        hint: "Serve the local Explorer from 127.0.0.1, localhost, or [::1].",
+        statusCode: 403,
+      })));
+      return;
+    }
+
+    applyCorsHeaders(response, cors.origin);
+
     if (request.url?.split("?")[0] !== RAW_UPLOAD_PATH) {
       writeJson(response, 404, failureEnvelope(new UploadDaemonError({
         code: "UPLOAD_NOT_FOUND",
@@ -297,6 +324,12 @@ async function handleDaemonRequest(
         hint: "Send multipart uploads to /api/raw-upload.",
         statusCode: 404,
       })));
+      return;
+    }
+
+    if (request.method === "OPTIONS") {
+      response.writeHead(204);
+      response.end();
       return;
     }
 
@@ -349,6 +382,50 @@ async function handleDaemonRequest(
         });
     writeJson(response, daemonError.statusCode, failureEnvelope(daemonError));
   }
+}
+
+function approveCorsOrigin(request: IncomingMessage): CorsApproval {
+  const origin = request.headers.origin;
+  if (typeof origin !== "string" || origin.trim() === "") {
+    return {
+      approved: true,
+      origin: null,
+    };
+  }
+
+  return isAllowedLoopbackOrigin(origin)
+    ? {
+        approved: true,
+        origin,
+      }
+    : {
+        approved: false,
+        origin,
+      };
+}
+
+function isAllowedLoopbackOrigin(origin: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return false;
+  }
+
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return parsed.protocol === "http:" && LOCAL_HOSTS.has(hostname) && parsed.port !== "";
+}
+
+function applyCorsHeaders(response: ServerResponse, origin: string | null): void {
+  if (origin === null) {
+    return;
+  }
+
+  response.setHeader("Access-Control-Allow-Origin", origin);
+  response.setHeader("Access-Control-Allow-Methods", CORS_ALLOWED_METHODS);
+  response.setHeader("Access-Control-Allow-Headers", CORS_ALLOWED_HEADERS);
+  response.setHeader("Access-Control-Max-Age", "600");
+  response.setHeader("Vary", "Origin");
 }
 
 async function runInRepoUploadQueue<T>(repoRoot: string, work: () => Promise<T>): Promise<T> {

@@ -6,6 +6,8 @@ import { promisify } from "node:util";
 import { stringify } from "yaml";
 import { describe, expect, it } from "vitest";
 
+import { syncQuartzContent } from "../src/quartz/index.js";
+import { computeContentHash } from "../src/scanner/index.js";
 import { parseInitJson, pathExists, readGeneratedFile, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
 
 const execFileAsync = promisify(execFile);
@@ -81,6 +83,24 @@ type SourceCaptureData = {
     queue_path: string;
   };
   created_paths: string[];
+};
+
+type ReviewSourceFixture = {
+  sourceId: string;
+  title: string;
+  status: "queued" | "ingesting" | "ingested" | "blocked";
+  sourceKind: "file" | "text" | "url";
+  capturedAt: string;
+  updatedAt: string | null;
+  sourceCardPath: string;
+  queuePath: string;
+  originalPath: string;
+  contentHash: string;
+};
+
+type ReviewSourceFixtureWriteOptions = {
+  sourceCard?: Record<string, unknown>;
+  queue?: Record<string, unknown>;
 };
 
 async function initializeWiki(targetDir: string): Promise<void> {
@@ -182,6 +202,86 @@ async function writeCuratedPage(
   await writeFile(absolutePath, `---\n${stringify(frontmatter).trimEnd()}\n---\n\n${body}`, "utf8");
 }
 
+function reviewSourceFixture(
+  sourceId: string,
+  title: string,
+  status: ReviewSourceFixture["status"],
+  sourceKind: ReviewSourceFixture["sourceKind"],
+  capturedAt: string,
+  updatedAt: string | null = null,
+): ReviewSourceFixture {
+  const originalContent = `${sourceId}\n`;
+  const year = sourceId.slice(4, 8);
+  const month = sourceId.slice(9, 11);
+  const sourceCardPath = `raw/inputs/${year}/${month}/${sourceId}/_source.md`;
+  const originalPath = `raw/inputs/${year}/${month}/${sourceId}/original.md`;
+
+  return {
+    sourceId,
+    title,
+    status,
+    sourceKind,
+    capturedAt,
+    updatedAt,
+    sourceCardPath,
+    queuePath: `raw/queue/${sourceId}.json`,
+    originalPath,
+    contentHash: computeContentHash(Buffer.from(originalContent, "utf8")),
+  };
+}
+
+async function writeReviewSourceFixture(
+  wikiDir: string,
+  source: ReviewSourceFixture,
+  options: ReviewSourceFixtureWriteOptions = {},
+): Promise<void> {
+  const originalPath = resolve(wikiDir, source.originalPath);
+  await mkdir(dirname(originalPath), { recursive: true });
+  await writeFile(originalPath, `${source.sourceId}\n`, "utf8");
+
+  const sourceCardFrontmatter = {
+    type: "raw_source",
+    source_id: source.sourceId,
+    title: source.title,
+    source_kind: source.sourceKind,
+    origin: source.sourceKind === "url" ? "https://example.com/source" : "pasted_text",
+    ...(source.sourceKind === "url" ? { origin_url: "https://example.com/source" } : {}),
+    captured_at: source.capturedAt,
+    content_hash: source.contentHash,
+    status: source.status,
+    visibility: "private",
+    ...(source.updatedAt === null ? {} : { updated_at: source.updatedAt }),
+    ...options.sourceCard,
+  };
+  const sourceCardPath = resolve(wikiDir, source.sourceCardPath);
+  await mkdir(dirname(sourceCardPath), { recursive: true });
+  await writeFile(
+    sourceCardPath,
+    `---\n${stringify(sourceCardFrontmatter).trimEnd()}\n---\n\n# ${source.title}\n\nOriginal file: [[original.md]]\n`,
+    "utf8",
+  );
+
+  const queueItem = {
+    kind: source.sourceKind,
+    source_id: source.sourceId,
+    title: source.title,
+    source_kind: source.sourceKind,
+    origin: source.sourceKind === "url" ? "https://example.com/source" : "pasted_text",
+    ...(source.sourceKind === "url" ? { origin_url: "https://example.com/source" } : {}),
+    captured_at: source.capturedAt,
+    content_hash: source.contentHash,
+    status: source.status,
+    visibility: "private",
+    path: source.sourceCardPath,
+    original_path: source.originalPath,
+    ...(source.updatedAt === null ? {} : { updated_at: source.updatedAt }),
+    ...options.queue,
+  };
+  const queuePath = resolve(wikiDir, source.queuePath);
+  await mkdir(dirname(queuePath), { recursive: true });
+  await writeFile(queuePath, `${JSON.stringify(queueItem, null, 2)}\n`, "utf8");
+}
+
 async function makeDefaultCuratedPagesPublic(wikiDir: string): Promise<void> {
   const pages = [
     ["curated/contradictions.md", "Contradictions"],
@@ -204,6 +304,44 @@ async function makeDefaultCuratedPagesPublic(wikiDir: string): Promise<void> {
       `# ${title}\n`,
     );
   }
+}
+
+function expectedLocalReviewGeneratedPaths(options: { includeRoot?: boolean } = {}): string[] {
+  const paths = [
+    "quartz/content/_llm-wiki/review/contradictions.md",
+    "quartz/content/_llm-wiki/review/needs-review.md",
+    "quartz/content/_llm-wiki/review/orphans.md",
+    "quartz/content/_llm-wiki/review/overview.md",
+    "quartz/content/_llm-wiki/review/profile-summary.md",
+    "quartz/content/_llm-wiki/review/recent-ingests.md",
+    "quartz/content/_llm-wiki/review/source-queue.md",
+    "quartz/content/_llm-wiki/review/stale-pages.md",
+    "quartz/content/_llm-wiki/review/status.md",
+    "quartz/content/_llm-wiki/review/visibility-warnings.md",
+    "quartz/content/_llm-wiki/upload.md",
+  ];
+  if (options.includeRoot === true) {
+    paths.push("quartz/content/index.md");
+  }
+
+  return paths.sort();
+}
+
+function generatedReviewPagePaths(): string[] {
+  return expectedLocalReviewGeneratedPaths().filter((path) => path.startsWith("quartz/content/_llm-wiki/review/"));
+}
+
+function expectGeneratedReviewFrontmatter(content: string, title: string, component: string): void {
+  expect(content).toContain(`title: ${title}`);
+  expect(content).toContain("type: dashboard");
+  expect(content).toContain("visibility: private");
+  expect(content).toContain(`llm_wiki_component: ${component}`);
+}
+
+function parseReviewCategoryItems(content: string): unknown[] {
+  const match = /```json\n([\s\S]*?)\n```/u.exec(content);
+  expect(match).not.toBeNull();
+  return JSON.parse(match?.[1] ?? "[]") as unknown[];
 }
 
 async function listTree(rootDir: string, relativeDir: string): Promise<string[]> {
@@ -232,7 +370,7 @@ async function listTree(rootDir: string, relativeDir: string): Promise<string[]>
 }
 
 describe("explore sync command", () => {
-  it("materializes local Markdown, raw source cards, and static review pages while excluding raw originals", async () => {
+  it("materializes local Markdown, raw source cards, upload entrypoint, root page, and full review page set", async () => {
     await withTempWorkspace("llm-wiki-explore-sync-local-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
@@ -248,33 +386,422 @@ describe("explore sync command", () => {
         "--json",
       ]);
       expect(addResult.exitCode).toBe(0);
+      const capture = parseSourceCapture(addResult.stdout);
 
       // Act
       const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "local", "--json"]);
       const payload = parseExploreSync(result.stdout);
       const manifest = await readManifest(wikiDir, "local");
       const syncedPaths = await listTree(wikiDir, "quartz/content");
+      const overview = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/overview.md");
+      const status = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/status.md");
+      const sourceQueue = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/source-queue.md");
+      const upload = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/upload.md");
 
       // Assert
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toEqual([]);
       expect(payload.data.profile).toBe("local");
       expect(payload.data.materialized_paths).toContain("quartz/content/curated/home.md");
-      expect(payload.data.generated_paths).toEqual([
-        "quartz/content/_llm-wiki/review/profile-summary.md",
-        "quartz/content/_llm-wiki/review/source-queue.md",
-      ]);
+      expect(payload.data.materialized_paths).toContain("quartz/content/index.md");
+      expect(payload.data.generated_paths).toEqual(expectedLocalReviewGeneratedPaths());
       expect(payload.data.excluded_paths).toEqual(expect.arrayContaining([expect.stringMatching(/original\.md$/)]));
       expect(syncedPaths).toContain("quartz/content/curated/home.md");
+      expect(syncedPaths).toContain("quartz/content/index.md");
+      expect(syncedPaths).toContain("quartz/content/_llm-wiki/upload.md");
+      expect(syncedPaths).toContain("quartz/content/_llm-wiki/review/status.md");
       expect(syncedPaths).toContain("quartz/content/_llm-wiki/review/source-queue.md");
       expect(syncedPaths.some((path) => path.endsWith("/_source.md"))).toBe(true);
       expect(syncedPaths.some((path) => path.endsWith("/original.md"))).toBe(false);
       expect(manifest.profile).toBe("local");
       expect(manifest.files.some((file) => file.source_path.endsWith("/_source.md"))).toBe(true);
       expect(manifest.files.some((file) => file.source_path.endsWith("/original.md"))).toBe(false);
-      expect(await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/source-queue.md")).toContain("Queue Note");
+      expect(manifest.generated_files.map((file) => file.content_path)).toEqual(expectedLocalReviewGeneratedPaths());
+      expect(upload).toContain("llm_wiki_component: LlmWikiUploadForm");
+      expect(upload).toContain("llm_wiki_upload: true");
+      expect(upload).not.toContain("<LlmWikiUploadForm");
+      expect(overview).toContain("llm_wiki_component: LlmWikiReviewPanel");
+      expect(overview).toContain("| Queue total | 1 |");
+      expect(status).toContain("| Queued | 1 |");
+      expect(sourceQueue).toContain("llm_wiki_component: LlmWikiQueueDashboard");
+      expect(sourceQueue).toContain(capture.source.source_id);
+      expect(sourceQueue).toContain("Queue Note");
     });
   });
+
+  it("renders every generated review page with component gates and review data items", async () => {
+    await withTempWorkspace("llm-wiki-explore-sync-review-pages-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const queued = reviewSourceFixture(
+        "src_2026_06_23_sync_queued_111111",
+        "Sync Queued",
+        "queued",
+        "text",
+        "2026-06-23T09:00:00.000Z",
+      );
+      const ingesting = reviewSourceFixture(
+        "src_2026_06_23_sync_ingesting_222222",
+        "Sync Ingesting",
+        "ingesting",
+        "file",
+        "2026-06-23T09:05:00.000Z",
+        "2026-06-23T10:00:00.000Z",
+      );
+      const blocked = reviewSourceFixture(
+        "src_2026_06_23_sync_blocked_333333",
+        "Sync Blocked",
+        "blocked",
+        "url",
+        "2026-06-23T09:10:00.000Z",
+        "2026-06-23T10:05:00.000Z",
+      );
+      const ingested = reviewSourceFixture(
+        "src_2026_06_23_sync_ingested_444444",
+        "Sync Ingested",
+        "ingested",
+        "text",
+        "2026-06-23T09:15:00.000Z",
+        "2026-06-23T10:10:00.000Z",
+      );
+
+      for (const source of [queued, ingesting, blocked, ingested]) {
+        await writeReviewSourceFixture(wikiDir, source);
+      }
+      await writeCuratedPage(
+        wikiDir,
+        `curated/sources/${ingested.sourceId}.md`,
+        {
+          type: "source_summary",
+          title: "Sync Ingested Summary",
+          visibility: "private",
+          source_ids: [ingested.sourceId],
+        },
+        "# Sync Ingested Summary\n",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/home.md",
+        {
+          type: "page",
+          title: "Home",
+          visibility: "private",
+          source_ids: [],
+        },
+        [
+          "# Home",
+          "",
+          "Linked review pages:",
+          "",
+          "- [[topics/sync-stale|Sync Stale]]",
+          "- [[questions/sync-review|Sync Review]]",
+          `- [[sources/${ingested.sourceId}|Sync Ingested Summary]]`,
+          "",
+        ].join("\n"),
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/sync-orphan.md",
+        {
+          type: "topic",
+          title: "Sync Orphan",
+          visibility: "private",
+          source_ids: [queued.sourceId],
+        },
+        "# Sync Orphan\n",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/sync-stale.md",
+        {
+          type: "topic",
+          title: "Sync Stale",
+          visibility: "private",
+          source_ids: [ingested.sourceId],
+          next_review: "2026-06-01",
+        },
+        "# Sync Stale\n",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/questions/sync-review.md",
+        {
+          type: "question",
+          title: "Sync Review Question",
+          visibility: "private",
+          source_ids: [queued.sourceId],
+          review_status: "needs-human-review",
+        },
+        "# Sync Review Question\n",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/contradictions/sync-conflict.md",
+        {
+          type: "page",
+          title: "Sync Pricing Conflict",
+          visibility: "private",
+          source_ids: [blocked.sourceId],
+          tags: ["contradiction"],
+        },
+        "# Sync Pricing Conflict\n",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/log.md",
+        {
+          type: "log",
+          title: "Log",
+          visibility: "private",
+          source_ids: [],
+        },
+        [
+          "# Log",
+          "",
+          `## [2026-06-23T10:10:00.000Z] ingest | ${ingested.sourceId} | Sync Ingested`,
+          "",
+          "- actor: cli",
+          "- command: \"llm-wiki ingest src_2026_06_23_sync_ingested_444444\"",
+          `- raw_source: ${ingested.sourceCardPath}`,
+          "- created:",
+          `  - curated/sources/${ingested.sourceId}.md`,
+          "- updated:",
+          "  - curated/topics/sync-stale.md",
+          "- contradictions:",
+          "  - Sync Ingested conflicts with Sync Blocked on pricing.",
+          "- follow_ups:",
+          "",
+        ].join("\n"),
+      );
+      await runCliBuffered(["lint", "--repo", wikiDir, "--fix", "--json"]);
+      await writeReviewSourceFixture(wikiDir, blocked, { sourceCard: { visibility: "public" } });
+
+      // Act
+      const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "review", "--json"]);
+      const payload = parseExploreSync(result.stdout);
+      const manifest = await readManifest(wikiDir, "review");
+      const reviewPages = new Map(
+        await Promise.all(
+          generatedReviewPagePaths().map(async (path) => [path, await readGeneratedFile(wikiDir, path)] as const),
+        ),
+      );
+      const recentIngests = reviewPages.get("quartz/content/_llm-wiki/review/recent-ingests.md") ?? "";
+      const needsReview = reviewPages.get("quartz/content/_llm-wiki/review/needs-review.md") ?? "";
+      const contradictions = reviewPages.get("quartz/content/_llm-wiki/review/contradictions.md") ?? "";
+      const orphans = reviewPages.get("quartz/content/_llm-wiki/review/orphans.md") ?? "";
+      const stalePages = reviewPages.get("quartz/content/_llm-wiki/review/stale-pages.md") ?? "";
+      const visibilityWarnings = reviewPages.get("quartz/content/_llm-wiki/review/visibility-warnings.md") ?? "";
+      const overview = reviewPages.get("quartz/content/_llm-wiki/review/overview.md") ?? "";
+      const profileSummary = reviewPages.get("quartz/content/_llm-wiki/review/profile-summary.md") ?? "";
+      const sourceQueue = reviewPages.get("quartz/content/_llm-wiki/review/source-queue.md") ?? "";
+      const status = reviewPages.get("quartz/content/_llm-wiki/review/status.md") ?? "";
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.generated_paths).toEqual(expectedLocalReviewGeneratedPaths());
+      expect(manifest.generated_files.map((file) => file.content_path)).toEqual(expectedLocalReviewGeneratedPaths());
+      expect([...reviewPages.keys()].sort()).toEqual(generatedReviewPagePaths());
+      expectGeneratedReviewFrontmatter(overview, "Review Overview", "LlmWikiReviewPanel");
+      expectGeneratedReviewFrontmatter(profileSummary, "Profile Summary", "LlmWikiReviewPanel");
+      expectGeneratedReviewFrontmatter(sourceQueue, "Source Queue", "LlmWikiQueueDashboard");
+      expectGeneratedReviewFrontmatter(status, "Review Status", "LlmWikiReviewPanel");
+      expectGeneratedReviewFrontmatter(recentIngests, "Recent Ingests", "LlmWikiReviewPanel");
+      expectGeneratedReviewFrontmatter(needsReview, "Needs Review", "LlmWikiReviewPanel");
+      expectGeneratedReviewFrontmatter(contradictions, "Contradictions", "LlmWikiReviewPanel");
+      expectGeneratedReviewFrontmatter(orphans, "Orphans", "LlmWikiReviewPanel");
+      expectGeneratedReviewFrontmatter(stalePages, "Stale Pages", "LlmWikiReviewPanel");
+      expectGeneratedReviewFrontmatter(visibilityWarnings, "Visibility Warnings", "LlmWikiVisibilityWarning");
+      expect(overview).toContain("| Source queue | 4 |");
+      expect(overview).toContain("| Recent ingests | 1 |");
+      expect(overview).toContain("| Needs review | 1 |");
+      expect(overview).toContain("| Contradictions | 2 |");
+      expect(overview).toContain("| Orphans | 1 |");
+      expect(overview).toContain("| Stale pages | 1 |");
+      expect(overview).toContain("| Visibility warnings | 1 |");
+      expect(overview).toContain("| Profile summary | 1 |");
+      expect(overview).toContain("| Status | 4 |");
+      expect(profileSummary).toContain("| Profile | review |");
+      expect(profileSummary).toContain("| Queue items | 4 |");
+      expect(profileSummary).toContain("| Raw source cards | 4 |");
+      expect(sourceQueue).toContain("| Total | 4 |");
+      expect(sourceQueue).toContain(`| ${blocked.sourceId} | Sync Blocked | blocked | url | public | ${blocked.sourceCardPath} | ${blocked.queuePath} | ${blocked.originalPath} |`);
+      expect(status).toContain("| Queued | 1 |");
+      expect(status).toContain("| Ingesting | 1 |");
+      expect(status).toContain("| Blocked | 1 |");
+      expect(status).toContain("| Ingested | 1 |");
+      expect(recentIngests).toContain("Count: 1");
+      expect(parseReviewCategoryItems(recentIngests)).toEqual([
+        expect.objectContaining({
+          source_id: ingested.sourceId,
+          title: "Sync Ingested",
+          source_card_path: ingested.sourceCardPath,
+          queue_path: ingested.queuePath,
+        }),
+      ]);
+      expect(needsReview).toContain("Count: 1");
+      expect(parseReviewCategoryItems(needsReview)).toEqual([
+        expect.objectContaining({
+          path: "curated/questions/sync-review.md",
+          title: "Sync Review Question",
+          review_status: "needs-human-review",
+          source_ids: [queued.sourceId],
+        }),
+      ]);
+      expect(contradictions).toContain("Count: 2");
+      expect(parseReviewCategoryItems(contradictions)).toEqual([
+        expect.objectContaining({
+          source: "frontmatter",
+          path: "curated/contradictions/sync-conflict.md",
+          title: "Sync Pricing Conflict",
+          source_ids: [blocked.sourceId],
+        }),
+        expect.objectContaining({
+          source: "log",
+          path: "curated/log.md",
+          source_id: ingested.sourceId,
+          text: "Sync Ingested conflicts with Sync Blocked on pricing.",
+        }),
+      ]);
+      expect(orphans).toContain("Count: 1");
+      expect(parseReviewCategoryItems(orphans)).toEqual([
+        expect.objectContaining({
+          path: "curated/topics/sync-orphan.md",
+          title: "Sync Orphan",
+          rule_id: "orphan_page",
+          source_ids: [queued.sourceId],
+        }),
+      ]);
+      expect(stalePages).toContain("Count: 1");
+      expect(parseReviewCategoryItems(stalePages)).toEqual([
+        expect.objectContaining({
+          source: "frontmatter",
+          path: "curated/topics/sync-stale.md",
+          title: "Sync Stale",
+          next_review: "2026-06-01",
+          source_ids: [ingested.sourceId],
+        }),
+      ]);
+      expect(visibilityWarnings).toContain("Count: 1");
+      expect(parseReviewCategoryItems(visibilityWarnings)).toEqual([
+        expect.objectContaining({
+          path: blocked.sourceCardPath,
+          rule_id: "raw_sources_default_private",
+        }),
+      ]);
+    });
+  });
+
+  it.each(["local", "review"] as const)(
+    "materializes selected curated/index.md as the %s Quartz root page",
+    async (profile) => {
+      await withTempWorkspace(`llm-wiki-explore-sync-${profile}-selected-root-`, async (workspaceDir) => {
+        // Arrange
+        const wikiDir = resolve(workspaceDir, "wiki");
+        await initializeWiki(wikiDir);
+
+        // Act
+        const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", profile, "--json"]);
+        const payload = parseExploreSync(result.stdout);
+        const sourceIndex = await readGeneratedFile(wikiDir, "curated/index.md");
+        const rootIndex = await readGeneratedFile(wikiDir, "quartz/content/index.md");
+
+        // Assert
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toEqual([]);
+        expect(payload.data.generated_paths).toEqual(expectedLocalReviewGeneratedPaths());
+        expect(payload.data.generated_paths).not.toContain("quartz/content/index.md");
+        expect(payload.data.materialized_paths).toContain("quartz/content/curated/index.md");
+        expect(payload.data.materialized_paths).toContain("quartz/content/index.md");
+        expect(rootIndex).toBe(sourceIndex);
+      });
+    },
+  );
+
+  it.each(["local", "review"] as const)(
+    "does not overwrite a selected top-level index.md for %s sync",
+    async (profile) => {
+      await withTempWorkspace(`llm-wiki-explore-sync-${profile}-top-level-root-`, async (workspaceDir) => {
+        // Arrange
+        const wikiDir = resolve(workspaceDir, "wiki");
+        await initializeWiki(wikiDir);
+        await writeCuratedPage(
+          wikiDir,
+          "index.md",
+          {
+            type: "index",
+            title: "Custom Root",
+            visibility: "private",
+            source_ids: [],
+          },
+          "# Custom Root\n\nThis profile-owned root must survive sync.\n",
+        );
+        const profilePath = resolve(wikiDir, `.llm-wiki/profiles/${profile}.yml`);
+        const profileContent = await readFile(profilePath, "utf8");
+        await writeFile(
+          profilePath,
+          profileContent.replace("include:\n  - curated/**\n", "include:\n  - index.md\n  - curated/**\n"),
+          "utf8",
+        );
+
+        // Act
+        const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", profile, "--json"]);
+        const payload = parseExploreSync(result.stdout);
+        const manifest = await readManifest(wikiDir, profile);
+        const rootIndex = await readGeneratedFile(wikiDir, "quartz/content/index.md");
+
+        // Assert
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toEqual([]);
+        expect(payload.data.generated_paths).toEqual(expectedLocalReviewGeneratedPaths());
+        expect(payload.data.generated_paths).not.toContain("quartz/content/index.md");
+        expect(payload.data.materialized_paths).toContain("quartz/content/index.md");
+        expect(manifest.files).toContainEqual(expect.objectContaining({
+          source_path: "index.md",
+          content_path: "quartz/content/index.md",
+        }));
+        expect(rootIndex).toContain("# Custom Root");
+        expect(rootIndex).toContain("This profile-owned root must survive sync.");
+        expect(rootIndex).not.toContain("# Index");
+        expect(rootIndex).not.toContain("# LLM Wiki Home");
+      });
+    },
+  );
+
+  it.each(["local", "review"] as const)(
+    "generates a useful %s home page when curated/index.md is not selected",
+    async (profile) => {
+      await withTempWorkspace(`llm-wiki-explore-sync-${profile}-generated-home-`, async (workspaceDir) => {
+        // Arrange
+        const wikiDir = resolve(workspaceDir, "wiki");
+        await initializeWiki(wikiDir);
+        const profilePath = resolve(wikiDir, `.llm-wiki/profiles/${profile}.yml`);
+        const profileContent = await readFile(profilePath, "utf8");
+        await writeFile(
+          profilePath,
+          profileContent.replace("exclude:\n  - raw/inputs/**/original.*\n", "exclude:\n  - curated/index.md\n  - raw/inputs/**/original.*\n"),
+          "utf8",
+        );
+
+        // Act
+        const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", profile, "--json"]);
+        const payload = parseExploreSync(result.stdout);
+        const rootIndex = await readGeneratedFile(wikiDir, "quartz/content/index.md");
+
+        // Assert
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toEqual([]);
+        expect(payload.data.generated_paths).toEqual(expectedLocalReviewGeneratedPaths({ includeRoot: true }));
+        expect(payload.data.materialized_paths).not.toContain("quartz/content/curated/index.md");
+        expect(rootIndex).toContain("[[curated/home|Curated home]]");
+        expect(rootIndex).toContain("[[_llm-wiki/upload|Upload]]");
+        expect(rootIndex).toContain("[[_llm-wiki/review/overview|Review overview]]");
+        expect(rootIndex).toContain("[[_llm-wiki/review/status|Status]]");
+        expect(rootIndex).toContain("[[_llm-wiki/review/source-queue|Source queue]]");
+      });
+    },
+  );
 
   it("treats missing Git as no worktree for no-git sync", async () => {
     await withTempWorkspace("llm-wiki-explore-sync-no-git-path-", async (workspaceDir) => {
@@ -627,12 +1154,12 @@ visibility:
     });
   });
 
-  it("materializes review profile content with review static pages and no raw originals", async () => {
+  it("materializes review profile content with upload, root, full review pages, and no raw originals", async () => {
     await withTempWorkspace("llm-wiki-explore-sync-review-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
       await initializeWiki(wikiDir);
-      await runCliBuffered([
+      const addResult = await runCliBuffered([
         "add-text",
         "--repo",
         wikiDir,
@@ -642,23 +1169,27 @@ visibility:
         "Needs review.\n",
         "--json",
       ]);
+      expect(addResult.exitCode).toBe(0);
+      const capture = parseSourceCapture(addResult.stdout);
 
       // Act
       const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "review", "--json"]);
       const payload = parseExploreSync(result.stdout);
       const manifest = await readManifest(wikiDir, "review");
+      const overview = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/overview.md");
+      const sourceQueue = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/source-queue.md");
 
       // Assert
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toEqual([]);
       expect(payload.data.profile).toBe("review");
-      expect(payload.data.generated_paths).toContain("quartz/content/_llm-wiki/review/source-queue.md");
+      expect(payload.data.generated_paths).toEqual(expectedLocalReviewGeneratedPaths());
       expect(manifest.profile).toBe("review");
       expect(manifest.files.some((file) => file.source_path.endsWith("/_source.md"))).toBe(true);
       expect(manifest.files.some((file) => file.source_path.includes("raw/queue/"))).toBe(false);
-      await expect(readFile(resolve(wikiDir, "quartz/content/_llm-wiki/review/source-queue.md"), "utf8")).resolves.toContain(
-        "Review Queue Note",
-      );
+      expect(overview).toContain("| Source queue | 1 |");
+      expect(sourceQueue).toContain(capture.source.source_id);
+      expect(sourceQueue).toContain("Review Queue Note");
     });
   });
 
@@ -902,6 +1433,56 @@ visibility:
     });
   });
 
+  it("checks local daemon runtime metadata in private-capable ignore repair without manifesting it", async () => {
+    await withTempWorkspace("llm-wiki-explore-sync-runtime-metadata-ignore-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir);
+      const runtimeMetadataPath = "quartz/content/_llm-wiki/runtime/local-daemon.json";
+      const quartzIgnorePath = "content/_llm-wiki/runtime/local-daemon.json";
+      const quartzIgnoreSegments = quartzIgnorePath.split("/");
+      const quartzIgnoreRules = quartzIgnoreSegments.flatMap((_, index) => {
+        const pattern = quartzIgnoreSegments.slice(0, index + 1).join("/");
+        return index === quartzIgnoreSegments.length - 1 ? [`!${pattern}`] : [`!${pattern}/`, `${pattern}/*`];
+      });
+      await mkdir(resolve(wikiDir, "quartz"), { recursive: true });
+      await writeFile(resolve(wikiDir, "quartz/.gitignore"), `${quartzIgnoreRules.join("\n")}\n`, "utf8");
+      expect(await gitIgnoresPath(wikiDir, "quartz/content/.llm-wiki-sync-probe.md")).toBe(true);
+      expect(await gitIgnoresPath(wikiDir, runtimeMetadataPath)).toBe(false);
+
+      // Act
+      const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "local", "--json"]);
+      const payload = parseExploreSync(result.stdout);
+      const quartzGitignore = await readFile(resolve(wikiDir, "quartz/.gitignore"), "utf8");
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(payload.warnings).toEqual(["Repaired nested generated Quartz ignore rule: quartz/.gitignore"]);
+      expect(quartzGitignore.trimEnd().endsWith("content/")).toBe(true);
+      expect(await gitIgnoresPath(wikiDir, runtimeMetadataPath)).toBe(true);
+      expect(payload.data.generated_paths).not.toContain(runtimeMetadataPath);
+      expect(await pathExists(resolve(wikiDir, runtimeMetadataPath))).toBe(false);
+    });
+  });
+
+  it("checks local daemon runtime metadata against content-level Quartz ignore rules", async () => {
+    await withTempWorkspace("llm-wiki-explore-sync-runtime-metadata-content-ignore-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/content"), { recursive: true });
+      await writeFile(resolve(wikiDir, "quartz/content/.gitignore"), "_llm-wiki/runtime/\n", "utf8");
+
+      // Act / Assert
+      await expect(syncQuartzContent(wikiDir, "local", { preserveContentRoot: true })).rejects.toMatchObject({
+        code: "QUARTZ_CONTENT_UNSAFE",
+        message: "Quartz content-level .gitignore would hide synced pages from Quartz.",
+        path: "quartz/content/.gitignore",
+      });
+    });
+  });
+
   it.each(["public", "github-pages"] as const)(
     "patches upgraded repo ignore rules before %s sync output",
     async (profile) => {
@@ -1009,6 +1590,12 @@ visibility:
         expect(syncedPaths).not.toContain(`quartz/content/${capture.source.source_card_path}`);
         expect(syncedPaths).not.toContain(`quartz/content/${capture.source.original_path}`);
         expect(syncedPaths).not.toContain(`quartz/content/${capture.source.queue_path}`);
+        expect(syncedPaths.some((path) => path.startsWith("quartz/content/_llm-wiki/upload"))).toBe(false);
+        expect(syncedPaths.some((path) => path.startsWith("quartz/content/_llm-wiki/review/"))).toBe(false);
+        expect(syncedPaths.some((path) => path.startsWith("quartz/content/_llm-wiki/runtime/"))).toBe(false);
+        expect(payload.data.generated_paths.some((path) => path.startsWith("quartz/content/_llm-wiki/upload"))).toBe(false);
+        expect(payload.data.generated_paths.some((path) => path.startsWith("quartz/content/_llm-wiki/review/"))).toBe(false);
+        expect(payload.data.generated_paths.some((path) => path.startsWith("quartz/content/_llm-wiki/runtime/"))).toBe(false);
         expect(syncedContent.join("\n")).not.toContain(privateRawText);
         expect(manifest.files.some((file) => file.source_path === capture.source.source_card_path)).toBe(false);
         expect(manifest.files.some((file) => file.source_path === capture.source.original_path)).toBe(false);

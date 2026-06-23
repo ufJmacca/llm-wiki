@@ -147,7 +147,7 @@ async function captureTextSource(wikiDir: string): Promise<SourceCaptureData["so
 
 async function configureCodexLocalAgent(
   wikiDir: string,
-  input: { defaultAgent: "generic" | "codex" },
+  input: { defaultAgent: "generic" | "codex"; command?: string },
 ): Promise<void> {
   const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
   const config = await readFile(configPath, "utf8");
@@ -161,7 +161,7 @@ async function configureCodexLocalAgent(
       "agents:",
       "  codex:",
       "    type: local-exec",
-      "    command: codex",
+      `    command: ${input.command ?? "codex"}`,
       "    args:",
       "      - exec",
       "    timeout_seconds: 900",
@@ -408,13 +408,16 @@ describe("ingest command task scaffolding", () => {
       args: ["--auto"],
       defaultAgent: "codex" as const,
     },
-  ])("resolves a valid local agent config before deferred ingest handoff: $name", async ({ args, defaultAgent }) => {
-    await withTempWorkspace("llm-wiki-ingest-agent-handoff-", async (workspaceDir) => {
+  ])("fails before queue start when the resolved local agent command is unavailable: $name", async ({ args, defaultAgent }) => {
+    await withTempWorkspace("llm-wiki-ingest-agent-missing-command-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
       await initializeWiki(wikiDir);
       const source = await captureTextSource(wikiDir);
-      await configureCodexLocalAgent(wikiDir, { defaultAgent });
+      await configureCodexLocalAgent(wikiDir, {
+        defaultAgent,
+        command: "llm-wiki-definitely-missing-codex",
+      });
 
       // Act
       const result = await runCliBuffered([
@@ -426,18 +429,22 @@ describe("ingest command task scaffolding", () => {
         "--json",
       ]);
       const payload = parseJsonFailure<"ingest">(result.stdout);
+      const queueResult = await runCliBuffered(["queue", "show", source.source_id, "--repo", wikiDir, "--json"]);
+      const queuePayload = parseJsonSuccess<"queue show", QueueShowData>(queueResult.stdout);
 
       // Assert
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toEqual([]);
       expect(payload.error).toMatchObject({
-        code: "AGENT_EXECUTION_UNAVAILABLE",
-        message: "Local agent execution is not implemented for ingest yet: codex.",
+        code: "AGENT_COMMAND_UNAVAILABLE",
+        message: "Agent command is not available: llm-wiki-definitely-missing-codex.",
       });
-      expect(payload.error.hint).toContain(".llm-wiki/config.yml:agents.codex");
+      expect(payload.error.hint).toContain("PATH");
       expect(payload.issues[0]).toMatchObject({
-        path: ".llm-wiki/config.yml:agents.codex",
+        path: "llm-wiki-definitely-missing-codex",
       });
+      expect(queuePayload.data.queue_record.status).toBe("queued");
+      expect(queuePayload.data.source_card.frontmatter.status).toBe("queued");
     });
   });
 

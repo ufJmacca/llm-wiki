@@ -55,6 +55,7 @@ type IngestTaskInput = {
   sourceId: string;
   artifactPath?: string | null;
   previousStatus?: QueueStatus | null;
+  promptMode?: "manual" | "local-agent";
 };
 
 type IngestRelatedPageContent = IngestRelatedPage & {
@@ -206,6 +207,7 @@ export async function buildIngestTask(input: IngestTaskInput): Promise<Result<In
         requiredOutputs,
         rawImmutabilityRules,
         contextPaths,
+        promptMode: input.promptMode ?? "manual",
       }),
     },
   });
@@ -317,6 +319,7 @@ function formatPrompt(input: {
   requiredOutputs: string[];
   rawImmutabilityRules: string[];
   contextPaths: string[];
+  promptMode: "manual" | "local-agent";
 }): string {
   return [
     `# Ingest task: ${input.source.title}`,
@@ -358,10 +361,27 @@ function formatPrompt(input: {
     "## Current curated/index.md",
     codeFence(snippet(input.indexContent, 4000), "markdown"),
     "",
-    "## Validation command",
-    `Run llm-wiki ingest ${input.source.source_id} --validate after making curated edits.`,
+    ...formatValidationInstruction(input),
     "",
   ].join("\n");
+}
+
+function formatValidationInstruction(input: {
+  source: IngestTaskSource;
+  promptMode: "manual" | "local-agent";
+}): string[] {
+  if (input.promptMode === "local-agent") {
+    return [
+      "## Validation boundary",
+      "Do not run llm-wiki validation or queue commands in this workspace.",
+      "Only make the requested curated Markdown edits; the orchestrator validates proposals and updates queue state after extraction.",
+    ];
+  }
+
+  return [
+    "## Validation command",
+    `Run llm-wiki ingest ${input.source.source_id} --validate after making curated edits.`,
+  ];
 }
 
 function formatRawPromptSection(path: string, rawPromptContent: RawPromptContent): string[] {

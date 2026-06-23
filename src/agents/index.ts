@@ -15,3 +15,9 @@ export {
   type LocalAgentWorkspaceResult,
   type RunLocalAgentWorkspaceInput,
 } from "./workspace.js";
+export {
+  createCodexQueryProposalPolicy,
+  runCodexQueryAgent,
+  type CodexQueryAgentResult,
+  type RunCodexQueryAgentInput,
+} from "./codex.js";

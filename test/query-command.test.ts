@@ -121,7 +121,7 @@ async function captureTextSource(
 
 async function configureCodexLocalAgent(
   wikiDir: string,
-  input: { defaultAgent: "generic" | "codex" },
+  input: { defaultAgent: "generic" | "codex"; command?: string },
 ): Promise<void> {
   const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
   const config = await readFile(configPath, "utf8");
@@ -135,7 +135,7 @@ async function configureCodexLocalAgent(
       "agents:",
       "  codex:",
       "    type: local-exec",
-      "    command: codex",
+      `    command: ${input.command ?? "codex"}`,
       "    args:",
       "      - exec",
       "    timeout_seconds: 900",
@@ -396,12 +396,13 @@ describe("query command task scaffolding", () => {
       args: ["--auto"],
       defaultAgent: "codex" as const,
     },
-  ])("resolves a valid local agent config before deferred query handoff: $name", async ({ args, defaultAgent }) => {
+  ])("resolves a valid local agent config before launching query execution: $name", async ({ args, defaultAgent }) => {
     await withTempWorkspace("llm-wiki-query-agent-handoff-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
+      const missingCommand = "llm-wiki-definitely-missing-codex";
       await initializeWiki(wikiDir);
-      await configureCodexLocalAgent(wikiDir, { defaultAgent });
+      await configureCodexLocalAgent(wikiDir, { defaultAgent, command: missingCommand });
 
       // Act
       const result = await runCliBuffered([
@@ -420,12 +421,12 @@ describe("query command task scaffolding", () => {
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toEqual([]);
       expect(payload.error).toMatchObject({
-        code: "AGENT_EXECUTION_UNAVAILABLE",
-        message: "Local agent execution is not implemented for query yet: codex.",
+        code: "AGENT_COMMAND_UNAVAILABLE",
+        message: `Agent command is not available: ${missingCommand}.`,
       });
-      expect(payload.error.hint).toContain(".llm-wiki/config.yml:agents.codex");
+      expect(payload.error.hint).toContain("PATH");
       expect(payload.issues[0]).toMatchObject({
-        path: ".llm-wiki/config.yml:agents.codex",
+        path: missingCommand,
       });
     });
   });

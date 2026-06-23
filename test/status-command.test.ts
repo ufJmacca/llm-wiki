@@ -474,9 +474,9 @@ describe("status command", () => {
           names: ["remote"],
         });
         expect(payload.data.auto).toEqual({
-          can_run: false,
+          can_run: true,
           agent: "codex",
-          reason: expect.stringContaining("Local agent execution is not implemented yet"),
+          reason: null,
         });
         await expect(readFile(fakeAgent.logPath, "utf8")).rejects.toThrow();
       } finally {
@@ -544,9 +544,9 @@ describe("status command", () => {
           }),
         ]);
         expect(payload.data.auto).toEqual({
-          can_run: false,
+          can_run: true,
           agent: "codex",
-          reason: expect.stringContaining("Local agent execution is not implemented yet"),
+          reason: null,
         });
       } finally {
         process.chdir(oldCwd);
@@ -780,7 +780,7 @@ describe("status command", () => {
         expect(result.stdout[0]).toContain("Default agent: codex");
         expect(result.stdout[0]).toContain("Codex executable: available");
         expect(result.stdout[0]).toContain("HTTP providers: 1 (remote)");
-        expect(result.stdout[0]).toContain("--auto: blocked (Local agent execution is not implemented yet");
+        expect(result.stdout[0]).toContain("--auto: ready (codex)");
         await expect(readFile(fakeAgent.logPath, "utf8")).rejects.toThrow();
       } finally {
         fakeAgent.restore();

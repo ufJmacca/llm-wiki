@@ -258,6 +258,15 @@ function validateIngestModeOptions(rawOptions: RawIngestOptions): void {
       path: "--validate",
     });
   }
+
+  if (rawOptions.createBranch === true && (rawOptions.auto === true || typeof rawOptions.agent === "string")) {
+    throw new RuntimeCommandError({
+      code: "INGEST_MODE_CONFLICT",
+      message: "Local agent ingest cannot be combined with --create-branch.",
+      hint: "Create or switch to the ingest branch first, then rerun with --agent <name> or --auto.",
+      path: "--create-branch",
+    });
+  }
 }
 
 function isAgentModeRequested(rawOptions: RawIngestOptions): boolean {
@@ -284,7 +293,7 @@ async function executeAgentIngest(
   }
 
   ensureIngestTaskCanStart(preflightTask.value);
-  await assertLocalAgentCommandAvailable(agent);
+  await assertLocalAgentCommandAvailable(agent, repoRoot);
   await ensureIngesting(repoRoot, sourceId, agentIngestCommand(sourceId, agent.name, rawOptions));
 
   try {
@@ -777,8 +786,8 @@ async function resolveLocalAgentConfig(repoRoot: string, rawOptions: RawIngestOp
   return result.value;
 }
 
-async function assertLocalAgentCommandAvailable(agent: LocalAgentConfig): Promise<void> {
-  const availability = await checkLocalAgentAvailability(agent);
+async function assertLocalAgentCommandAvailable(agent: LocalAgentConfig, repoRoot: string): Promise<void> {
+  const availability = await checkLocalAgentAvailability(agent, { cwd: repoRoot });
   if (!availability.ok) {
     throw new RuntimeCommandError({
       code: availability.error.code,

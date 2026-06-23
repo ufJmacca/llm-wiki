@@ -110,9 +110,6 @@ const EMPTY_QUEUE_COUNTS: QueueListResult["counts"] = {
   blocked: 0,
 };
 
-const LOCAL_AGENT_EXECUTION_UNAVAILABLE_REASON =
-  "Local agent execution is not implemented yet. Use manual prompt generation without --auto, or use --provider <name> for an HTTP proposal provider until the local Codex adapter is enabled.";
-
 export async function getWikiStatus(repoRoot: string): Promise<StatusData> {
   const [configSummary, configReadiness, scan, lint, queue, explorer] = await Promise.all([
     readWikiConfigSummary(repoRoot),
@@ -226,9 +223,9 @@ function summarizeAutoReadiness(agents: StatusData["agents"]): StatusData["auto"
   }
 
   return {
-    can_run: false,
+    can_run: true,
     agent: agents.default,
-    reason: LOCAL_AGENT_EXECUTION_UNAVAILABLE_REASON,
+    reason: null,
   };
 }
 

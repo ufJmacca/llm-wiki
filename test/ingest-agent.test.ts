@@ -153,6 +153,26 @@ async function createFakeCodex(workspaceDir: string, source: string): Promise<st
   return executablePath;
 }
 
+async function createFakeCodexInBin(binDir: string, source: string): Promise<string> {
+  await mkdir(binDir, { recursive: true });
+
+  if (process.platform === "win32") {
+    const scriptPath = resolve(binDir, "codex.js");
+    const executablePath = resolve(binDir, "codex.cmd");
+    await writeFile(scriptPath, source, "utf8");
+    await writeFile(executablePath, `@echo off\r\n"${process.execPath}" "%~dp0codex.js" %*\r\n`, "utf8");
+    await chmod(executablePath, 0o755);
+
+    return executablePath;
+  }
+
+  const executablePath = resolve(binDir, "codex");
+  await writeFile(executablePath, source, "utf8");
+  await chmod(executablePath, 0o755);
+
+  return executablePath;
+}
+
 function parseJsonSuccess<Command extends string, Data>(
   stdout: string[],
 ): RuntimeSuccessEnvelope<Command, Data> {
@@ -224,7 +244,7 @@ function ingestLogContent(source: SourceCaptureData["source"]): string {
 
 function successfulCodexSource(source: SourceCaptureData["source"]): string {
   return [
-    "#!/usr/bin/env node",
+    `#!${process.execPath}`,
     "const fs = require('node:fs');",
     "const path = require('node:path');",
     "const cwd = process.cwd();",
@@ -252,6 +272,44 @@ function successfulCodexSource(source: SourceCaptureData["source"]): string {
 }
 
 describe("ingest local agent automation", () => {
+  it("rejects --create-branch with local agent ingest before queue changes", async () => {
+    await withTempWorkspace("llm-wiki-ingest-agent-create-branch-conflict-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureTextSource(wikiDir);
+      await mkdir(resolve(wikiDir, ".git"));
+
+      // Act
+      const result = await runCliBuffered([
+        "ingest",
+        source.source_id,
+        "--repo",
+        wikiDir,
+        "--agent",
+        "codex",
+        "--create-branch",
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"ingest">(result.stdout);
+      const queueResult = await runCliBuffered(["queue", "show", source.source_id, "--repo", wikiDir, "--json"]);
+      const queuePayload = parseJsonSuccess<"queue show", QueueShowData>(queueResult.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(payload.error).toMatchObject({
+        code: "INGEST_MODE_CONFLICT",
+        message: "Local agent ingest cannot be combined with --create-branch.",
+      });
+      expect(payload.issues[0]).toMatchObject({
+        code: "INGEST_MODE_CONFLICT",
+        path: "--create-branch",
+      });
+      expect(queuePayload.data.queue_record.status).toBe("queued");
+      expect(queuePayload.data.source_card.frontmatter.status).toBe("queued");
+    });
+  });
+
   it("runs Codex in a temp workspace, validates proposals, applies curated Markdown, and marks the source ingested", async () => {
     await withTempWorkspace("llm-wiki-ingest-agent-success-", async (workspaceDir) => {
       // Arrange
@@ -353,6 +411,52 @@ describe("ingest local agent automation", () => {
       expect(result.stderr).toEqual([]);
       expect(queuePayload.data.queue_record.status).toBe("ingested");
       expect(queuePayload.data.source_card.frontmatter.status).toBe("ingested");
+    });
+  });
+
+  it("runs after preflight when PATH contains a repo-relative entry excluded from the temp workspace", async () => {
+    await withTempWorkspace("llm-wiki-ingest-agent-relative-path-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const runDir = resolve(workspaceDir, "outside");
+      const promptLogPath = resolve(workspaceDir, "relative-path-prompt.md");
+      process.env.LLM_WIKI_AGENT_PROMPT_LOG = promptLogPath;
+      await initializeWiki(wikiDir);
+      await mkdir(runDir);
+      const source = await captureTextSource(wikiDir);
+      await createFakeCodexInBin(resolve(wikiDir, "node_modules/.bin"), successfulCodexSource(source));
+      await configureCodexAgent(wikiDir, { command: "codex" });
+
+      const oldCwd = process.cwd();
+      const oldPath = process.env.PATH;
+      try {
+        process.chdir(runDir);
+        process.env.PATH = "node_modules/.bin";
+
+        // Act
+        const result = await runCliBuffered([
+          "ingest",
+          source.source_id,
+          "--repo",
+          wikiDir,
+          "--agent",
+          "codex",
+          "--json",
+        ]);
+        const payload = parseJsonSuccess<"ingest", IngestAgentData>(result.stdout);
+
+        // Assert
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toEqual([]);
+        expect(payload.data.source.status).toBe("ingested");
+      } finally {
+        process.chdir(oldCwd);
+        if (oldPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = oldPath;
+        }
+      }
     });
   });
 

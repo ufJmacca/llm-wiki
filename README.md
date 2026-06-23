@@ -26,8 +26,8 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/commands/add.ts`, `src/commands/addText.ts`, and `src/commands/addUrl.ts` own source capture command behavior.
 - `src/commands/daemon.ts` owns the localhost-only raw upload daemon command behavior.
 - `src/commands/queue.ts` and `src/commands/log.ts` own queue inspection, status transitions, and parsed runtime log output.
-- `src/commands/ingest.ts` owns ingest task prompt generation, optional branch creation, and validation-driven completion.
-- `src/commands/query.ts` owns query task prompt generation and validation of durable saved question pages.
+- `src/commands/ingest.ts` owns ingest task prompt generation, optional branch creation, local agent/provider execution, and validation-driven completion.
+- `src/commands/query.ts` owns query task prompt generation, local agent/provider execution, and validation of durable saved question pages.
 - `src/commands/lint.ts` and `src/commands/index.ts` own executable lint checks and rebuildable cache generation.
 - `src/commands/search.ts` and `src/commands/nav.ts` own offline search and Markdown graph/navigation command behavior.
 - `src/commands/explore.ts` owns Quartz Explorer runtime initialization and profile sync commands.
@@ -36,6 +36,8 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/deploy/` owns generated deploy workflows, deploy profiles, and local deploy preflight checks.
 - `src/uploadScaffold/` owns generated remote upload backend templates, docs, and form configuration.
 - `src/agentTasks/` owns deterministic agent prompt/task assembly.
+- `src/agents/` owns local CLI agent execution, availability checks, and temporary workspaces.
+- `src/proposals/` owns shared proposal policies, validation staging, safe application, and rollback.
 - `src/validation/` owns workflow-specific validation gates before state transitions.
 - `src/commands/status.ts` and `src/commands/snapshot.ts` own runtime health reporting and lint-gated Git snapshots.
 - `src/sourceCapture/` owns deterministic source IDs, hashing, metadata, duplicate detection, and raw writes.
@@ -46,7 +48,7 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/search/` and `src/nav/` own local Markdown search scoring, source relation lookup, wikilink navigation, orphan reporting, and graph JSON.
 - `src/profiles/` owns profile YAML loading and profile-based Markdown selection.
 - `src/quartz/` owns generated Quartz runtime files, profile materialization, static review pages, and manifests.
-- `src/providers/` owns explicit provider proposal execution and safe proposal application.
+- `src/providers/` owns explicit HTTP provider proposal requests and provider-specific normalization.
 - `src/runtime/status.ts` owns health aggregation across lint, queue, profiles, Git, and Explorer readiness.
 - `src/runtime/queue.ts` and `src/runtime/log.ts` own queue/source-card consistency and runtime log parsing/appending.
 - `src/runtime/config.ts` owns provider config loading, env-var secret checks, and Git feature config parsing.
@@ -71,9 +73,13 @@ llm-wiki queue
 llm-wiki queue show <source_id>
 llm-wiki queue set-status <source_id> ingesting
 llm-wiki ingest <source_id>
+llm-wiki ingest <source_id> --agent codex
+llm-wiki ingest <source_id> --auto
 llm-wiki ingest <source_id> --validate
 llm-wiki ingest <source_id> --provider local
 llm-wiki query "What does this source prove?" --save curated/questions/source-proof.md
+llm-wiki query "What does this source prove?" --save curated/questions/source-proof.md --agent codex
+llm-wiki query "What does this source prove?" --save curated/questions/source-proof.md --auto
 llm-wiki query "What does this source prove?" --save curated/questions/source-proof.md --validate
 llm-wiki query "What does this source prove?" --save curated/questions/source-proof.md --provider local
 llm-wiki log
@@ -121,9 +127,13 @@ llm-wiki queue --repo my-wiki --json
 llm-wiki queue show <source_id> --repo my-wiki --json
 llm-wiki queue set-status <source_id> ingesting --repo my-wiki --json
 llm-wiki ingest <source_id> --repo my-wiki --json
+llm-wiki ingest <source_id> --repo my-wiki --agent codex --json
+llm-wiki ingest <source_id> --repo my-wiki --auto --json
 llm-wiki ingest <source_id> --repo my-wiki --validate --json
 llm-wiki ingest <source_id> --repo my-wiki --provider local --json
 llm-wiki query "What does this source prove?" --repo my-wiki --save curated/questions/source-proof.md --json
+llm-wiki query "What does this source prove?" --repo my-wiki --save curated/questions/source-proof.md --agent codex --json
+llm-wiki query "What does this source prove?" --repo my-wiki --save curated/questions/source-proof.md --auto --json
 llm-wiki query "What does this source prove?" --repo my-wiki --save curated/questions/source-proof.md --validate --json
 llm-wiki query "What does this source prove?" --repo my-wiki --save curated/questions/source-proof.md --provider local --json
 llm-wiki log --repo my-wiki --json
@@ -160,7 +170,7 @@ llm-wiki snapshot --repo my-wiki --json
 
 `snapshot` runs lint before touching Git. It refuses to commit while error-severity lint issues exist, and malformed or unreadable config fails with an actionable config error before Git preflight. When lint passes, it stages the repository, creates a `chore: snapshot llm-wiki state` commit, falls back to the built-in llm-wiki Git identity when local Git identity is missing, and reports the commit SHA plus post-commit Git state.
 
-`add`, `add-text`, `add-url`, and upload API responses return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `ingest` and `query` return generated agent task prompts or validation results. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. `explore init` writes isolated Quartz runtime files, `explore sync` materializes profile-selected Markdown into generated Quartz content, `explore serve` starts the local Quartz script after sync and can optionally start the local upload daemon, `explore open` prints the recorded local URL, and `explore build` runs public sync, strict public lint, and the Quartz build script. `daemon` starts the local upload API. `deploy github-pages` generates the Pages workflow/profile pair, validates deploy readiness, and runs the local preflight sequence that mirrors CI. `upload init --target github` generates a remote upload scaffold without implementing a hosted service.
+`add`, `add-text`, `add-url`, and upload API responses return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `ingest` and `query` return generated manual task prompts, local agent/provider execution results, or validation results. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. `explore init` writes isolated Quartz runtime files, `explore sync` materializes profile-selected Markdown into generated Quartz content, `explore serve` starts the local Quartz script after sync and can optionally start the local upload daemon, `explore open` prints the recorded local URL, and `explore build` runs public sync, strict public lint, and the Quartz build script. `daemon` starts the local upload API. `deploy github-pages` generates the Pages workflow/profile pair, validates deploy readiness, and runs the local preflight sequence that mirrors CI. `upload init --target github` generates a remote upload scaffold without implementing a hosted service.
 
 ## Quartz Explorer
 
@@ -254,17 +264,57 @@ The scaffold is private and PR-first by default: authentication hooks are requir
 
 When the wiki has Git enabled, `ingest` recommends `git switch -c ingest/<source_id>`. Pass `--create-branch` to create that branch explicitly.
 
+`llm-wiki ingest <source_id> --agent codex` runs the configured local Codex agent against the generated ingest task in a temporary workspace, extracts changed curated Markdown files as proposals, validates them, applies them only after validation passes, and then marks the queue item `ingested`. `llm-wiki ingest <source_id> --auto` resolves `agent.default` from `.llm-wiki/config.yml` and runs that configured local agent.
+
 `llm-wiki ingest <source_id> --validate` checks that the agent created `curated/sources/<source_id>.md`, updated `curated/index.md`, appended an ingest log entry, kept `source_ids` on edited curated pages, and left raw originals unchanged. The queue item moves to `ingested` only after validation passes.
 
 `llm-wiki ingest <source_id> --provider <name>` is optional and never used unless requested explicitly. The configured provider must return structured file proposals under `curated/`; proposals are validated on a temporary copy with the same ingest validation gates before any files are applied. Rejected provider output does not change queue status or raw originals.
 
 ## Query Tasks
 
-`llm-wiki query "<question>" --save curated/questions/<slug>.md` loads `AGENTS.md`, `curated/index.md`, relevant curated pages, source summaries, `source_ids`, and linked context, then prints an agent task prompt. Without `--provider`, the CLI does not call an LLM provider or invent an answer.
+`llm-wiki query "<question>" --save curated/questions/<slug>.md` loads `AGENTS.md`, `curated/index.md`, relevant curated pages, source summaries, `source_ids`, and linked context, then prints an agent task prompt. Without `--agent`, `--auto`, or `--provider`, the CLI does not call an LLM or invent an answer.
+
+`llm-wiki query "<question>" --save curated/questions/<slug>.md --agent codex` runs the configured local Codex agent, validates the saved answer proposal, and applies only the requested saved question page, `curated/index.md`, and `curated/log.md`. `llm-wiki query "<question>" --save curated/questions/<slug>.md --auto` uses the configured default local agent. Agent query mode requires `--save`.
 
 After an agent writes the saved question page, `llm-wiki query "<question>" --save curated/questions/<slug>.md --validate` checks that the page has `type: question`, title, visibility, source references where sources are available, explicit open questions for missing provenance, an index entry, and a compatible `query` entry in `curated/log.md`.
 
 `llm-wiki query "<question>" --save curated/questions/<slug>.md --provider <name>` is optional explicit provider mode. It requires `--save`; provider proposals may only write the saved question page, `curated/index.md`, and `curated/log.md`, and must pass the same saved-query validation before being applied.
+
+## Local Agent Automation
+
+`--agent <name>` runs a configured local CLI agent such as Codex. `--auto` uses `agent.default` from `.llm-wiki/config.yml` and requires that default to name a configured local agent under `agents.<name>`. `--provider <name>` runs an explicit HTTP proposal service configured under `providers.<name>`. `--provider codex` is not a shortcut for local Codex; it is valid only if the repo intentionally configures an HTTP provider named `codex`.
+
+New Codex-initialized repositories include the local Codex agent config. Older repos that only have `CODEX.md` can add this to `.llm-wiki/config.yml`:
+
+```yaml
+agent:
+  default: codex
+agents:
+  codex:
+    type: local-exec
+    command: codex
+    args:
+      - exec
+    approval_policy: never
+    sandbox_mode: workspace-write
+    output_mode: git-diff
+    timeout_seconds: 900
+```
+
+The command is resolved from `PATH` unless `command` is an absolute path. Keep secrets out of `.llm-wiki/config.yml`; local agent config should describe the executable, arguments, sandbox policy, output mode, and timeout only.
+
+To inspect prompts or keep manual control, generate the task and run your agent yourself:
+
+```bash
+mkdir -p tasks
+llm-wiki ingest <source_id> --task-out tasks/ingest.md
+llm-wiki query "What changed in the PRD?" --save curated/questions/prd-changes.md > tasks/query.md
+codex exec "$(cat tasks/ingest.md)"
+llm-wiki ingest <source_id> --validate
+llm-wiki query "What changed in the PRD?" --save curated/questions/prd-changes.md --validate
+```
+
+After manual Codex execution, review `git diff` before validation. If automated ingest or query validation fails, the real repository is left unchanged by the rejected proposal set. Fix the underlying curated files manually or rerun the local agent after updating the prompt/context. Run the matching `--validate` command after making manual fixes so queue state, index requirements, and log entries are checked before the work is treated as complete.
 
 ## Provider Proposal Mode
 
@@ -375,4 +425,4 @@ The following PRD features are not implemented in this foundation slice:
 - Full Quartz browser feature wiring beyond the generated runtime defaults.
 - Remote upload workflows, remote API, and browser upload form.
 
-Until those features land, the supported product behavior is repo initialization plus local source capture, local daemon uploads, remote upload scaffold generation, ingest and query task scaffolding and validation, optional provider proposal mode, queue/log inspection, lint/index rebuild, status reporting, Git snapshots, offline search/navigation over local Markdown, Quartz init/sync/serve/open/build workflows, and GitHub Pages deploy workflow generation/preflight.
+Until those features land, the supported product behavior is repo initialization plus local source capture, local daemon uploads, remote upload scaffold generation, ingest and query task scaffolding, local agent execution, validation, optional provider proposal mode, queue/log inspection, lint/index rebuild, status reporting, Git snapshots, offline search/navigation over local Markdown, Quartz init/sync/serve/open/build workflows, and GitHub Pages deploy workflow generation/preflight.

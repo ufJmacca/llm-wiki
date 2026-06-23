@@ -15,6 +15,17 @@ import {
 
 type Config = {
   agent: { default: string };
+  agents?: {
+    codex?: {
+      type: string;
+      command: string;
+      args: string[];
+      approval_policy: string;
+      sandbox_mode: string;
+      output_mode: string;
+      timeout_seconds: number;
+    };
+  };
   defaults: { visibility: string; source_status: string };
   features: { obsidian: boolean; dataview: boolean; git: boolean };
   privacy: {
@@ -100,6 +111,7 @@ describe("init end-to-end scaffold contract", () => {
         "--json",
       ]);
       const payload = parseInitJson(result.stdout);
+      const config = await readGeneratedYaml<Config>(targetDir, ".llm-wiki/config.yml");
 
       // Assert
       expect(result.exitCode).toBe(0);
@@ -144,6 +156,20 @@ describe("init end-to-end scaffold contract", () => {
       expect(await pathExists(resolve(targetDir, ".git"))).toBe(false);
       expect(await pathExists(resolve(targetDir, "quartz"))).toBe(false);
       expect(await readGeneratedFile(targetDir, "CODEX.md")).toContain("AGENTS.md is authoritative");
+      expect(config).toMatchObject({
+        agent: { default: "codex" },
+        agents: {
+          codex: {
+            type: "local-exec",
+            command: "codex",
+            args: ["exec"],
+            approval_policy: "never",
+            sandbox_mode: "workspace-write",
+            output_mode: "git-diff",
+            timeout_seconds: 900,
+          },
+        },
+      });
       expect(await readGeneratedFile(targetDir, "curated/dashboards/ingestion-queue.md")).toContain(
         'FROM "raw/inputs"',
       );

@@ -2,6 +2,7 @@ import { CommanderError, type Command } from "commander";
 
 import type { CliIo } from "../cli.js";
 import { buildQueryTask, type QueryTask } from "../agentTasks/query.js";
+import { LocalAgentExecutionError, runCodexQueryAgent } from "../agents/index.js";
 import {
   applyProviderProposalsWithValidation,
   createProviderQueryProposalPolicy,
@@ -9,6 +10,10 @@ import {
   requestProviderFileProposals,
   validateProposalsOnTemporaryRepo,
 } from "../providers/index.js";
+import {
+  applyProposalsWithValidation as applyAgentProposalsWithValidation,
+  validateProposalsOnTemporaryRepo as validateAgentProposalsOnTemporaryRepo,
+} from "../proposals/index.js";
 import {
   loadDefaultLocalAgentConfig,
   loadLocalAgentConfig,
@@ -59,7 +64,20 @@ type QueryProviderData = {
   };
 };
 
-type QueryData = QueryTask | QueryValidationData | QueryProviderData;
+type QueryAgentData = {
+  mode: "agent";
+  agent: string;
+  question: string;
+  save_path: string;
+  saved_path: string;
+  applied_paths: string[];
+  validation: {
+    passed: true;
+    issues: [];
+  };
+};
+
+type QueryData = QueryTask | QueryValidationData | QueryProviderData | QueryAgentData;
 
 export function registerQueryCommand(program: Command, io: CliIo): void {
   addRuntimeOptions(
@@ -149,6 +167,8 @@ async function runQueryCommand(question: string, rawOptions: RawQueryOptions, io
 
     const commandError = error instanceof RuntimeCommandError
       ? error
+      : error instanceof LocalAgentExecutionError
+        ? agentExecutionRuntimeError(error)
       : new RuntimeCommandError({
           code: "QUERY_FAILED",
           message: error instanceof Error ? error.message : String(error),
@@ -217,19 +237,54 @@ function isAgentModeRequested(rawOptions: RawQueryOptions): boolean {
 
 async function executeAgentQuery(
   repoRoot: string,
-  _question: string,
-  _savePath: string | null,
+  question: string,
+  savePath: string | null,
   rawOptions: RawQueryOptions,
-): Promise<never> {
-  const agent = await resolveLocalAgentConfig(repoRoot, rawOptions);
-  const agentConfigPath = `.llm-wiki/config.yml:agents.${agent.name}`;
+): Promise<QueryAgentData> {
+  if (savePath === null) {
+    throw new RuntimeCommandError({
+      code: "QUERY_SAVE_REQUIRED",
+      message: "Query agent mode requires --save <path>.",
+      hint: "Run llm-wiki query \"<question>\" --save curated/questions/<slug>.md --agent <name>, or use --auto when agent.default is configured.",
+      path: "--save",
+    });
+  }
 
-  throw new RuntimeCommandError({
-    code: "AGENT_EXECUTION_UNAVAILABLE",
-    message: `Local agent execution is not implemented for query yet: ${agent.name}.`,
-    hint: `Resolved local agent config at ${agentConfigPath}. Use manual prompt generation without --agent/--auto, or use --provider <name> for an HTTP proposal provider until the local Codex adapter is enabled.`,
-    path: agentConfigPath,
+  const task = await createQueryTask(repoRoot, question, savePath);
+  const agent = await resolveLocalAgentConfig(repoRoot, rawOptions);
+  const agentResult = await runCodexQueryAgent({
+    repoRoot,
+    agent,
+    taskPrompt: task.task.prompt,
+    savePath,
   });
+
+  await validateAgentProposalsOnTemporaryRepo(repoRoot, agentResult.proposals, agentResult.policy, async (tempRepoRoot) => {
+    const validation = await validateQuerySaveReadiness(tempRepoRoot, question, savePath);
+    if (!validation.passed) {
+      throw new QueryValidationFailedError(validation.issues);
+    }
+  });
+
+  const { appliedPaths, validation } = await applyAgentProposalsWithValidation(
+    repoRoot,
+    agentResult.proposals,
+    agentResult.policy,
+    async () => validateCompletedQuery(repoRoot, question, savePath),
+  );
+
+  return {
+    mode: "agent",
+    agent: agent.name,
+    question,
+    save_path: validation.save_path,
+    saved_path: validation.save_path,
+    applied_paths: appliedPaths,
+    validation: {
+      passed: true,
+      issues: [],
+    },
+  };
 }
 
 async function executeProviderQuery(
@@ -378,6 +433,28 @@ function publicProviderData(provider: HttpProviderConfig): QueryProviderData["pr
   };
 }
 
+function agentExecutionRuntimeError(error: LocalAgentExecutionError): RuntimeCommandError {
+  const message = error.code === "AGENT_COMMAND_UNAVAILABLE"
+    ? error.message
+    : [
+        error.message,
+        `Executable: ${error.executablePath}.`,
+        `exit code ${error.exitCode ?? "none"}.`,
+        `signal ${error.signal ?? "none"}.`,
+        `changes observed: ${error.changesObserved ? "yes" : "no"}.`,
+      ].join(" ");
+  const stderrHint = error.stderrTail.trim() === ""
+    ? "No stderr was captured."
+    : `stderr tail: ${error.stderrTail.trim()}`;
+
+  return new RuntimeCommandError({
+    code: error.code,
+    message,
+    hint: `${error.hint} ${stderrHint}`,
+    path: error.executablePath,
+  });
+}
+
 class QueryValidationFailedError extends Error {
   readonly issues: QueryValidationIssue[];
 
@@ -445,6 +522,16 @@ function formatHumanQuery(data: QueryData): string {
       `Saved page: ${data.save_path}`,
       "Applied paths:",
       ...data.proposals.applied_paths.map((path) => `- ${path}`),
+    ].join("\n");
+  }
+
+  if (data.mode === "agent") {
+    return [
+      `Agent query applied: ${data.agent}`,
+      `Question: ${data.question}`,
+      `Saved page: ${data.save_path}`,
+      "Applied paths:",
+      ...data.applied_paths.map((path) => `- ${path}`),
     ].join("\n");
   }
 

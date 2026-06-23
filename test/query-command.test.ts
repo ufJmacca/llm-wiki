@@ -119,6 +119,32 @@ async function captureTextSource(
   return payload.data.source;
 }
 
+async function configureCodexLocalAgent(
+  wikiDir: string,
+  input: { defaultAgent: "generic" | "codex" },
+): Promise<void> {
+  const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+  const config = await readFile(configPath, "utf8");
+  const baseConfig = input.defaultAgent === "codex"
+    ? config.replace("default: generic", "default: codex")
+    : config;
+  await writeFile(
+    configPath,
+    [
+      baseConfig.trimEnd(),
+      "agents:",
+      "  codex:",
+      "    type: local-exec",
+      "    command: codex",
+      "    args:",
+      "      - exec",
+      "    timeout_seconds: 900",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+}
+
 async function writeCuratedPage(
   wikiDir: string,
   path: string,
@@ -173,6 +199,262 @@ function parseJsonFailure<Command extends string>(stdout: string[]): RuntimeFail
 }
 
 describe("query command task scaffolding", () => {
+  it.each([
+    {
+      name: "agent and provider",
+      args: ["--agent", "codex", "--provider", "local"],
+      message: "Choose only one query execution mode.",
+    },
+    {
+      name: "auto and provider",
+      args: ["--auto", "--provider", "local"],
+      message: "Choose only one query execution mode.",
+    },
+    {
+      name: "auto and agent",
+      args: ["--auto", "--agent", "codex"],
+      message: "Choose only one query execution mode.",
+    },
+    {
+      name: "provider and validate",
+      args: ["--provider", "local", "--validate"],
+      message: "Query validation cannot be combined with execution mode.",
+    },
+    {
+      name: "agent and validate",
+      args: ["--agent", "codex", "--validate"],
+      message: "Query validation cannot be combined with execution mode.",
+    },
+    {
+      name: "auto and validate",
+      args: ["--auto", "--validate"],
+      message: "Query validation cannot be combined with execution mode.",
+    },
+  ])("rejects conflicting query mode flags: $name", async ({ args, message }) => {
+    await withTempWorkspace("llm-wiki-query-mode-conflict-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+
+      // Act
+      const result = await runCliBuffered([
+        "query",
+        "Can conflicting query modes run together?",
+        "--repo",
+        wikiDir,
+        "--save",
+        "curated/questions/query-mode-conflict.md",
+        ...args,
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"query">(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "QUERY_MODE_CONFLICT",
+        message,
+      });
+      expect(payload.error.hint).toContain("--agent");
+      expect(payload.error.hint).toContain("--auto");
+      expect(payload.error.hint).toContain("--provider");
+    });
+  });
+
+  it.each(["--agent", "--auto"])("requires --save before resolving query %s mode", async (modeFlag) => {
+    await withTempWorkspace("llm-wiki-query-agent-save-required-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+      const config = await readFile(configPath, "utf8");
+      await writeFile(
+        configPath,
+        [
+          config.replace("default: generic", "default: codex").trimEnd(),
+          "agents:",
+          "  codex:",
+          "    type: http",
+          "    command: codex",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered([
+        "query",
+        "Does query agent mode require a durable output path?",
+        "--repo",
+        wikiDir,
+        modeFlag,
+        ...(modeFlag === "--agent" ? ["codex"] : []),
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"query">(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "QUERY_SAVE_REQUIRED",
+        message: "Query agent mode requires --save <path>.",
+      });
+      expect(payload.error.hint).toContain("--save curated/questions/<slug>.md");
+      expect(JSON.stringify(payload)).not.toContain("Agent type must be local-exec");
+    });
+  });
+
+  it("fails query --auto early when the default agent has no local agent config", async () => {
+    await withTempWorkspace("llm-wiki-query-auto-missing-agent-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+
+      // Act
+      const result = await runCliBuffered([
+        "query",
+        "Can auto query run without a configured local agent?",
+        "--repo",
+        wikiDir,
+        "--save",
+        "curated/questions/auto-missing-agent.md",
+        "--auto",
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"query">(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "AGENT_CONFIG_MISSING",
+        message: "Local agent is not configured: generic.",
+        hint: expect.stringContaining("local agent mode"),
+      });
+      expect(payload.issues[0]).toMatchObject({
+        path: ".llm-wiki/config.yml:agents.generic",
+      });
+    });
+  });
+
+  it("fails query --auto early when the configured default agent is not local-exec", async () => {
+    await withTempWorkspace("llm-wiki-query-auto-unsupported-agent-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+      const config = await readFile(configPath, "utf8");
+      await writeFile(
+        configPath,
+        [
+          config.replace("default: generic", "default: codex").trimEnd(),
+          "agents:",
+          "  codex:",
+          "    type: http",
+          "    command: codex",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered([
+        "query",
+        "Can auto query use an HTTP-shaped agent?",
+        "--repo",
+        wikiDir,
+        "--save",
+        "curated/questions/auto-unsupported-agent.md",
+        "--auto",
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"query">(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "AGENT_CONFIG_INVALID",
+        message: "Agent type must be local-exec.",
+      });
+      expect(payload.issues[0]).toMatchObject({
+        path: ".llm-wiki/config.yml:agents.codex.type",
+      });
+    });
+  });
+
+  it.each([
+    {
+      name: "explicit --agent codex",
+      args: ["--agent", "codex"],
+      defaultAgent: "generic" as const,
+    },
+    {
+      name: "--auto with agent.default",
+      args: ["--auto"],
+      defaultAgent: "codex" as const,
+    },
+  ])("resolves a valid local agent config before deferred query handoff: $name", async ({ args, defaultAgent }) => {
+    await withTempWorkspace("llm-wiki-query-agent-handoff-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await configureCodexLocalAgent(wikiDir, { defaultAgent });
+
+      // Act
+      const result = await runCliBuffered([
+        "query",
+        "Can query select a configured local agent?",
+        "--repo",
+        wikiDir,
+        "--save",
+        "curated/questions/local-agent-handoff.md",
+        ...args,
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"query">(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "AGENT_EXECUTION_UNAVAILABLE",
+        message: "Local agent execution is not implemented for query yet: codex.",
+      });
+      expect(payload.error.hint).toContain(".llm-wiki/config.yml:agents.codex");
+      expect(payload.issues[0]).toMatchObject({
+        path: ".llm-wiki/config.yml:agents.codex",
+      });
+    });
+  });
+
+  it("keeps query prompt generation manual when execution flags are omitted", async () => {
+    await withTempWorkspace("llm-wiki-query-manual-task-default-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+
+      // Act
+      const result = await runCliBuffered([
+        "query",
+        "What can the wiki answer manually?",
+        "--repo",
+        wikiDir,
+        "--json",
+      ]);
+      const payload = parseJsonSuccess<"query", QueryTaskData>(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.mode).toBe("task");
+      expect(payload.data.save_path).toBeNull();
+      expect(payload.data.task.prompt).toContain("What can the wiki answer manually?");
+    });
+  });
+
   it("builds an agent prompt from curated Markdown, source summaries, index, source IDs, and relevant links", async () => {
     await withTempWorkspace("llm-wiki-query-task-", async (workspaceDir) => {
       // Arrange

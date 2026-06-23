@@ -4,6 +4,8 @@ import type { CliIo } from "../cli.js";
 import { buildQueryTask, type QueryTask } from "../agentTasks/query.js";
 import {
   applyProviderProposalsWithValidation,
+  createProviderQueryProposalPolicy,
+  normalizeProviderProposalsForPolicy,
   requestProviderFileProposals,
   validateProposalsOnTemporaryRepo,
 } from "../providers/index.js";
@@ -181,20 +183,21 @@ async function executeProviderQuery(
     provider,
     task,
   });
-  rejectQuerySourceSummaryProposals(proposals);
-  rejectUnexpectedQueryProviderProposals(proposals, task.save_path ?? savePath);
+  const proposalPolicy = createProviderQueryProposalPolicy(task.save_path ?? savePath);
+  const queryProposals = normalizeProviderProposalsForPolicy(proposals, proposalPolicy);
 
-  await validateProposalsOnTemporaryRepo(repoRoot, proposals, async (tempRepoRoot) => {
+  await validateProposalsOnTemporaryRepo(repoRoot, queryProposals, async (tempRepoRoot) => {
     const validation = await validateQuerySaveReadiness(tempRepoRoot, question, savePath);
     if (!validation.passed) {
       throw new QueryValidationFailedError(validation.issues);
     }
-  });
+  }, proposalPolicy);
 
   const { appliedPaths, validation } = await applyProviderProposalsWithValidation(
     repoRoot,
-    proposals,
+    queryProposals,
     async () => validateCompletedQuery(repoRoot, question, savePath),
+    proposalPolicy,
   );
 
   return {
@@ -282,39 +285,6 @@ function publicProviderData(provider: HttpProviderConfig): QueryProviderData["pr
     name: provider.name,
     model: provider.model,
   };
-}
-
-function rejectQuerySourceSummaryProposals(proposals: { files: Array<{ path: string }> }): void {
-  const sourceSummaryProposal = proposals.files.find((proposal) => isSourceSummaryPath(proposal.path));
-  if (sourceSummaryProposal === undefined) {
-    return;
-  }
-
-  throw new RuntimeCommandError({
-    code: "PROVIDER_PROPOSAL_REJECTED",
-    message: `Query provider proposals cannot create or modify source summaries: ${sourceSummaryProposal.path}.`,
-    hint: "Query provider mode may cite only source summaries that existed before the provider proposal.",
-    path: sourceSummaryProposal.path,
-  });
-}
-
-function rejectUnexpectedQueryProviderProposals(proposals: { files: Array<{ path: string }> }, savePath: string): void {
-  const allowedPaths = new Set([savePath, "curated/index.md", "curated/log.md"]);
-  const unexpectedProposal = proposals.files.find((proposal) => !allowedPaths.has(proposal.path));
-  if (unexpectedProposal === undefined) {
-    return;
-  }
-
-  throw new RuntimeCommandError({
-    code: "PROVIDER_PROPOSAL_REJECTED",
-    message: `Query provider proposal path is not an expected saved-query output: ${unexpectedProposal.path}.`,
-    hint: `Query provider mode may only write ${savePath}, curated/index.md, and curated/log.md.`,
-    path: unexpectedProposal.path,
-  });
-}
-
-function isSourceSummaryPath(path: string): boolean {
-  return /^curated\/sources\/[^/]+\.md$/.test(path);
 }
 
 class QueryValidationFailedError extends Error {

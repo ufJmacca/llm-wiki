@@ -1,14 +1,16 @@
-import { cp, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { posix, relative, resolve } from "node:path";
-
 import type { HttpProviderConfig } from "../runtime/config.js";
 import { RuntimeCommandError } from "../runtime/errors.js";
 import {
-  readTextFileInsideRoot,
-  validateTextFileWriteInsideRoot,
-  writeTextFileInsideRoot,
-} from "../utils/fs.js";
+  applyProposals,
+  applyProposalsWithValidation,
+  createIngestProposalPolicy,
+  createQueryProposalPolicy,
+  normalizeFileProposals,
+  validateProposalsOnTemporaryRepo as validateCoreProposalsOnTemporaryRepo,
+  type FileProposal,
+  type ProposalPolicy,
+  type ProposalSet,
+} from "../proposals/index.js";
 
 export type ProviderRequestInput = {
   kind: "ingest" | "query";
@@ -16,21 +18,20 @@ export type ProviderRequestInput = {
   task: unknown;
 };
 
-export type ProviderFileProposal = {
-  path: string;
-  content: string;
-};
+export type ProviderFileProposal = FileProposal;
 
-export type ProviderProposalSet = {
-  files: ProviderFileProposal[];
-};
+export type ProviderProposalSet = ProposalSet;
 
-type ProposalSnapshot = {
-  path: string;
-  content: string | null;
-};
-
-const RUNTIME_LOG_PATH = "curated/log.md";
+const PROVIDER_PROPOSAL_POLICY = createIngestProposalPolicy({
+  rejectionCode: "PROVIDER_PROPOSAL_REJECTED",
+  writeFailedCode: "PROVIDER_PROPOSAL_WRITE_FAILED",
+  rejectedPathHint: "Provider proposals may only write Markdown files under curated/.",
+  duplicatePathHint: "Return one file proposal per path.",
+  writeRejectedHint: "Provider file proposals must target safe Markdown files inside curated/.",
+  writeFailedHint: "Fix filesystem permissions or unsafe proposal paths, then rerun provider mode.",
+  pathRejectedMessage: (path) => `Provider proposal path is not allowed: ${path}.`,
+  duplicatePathMessage: (path) => `Provider proposed the same path more than once: ${path}.`,
+});
 
 export async function requestProviderFileProposals(input: ProviderRequestInput): Promise<ProviderProposalSet> {
   let response: Response;
@@ -94,128 +95,53 @@ export async function validateProposalsOnTemporaryRepo(
   repoRoot: string,
   proposals: ProviderProposalSet,
   validate: (tempRepoRoot: string) => Promise<void>,
+  policy: ProposalPolicy = PROVIDER_PROPOSAL_POLICY,
 ): Promise<void> {
-  const tempParent = await mkdtemp(resolve(tmpdir(), "llm-wiki-provider-proposals-"));
-  const tempRepoRoot = resolve(tempParent, "repo");
-
-  try {
-    await cp(repoRoot, tempRepoRoot, {
-      filter: (source) => !isRootGitMetadataPath(repoRoot, source),
-      preserveTimestamps: true,
-      recursive: true,
-      verbatimSymlinks: true,
-    });
-    await applyProviderProposals(tempRepoRoot, proposals);
-    await validate(tempRepoRoot);
-  } finally {
-    await rm(tempParent, { recursive: true, force: true });
-  }
+  await validateCoreProposalsOnTemporaryRepo(repoRoot, proposals, policy, validate);
 }
 
-function isRootGitMetadataPath(repoRoot: string, sourcePath: string): boolean {
-  const path = relative(repoRoot, sourcePath).replaceAll("\\", "/");
-  return path === ".git" || path.startsWith(".git/");
-}
-
-export async function applyProviderProposals(repoRoot: string, proposals: ProviderProposalSet): Promise<string[]> {
-  const result = await applyProviderProposalsWithValidation(repoRoot, proposals, async () => undefined);
-
-  return result.appliedPaths;
+export async function applyProviderProposals(
+  repoRoot: string,
+  proposals: ProviderProposalSet,
+  policy: ProposalPolicy = PROVIDER_PROPOSAL_POLICY,
+): Promise<string[]> {
+  return applyProposals(repoRoot, proposals, policy);
 }
 
 export async function applyProviderProposalsWithValidation<ValidationResult>(
   repoRoot: string,
   proposals: ProviderProposalSet,
   validate: () => Promise<ValidationResult>,
+  policy: ProposalPolicy = PROVIDER_PROPOSAL_POLICY,
 ): Promise<{ appliedPaths: string[]; validation: ValidationResult }> {
-  const normalizedProposals = normalizeProposalPaths(proposals);
-  const snapshots: ProposalSnapshot[] = [];
-
-  for (const proposal of normalizedProposals) {
-    const writeTarget = await validateTextFileWriteInsideRoot(repoRoot, proposal.path);
-    if (!writeTarget.ok) {
-      throw new RuntimeCommandError({
-        code: "PROVIDER_PROPOSAL_REJECTED",
-        message: writeTarget.error.message,
-        hint: "Provider file proposals must target safe Markdown files inside curated/.",
-        path: writeTarget.error.path,
-      });
-    }
-  }
-
-  for (const proposal of normalizedProposals) {
-    const existing = await readTextFileInsideRoot(repoRoot, proposal.path);
-    snapshots.push({
-      path: proposal.path,
-      content: existing.ok ? existing.value : null,
-    });
-  }
-
-  const writtenPaths: string[] = [];
-  try {
-    const snapshotByPath = new Map(snapshots.map((snapshot) => [snapshot.path, snapshot.content]));
-    for (const proposal of normalizedProposals) {
-      const write = await writeTextFileInsideRoot(
-        repoRoot,
-        proposal.path,
-        providerProposalWriteContent(proposal, snapshotByPath.get(proposal.path) ?? null),
-      );
-      if (!write.ok) {
-        throw new RuntimeCommandError({
-          code: "PROVIDER_PROPOSAL_WRITE_FAILED",
-          message: write.error.message,
-          hint: "Fix filesystem permissions or unsafe proposal paths, then rerun provider mode.",
-          path: write.error.path,
-        });
-      }
-
-      writtenPaths.push(proposal.path);
-    }
-
-    const validation = await validate();
-
-    return {
-      appliedPaths: writtenPaths.sort(),
-      validation,
-    };
-  } catch (error) {
-    await rollbackProviderProposalWrites(repoRoot, snapshots);
-    throw error;
-  }
+  return applyProposalsWithValidation(repoRoot, proposals, policy, validate);
 }
 
-function providerProposalWriteContent(proposal: ProviderFileProposal, existingContent: string | null): string {
-  if (proposal.path !== RUNTIME_LOG_PATH || existingContent === null) {
-    return proposal.content;
-  }
-
-  return appendProviderLogProposal(existingContent, proposal.content);
+export function createProviderQueryProposalPolicy(savePath: string): ProposalPolicy {
+  return createQueryProposalPolicy(savePath, {
+    rejectionCode: "PROVIDER_PROPOSAL_REJECTED",
+    writeFailedCode: "PROVIDER_PROPOSAL_WRITE_FAILED",
+    rejectedPathHint: "Provider proposals may only write Markdown files under curated/.",
+    duplicatePathHint: "Return one file proposal per path.",
+    writeRejectedHint: "Provider file proposals must target safe Markdown files inside curated/.",
+    writeFailedHint: "Fix filesystem permissions or unsafe proposal paths, then rerun provider mode.",
+    pathRejectedMessage: (path) => `Provider proposal path is not allowed: ${path}.`,
+    duplicatePathMessage: (path) => `Provider proposed the same path more than once: ${path}.`,
+    sourceSummaryRejectedMessage: (path) => `Query provider proposals cannot create or modify source summaries: ${path}.`,
+    sourceSummaryRejectedHint: "Query provider mode may cite only source summaries that existed before the provider proposal.",
+    unexpectedPathRejectedMessage: (path) => `Query provider proposal path is not an expected saved-query output: ${path}.`,
+    unexpectedPathRejectedHint: (savePathValue) =>
+      `Query provider mode may only write ${savePathValue}, curated/index.md, and curated/log.md.`,
+  });
 }
 
-function appendProviderLogProposal(existingContent: string, proposedContent: string): string {
-  const normalizedExisting = normalizeMarkdownNewlines(existingContent).trim();
-  const normalizedProposed = normalizeMarkdownNewlines(proposedContent).trim();
-  if (normalizedExisting !== "" && normalizedProposed.startsWith(normalizedExisting)) {
-    return proposedContent;
-  }
-
-  const proposedAppend = stripProviderLogTitle(proposedContent).trimStart();
-  if (proposedAppend === "") {
-    return existingContent;
-  }
-
-  const existingWithNewline = existingContent.endsWith("\n") ? existingContent : `${existingContent}\n`;
-  const separator = existingWithNewline.endsWith("\n\n") ? "" : "\n";
-
-  return `${existingWithNewline}${separator}${proposedAppend}`;
-}
-
-function stripProviderLogTitle(content: string): string {
-  return content.replaceAll("\r\n", "\n").replaceAll("\r", "\n").replace(/^# Log[ \t]*\n+/, "");
-}
-
-function normalizeMarkdownNewlines(content: string): string {
-  return content.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+export function normalizeProviderProposalsForPolicy(
+  proposals: ProviderProposalSet,
+  policy: ProposalPolicy = PROVIDER_PROPOSAL_POLICY,
+): ProviderProposalSet {
+  return {
+    files: normalizeFileProposals(proposals, policy),
+  };
 }
 
 function normalizeProviderProposalSet(value: unknown, providerName: string): ProviderProposalSet {
@@ -242,68 +168,7 @@ function normalizeProviderProposalSet(value: unknown, providerName: string): Pro
     return { path, content };
   });
 
-  return {
-    files: normalizeProposalPaths({ files: proposals }),
-  };
-}
-
-function normalizeProposalPaths(proposals: ProviderProposalSet): ProviderFileProposal[] {
-  const seen = new Set<string>();
-  const normalized: ProviderFileProposal[] = [];
-
-  for (const proposal of proposals.files) {
-    const path = normalizeProviderPath(proposal.path);
-    if (path === null || !isAllowedProviderProposalPath(path)) {
-      throw new RuntimeCommandError({
-        code: "PROVIDER_PROPOSAL_REJECTED",
-        message: `Provider proposal path is not allowed: ${proposal.path}.`,
-        hint: "Provider proposals may only write Markdown files under curated/.",
-        path: proposal.path,
-      });
-    }
-
-    if (seen.has(path)) {
-      throw new RuntimeCommandError({
-        code: "PROVIDER_PROPOSAL_REJECTED",
-        message: `Provider proposed the same path more than once: ${path}.`,
-        hint: "Return one file proposal per path.",
-        path,
-      });
-    }
-
-    seen.add(path);
-    normalized.push({ path, content: proposal.content });
-  }
-
-  return normalized.sort((left, right) => left.path.localeCompare(right.path));
-}
-
-function normalizeProviderPath(path: string): string | null {
-  if (path.trim() === "" || path.includes("\0") || path.includes("\\") || path.startsWith("/")) {
-    return null;
-  }
-
-  const segments = path.split("/");
-  if (segments.includes("..")) {
-    return null;
-  }
-
-  return posix.normalize(path).replace(/\/+$/, "");
-}
-
-function isAllowedProviderProposalPath(path: string): boolean {
-  return path.startsWith("curated/") && path.endsWith(".md") && !path.split("/").includes(".git");
-}
-
-async function rollbackProviderProposalWrites(repoRoot: string, snapshots: ProposalSnapshot[]): Promise<void> {
-  for (const snapshot of snapshots.reverse()) {
-    if (snapshot.content === null) {
-      await rm(resolve(repoRoot, snapshot.path), { force: true }).catch(() => undefined);
-      continue;
-    }
-
-    await writeTextFileInsideRoot(repoRoot, snapshot.path, snapshot.content);
-  }
+  return normalizeProviderProposalsForPolicy({ files: proposals });
 }
 
 function providerOutputInvalid(message: string, path: string): RuntimeCommandError {

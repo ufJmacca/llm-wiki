@@ -1002,9 +1002,17 @@ describe("explicit provider proposal mode", () => {
         // Assert
         expect(result.exitCode).toBe(1);
         expect(result.stderr).toEqual([]);
-        expect(payload.error.code).toBe("PROVIDER_PROPOSAL_REJECTED");
-        expect(payload.issues[0]).toMatchObject({
+        expect(payload.error).toEqual({
+          code: "PROVIDER_PROPOSAL_REJECTED",
+          message: `Provider proposal path is not allowed: ${source.original_path}.`,
+          hint: "Provider proposals may only write Markdown files under curated/.",
+        });
+        expect(payload.issues[0]).toEqual({
+          severity: "error",
+          code: "PROVIDER_PROPOSAL_REJECTED",
+          message: `Provider proposal path is not allowed: ${source.original_path}.`,
           path: source.original_path,
+          hint: "Provider proposals may only write Markdown files under curated/.",
         });
         expect(queuePayload.data.queue_record.status).toBe("queued");
         expect(queuePayload.data.source_card.frontmatter.status).toBe("queued");
@@ -1340,9 +1348,17 @@ describe("explicit provider proposal mode", () => {
         // Assert
         expect(result.exitCode).toBe(1);
         expect(result.stderr).toEqual([]);
-        expect(payload.error.code).toBe("PROVIDER_PROPOSAL_REJECTED");
-        expect(payload.issues[0]).toMatchObject({
+        expect(payload.error).toEqual({
+          code: "PROVIDER_PROPOSAL_REJECTED",
+          message: `Query provider proposals cannot create or modify source summaries: curated/sources/${inventedSourceId}.md.`,
+          hint: "Query provider mode may cite only source summaries that existed before the provider proposal.",
+        });
+        expect(payload.issues[0]).toEqual({
+          severity: "error",
+          code: "PROVIDER_PROPOSAL_REJECTED",
+          message: `Query provider proposals cannot create or modify source summaries: curated/sources/${inventedSourceId}.md.`,
           path: `curated/sources/${inventedSourceId}.md`,
+          hint: "Query provider mode may cite only source summaries that existed before the provider proposal.",
         });
         expect(after).toEqual(before);
       } finally {
@@ -1435,8 +1451,18 @@ describe("explicit provider proposal mode", () => {
         // Assert
         expect(result.exitCode).toBe(1);
         expect(result.stderr).toEqual([]);
-        expect(payload.error.code).toBe("PROVIDER_PROPOSAL_REJECTED");
-        expect(payload.issues[0]).toMatchObject({ path: extraPath });
+        expect(payload.error).toEqual({
+          code: "PROVIDER_PROPOSAL_REJECTED",
+          message: `Query provider proposal path is not an expected saved-query output: ${extraPath}.`,
+          hint: "Query provider mode may only write curated/questions/provider-answer.md, curated/index.md, and curated/log.md.",
+        });
+        expect(payload.issues[0]).toEqual({
+          severity: "error",
+          code: "PROVIDER_PROPOSAL_REJECTED",
+          message: `Query provider proposal path is not an expected saved-query output: ${extraPath}.`,
+          path: extraPath,
+          hint: "Query provider mode may only write curated/questions/provider-answer.md, curated/index.md, and curated/log.md.",
+        });
         expect(queuePayload.data.queue_record.status).toBe("queued");
         expect(queuePayload.data.source_card.frontmatter.status).toBe("queued");
         expect(rawOriginalAfter).toBe(rawOriginalBefore);

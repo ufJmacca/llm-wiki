@@ -276,6 +276,19 @@ describe("runtime config local agents", () => {
       expectedMessage: "Agent timeout_seconds must be a positive integer when present.",
       expectedPath: ".llm-wiki/config.yml:agents.codex.timeout_seconds",
     },
+    {
+      name: "unsupported output modes",
+      source: [
+        "agents:",
+        "  codex:",
+        "    type: local-exec",
+        "    command: codex",
+        "    output_mode: json",
+        "",
+      ].join("\n"),
+      expectedMessage: "Agent output_mode must be git-diff when present.",
+      expectedPath: ".llm-wiki/config.yml:agents.codex.output_mode",
+    },
   ])("rejects malformed local agent config: $name", async ({ source, expectedMessage, expectedPath }) => {
     await withTempWorkspace("llm-wiki-config-agent-invalid-", async (workspaceDir) => {
       // Arrange

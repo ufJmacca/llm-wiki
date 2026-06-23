@@ -668,6 +668,95 @@ process.stdin.on("end", () => {
     });
   });
 
+  it("honors configured Codex approval and sandbox options for aliased command: codex configs", async () => {
+    await withTempWorkspace("llm-wiki-agent-exec-codex-config-flags-", async (workspaceDir) => {
+      // Arrange
+      const agentCwd = resolve(workspaceDir, "repo-copy");
+      const logPath = resolve(workspaceDir, "codex-config-flags.log");
+      const taskPrompt = "write curated markdown from configured Codex";
+      await mkdir(agentCwd, { recursive: true });
+      const { executablePath, binDir } = await createFakeExecutable({
+        source: `#!/usr/bin/env node
+const fs = require("node:fs");
+let stdin = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  stdin += chunk;
+});
+process.stdin.on("end", () => {
+  fs.appendFileSync(process.env.LLM_WIKI_FAKE_AGENT_LOG, JSON.stringify({
+    args: process.argv.slice(2),
+    cwd: process.cwd(),
+    stdin
+  }) + "\\n", "utf8");
+  process.stdout.write("configured codex flags done\\n");
+});
+`,
+      });
+
+      try {
+        // Act
+        const result = await runLocalAgentCommand({
+          agent: localAgent({
+            name: "safe-codex",
+            command: "codex",
+            args: ["exec", "--json"],
+            approvalPolicy: "never",
+            sandboxMode: "workspace-write",
+            outputMode: "git-diff",
+          }),
+          cwd: agentCwd,
+          taskPrompt,
+          changesObserved: false,
+          env: {
+            ...process.env,
+            PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+            LLM_WIKI_FAKE_AGENT_LOG: logPath,
+          },
+        });
+
+        // Assert
+        expect(result).toMatchObject({
+          agentName: "safe-codex",
+          executablePath,
+          args: [
+            "--ask-for-approval",
+            "never",
+            "--sandbox",
+            "workspace-write",
+            "exec",
+            "--json",
+            taskPrompt,
+          ],
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: {
+            text: "configured codex flags done\n",
+            truncated: false,
+          },
+        });
+        await expect(readInvocationLog(logPath)).resolves.toEqual([
+          {
+            args: [
+              "--ask-for-approval",
+              "never",
+              "--sandbox",
+              "workspace-write",
+              "exec",
+              "--json",
+              "-",
+            ],
+            cwd: agentCwd,
+            stdin: taskPrompt,
+          },
+        ]);
+      } finally {
+        await rm(binDir, { force: true, recursive: true });
+      }
+    });
+  });
+
   it("streams large Codex exec prompts to stdin when -C precedes exec", async () => {
     await withTempWorkspace("llm-wiki-agent-exec-codex-short-cd-stdin-", async (workspaceDir) => {
       // Arrange
@@ -1089,6 +1178,109 @@ fs.appendFileSync(process.env.LLM_WIKI_TASKKILL_LOG, JSON.stringify(process.argv
           ]);
         });
       } finally {
+        await rm(agentBinDir, { force: true, recursive: true });
+        await rm(taskkillBinDir, { force: true, recursive: true });
+      }
+    });
+  });
+
+  it("waits for Windows process-tree termination before returning timeout diagnostics", async () => {
+    await withTempWorkspace("llm-wiki-agent-exec-windows-shim-timeout-wait-", async (workspaceDir) => {
+      // Arrange
+      const agentCwd = resolve(workspaceDir, "repo-copy");
+      const releaseTaskkillPath = resolve(workspaceDir, "release-taskkill");
+      const taskkillLogPath = resolve(workspaceDir, "taskkill-wait.log");
+      await mkdir(agentCwd, { recursive: true });
+      const { binDir: agentBinDir } = await createFakeExecutable({
+        name: "codex.cmd",
+        source: "@echo off\n",
+      });
+      const fakeCmdPath = resolve(workspaceDir, "fake-cmd-wait");
+      await writeFile(fakeCmdPath, `#!/usr/bin/env node
+process.stderr.write("shim wrapper running\\n");
+process.on("SIGTERM", () => {
+  process.stderr.write("wrapper ignored SIGTERM\\n");
+});
+setInterval(() => {}, 1000);
+`, "utf8");
+      await chmod(fakeCmdPath, 0o755);
+      const { binDir: taskkillBinDir } = await createFakeExecutable({
+        name: "taskkill",
+        source: `#!/usr/bin/env node
+const fs = require("node:fs");
+const logPath = process.env.LLM_WIKI_TASKKILL_LOG;
+const releasePath = process.env.LLM_WIKI_TASKKILL_RELEASE;
+fs.appendFileSync(logPath, JSON.stringify({ event: "started", args: process.argv.slice(2) }) + "\\n", "utf8");
+const deadline = Date.now() + 5000;
+const waitForRelease = () => {
+  if (fs.existsSync(releasePath)) {
+    fs.appendFileSync(logPath, JSON.stringify({ event: "finished" }) + "\\n", "utf8");
+    return;
+  }
+
+  if (Date.now() > deadline) {
+    fs.appendFileSync(logPath, JSON.stringify({ event: "timed-out" }) + "\\n", "utf8");
+    process.exit(2);
+    return;
+  }
+
+  setTimeout(waitForRelease, 25);
+};
+waitForRelease();
+`,
+      });
+
+      let runSettled = false;
+      const runPromise = withPath(taskkillBinDir, async () => runLocalAgentCommand({
+        agent: localAgent({ command: "codex", timeoutSeconds: 1 }),
+        cwd: agentCwd,
+        taskPrompt: "prompt",
+        changesObserved: true,
+        env: {
+          ...process.env,
+          ComSpec: fakeCmdPath,
+          LLM_WIKI_TASKKILL_LOG: taskkillLogPath,
+          LLM_WIKI_TASKKILL_RELEASE: releaseTaskkillPath,
+          PATH: `${agentBinDir}${delimiter}${process.env.PATH ?? ""}`,
+          PATHEXT: ".cmd",
+        },
+        platform: "win32",
+        timeoutKillGraceMs: 50,
+      }).catch((error: unknown) => error)).finally(() => {
+        runSettled = true;
+      });
+
+      try {
+        // Act
+        await delay(1100);
+        await readTextEventually(taskkillLogPath);
+        await delay(150);
+
+        // Assert
+        expect(runSettled).toBe(false);
+        await writeFile(releaseTaskkillPath, "release", "utf8");
+        const failure = await runPromise;
+        expect(failure).toBeInstanceOf(LocalAgentExecutionError);
+        if (!(failure instanceof LocalAgentExecutionError)) {
+          throw new Error("Expected LocalAgentExecutionError.");
+        }
+        expect(failure).toMatchObject({
+          code: "AGENT_COMMAND_TIMEOUT",
+          signal: "SIGKILL",
+          timedOut: true,
+          changesObserved: true,
+          changes_observed: true,
+        });
+        const taskkillEvents = (await readTextEventually(taskkillLogPath))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        expect(taskkillEvents).toEqual(expect.arrayContaining([
+          expect.objectContaining({ event: "finished" }),
+        ]));
+      } finally {
+        await writeFile(releaseTaskkillPath, "release", "utf8").catch(() => undefined);
+        await runPromise.catch(() => undefined);
         await rm(agentBinDir, { force: true, recursive: true });
         await rm(taskkillBinDir, { force: true, recursive: true });
       }

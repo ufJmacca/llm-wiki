@@ -10,3 +10,8 @@ export {
   type LocalAgentExecutionErrorOptions,
   type RunLocalAgentCommandInput,
 } from "./exec.js";
+export {
+  runLocalAgentInTemporaryWorkspace,
+  type LocalAgentWorkspaceResult,
+  type RunLocalAgentWorkspaceInput,
+} from "./workspace.js";

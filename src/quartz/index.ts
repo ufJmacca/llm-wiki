@@ -402,6 +402,19 @@ export async function writeLocalDaemonRuntimeMetadata(
   }
 }
 
+export async function removeLocalDaemonRuntimeMetadata(repoRoot: string): Promise<void> {
+  try {
+    await rm(resolve(repoRoot, QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH), { force: true });
+  } catch (error) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to remove local daemon runtime metadata.",
+      path: QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH,
+      hint: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 export async function writeDisabledLocalDaemonRuntimeMetadataIfCurrent(
   repoRoot: string,
   expected: Pick<Extract<QuartzLocalDaemonRuntimeMetadata, { enabled: true }>, "url" | "upload_token">,

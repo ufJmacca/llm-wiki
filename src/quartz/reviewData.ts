@@ -169,7 +169,7 @@ export function buildReviewDataModel(
   const generatedAt = options.generatedAt ?? new Date();
   const reviewScan = options.profile === undefined ? scan : filterReviewScanForProfile(scan, options.profile);
   const lintIssues = options.lintResult?.issues ?? collectLintIssues(reviewScan, lintOptionsForProfile(options.profile));
-  const visibilityLintIssues = options.lintResult?.issues ?? visibilityLintIssuesForProfile(reviewScan, options.profile, lintIssues);
+  const visibilityLintIssues = options.lintResult?.issues ?? visibilityLintIssuesForProfile(scan, options.profile, lintIssues);
   const materializedMarkdownPaths = options.materializedMarkdownPaths ?? selectedMarkdownPaths(scan, options.profile);
   const sourceBadgesById = buildSourceBadgeIndex(reviewScan);
 
@@ -505,7 +505,7 @@ function buildVisibilityWarningItems(
 
   return lintIssues
     .filter((issue) => isVisibilityWarningRule(issue.rule_id))
-    .filter((issue) => profile === undefined || matchesFileProfile(issue.path, profile))
+    .filter((issue) => shouldIncludeVisibilityWarningItem(issue, profile))
     .map((issue) => ({
       ...toLintIssueItem(issue),
       reason: issue.message,
@@ -514,6 +514,14 @@ function buildVisibilityWarningItems(
       source: sourceBadgeForIssue(issue, sourceBadgesByPath, pagesByPath, sourceBadgesById),
     }))
     .sort((left, right) => left.path.localeCompare(right.path) || left.rule_id.localeCompare(right.rule_id));
+}
+
+function shouldIncludeVisibilityWarningItem(issue: LintIssue, profile: WikiProfile | undefined): boolean {
+  if (profile === undefined || issue.rule_id.startsWith("public_")) {
+    return true;
+  }
+
+  return matchesFileProfile(issue.path, profile);
 }
 
 function isVisibilityWarningRule(ruleId: string): boolean {

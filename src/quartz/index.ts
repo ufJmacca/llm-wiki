@@ -21,7 +21,7 @@ import {
 } from "../profiles/index.js";
 import { gitCommandEnv } from "../utils/git.js";
 import { validateTextFileWriteInsideRoot, writeTextFileInsideRoot, type ScaffoldEntry } from "../utils/fs.js";
-import { buildReviewDataModel, type ReviewCategory, type ReviewDataModel } from "./reviewData.js";
+import { buildReviewDataModel, filterReviewScanForProfile, type ReviewCategory, type ReviewDataModel } from "./reviewData.js";
 
 export { buildReviewDataModel, type ReviewDataModel } from "./reviewData.js";
 
@@ -140,6 +140,33 @@ const QUARTZ_BUILD_HOMEPAGE_SOURCE_PATH = "curated/index.md";
 const QUARTZ_BUILD_HOMEPAGE_CONTENT_PATH = "quartz/content/index.md";
 const QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH = "quartz/content/_llm-wiki/runtime/local-daemon.json";
 const QUARTZ_UPLOAD_FORM_COMPONENT_PATH = "quartz/components/LlmWikiUploadForm.tsx";
+const QUARTZ_LAYOUT_COMPONENTS = [
+  {
+    path: "quartz/components/LlmWikiQueueDashboard.tsx",
+    componentName: "LlmWikiQueueDashboard",
+    className: "llm-wiki-queue-dashboard",
+  },
+  {
+    path: "quartz/components/LlmWikiReviewPanel.tsx",
+    componentName: "LlmWikiReviewPanel",
+    className: "llm-wiki-review-panel",
+  },
+  {
+    path: "quartz/components/LlmWikiSourceBadge.tsx",
+    componentName: "LlmWikiSourceBadge",
+    className: "llm-wiki-source-badge",
+  },
+  {
+    path: QUARTZ_UPLOAD_FORM_COMPONENT_PATH,
+    componentName: "LlmWikiUploadForm",
+    className: "llm-wiki-upload-form",
+  },
+  {
+    path: "quartz/components/LlmWikiVisibilityWarning.tsx",
+    componentName: "LlmWikiVisibilityWarning",
+    className: "llm-wiki-visibility-warning",
+  },
+] as const;
 const QUARTZ_PARENT_GITIGNORE_PATH = "quartz/.gitignore";
 const QUARTZ_PARENT_CONTENT_IGNORE_RULE = "content/";
 const QUARTZ_RUNTIME_IGNORE_RULE = "quartz/quartz/";
@@ -791,6 +818,7 @@ function localExplorerPageDefinitions(
   scan: RepoScan,
   files: readonly RepoMarkdownFile[],
 ): StaticReviewPage[] {
+  const reviewScan = filterReviewScanForProfile(scan, profile);
   const reviewData = buildReviewDataModel(scan, { profile });
   const fallbackHomepage = localGeneratedHomepageDefinition(files);
 
@@ -809,7 +837,7 @@ function localExplorerPageDefinitions(
     {
       path: "quartz/content/_llm-wiki/review/profile-summary.md",
       title: "Profile Summary",
-      content: profileSummaryContent(reviewData, scan),
+      content: profileSummaryContent(reviewData, reviewScan),
     },
     {
       path: "quartz/content/_llm-wiki/review/source-queue.md",
@@ -2078,25 +2106,26 @@ async function quartzRuntimeEntryMigrationContent(repoRoot: string, entry: Scaff
       )
         ? entry.content
         : null;
-    case "quartz/quartz.layout.ts":
+    case "quartz/quartz.layout.ts": {
+      const componentsSupportDefaultLayoutImports = await llmWikiLayoutComponentsSupportDefaultImports(repoRoot);
+
       if (content === OLD_PLACEHOLDER_QUARTZ_LAYOUT) {
-        return await uploadFormComponentSupportsDefaultLayoutImport(repoRoot)
-          ? entry.content
-          : quartzLayoutContentBeforeUploadForm();
+        return componentsSupportDefaultLayoutImports ? entry.content : quartzLayoutContentBeforeUploadForm();
       }
 
       if (
         content === quartzLayoutContentBeforeReviewGates() ||
         content === quartzLayoutContentBeforeSourceBadge()
       ) {
-        return entry.content;
+        return componentsSupportDefaultLayoutImports ? entry.content : null;
       }
 
       if (content === quartzLayoutContentBeforeUploadForm()) {
-        return await uploadFormComponentSupportsDefaultLayoutImport(repoRoot) ? entry.content : null;
+        return componentsSupportDefaultLayoutImports ? entry.content : null;
       }
 
       return null;
+    }
     case "quartz/components/LlmWikiQueueDashboard.tsx":
       return (
         content === componentPlaceholder("LlmWikiQueueDashboard", "llm-wiki-queue-dashboard") ||
@@ -2133,10 +2162,21 @@ async function quartzRuntimeEntryMigrationContent(repoRoot: string, entry: Scaff
   }
 }
 
-async function uploadFormComponentSupportsDefaultLayoutImport(repoRoot: string): Promise<boolean> {
+async function llmWikiLayoutComponentsSupportDefaultImports(repoRoot: string): Promise<boolean> {
+  const componentSupport = await Promise.all(
+    QUARTZ_LAYOUT_COMPONENTS.map((component) => llmWikiLayoutComponentSupportsDefaultImport(repoRoot, component)),
+  );
+
+  return componentSupport.every(Boolean);
+}
+
+async function llmWikiLayoutComponentSupportsDefaultImport(
+  repoRoot: string,
+  component: (typeof QUARTZ_LAYOUT_COMPONENTS)[number],
+): Promise<boolean> {
   let content: string;
   try {
-    content = await readFile(resolve(repoRoot, QUARTZ_UPLOAD_FORM_COMPONENT_PATH), "utf8");
+    content = await readFile(resolve(repoRoot, component.path), "utf8");
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
       return true;
@@ -2144,19 +2184,30 @@ async function uploadFormComponentSupportsDefaultLayoutImport(repoRoot: string):
 
     throw new QuartzOperationError({
       code: "QUARTZ_WRITE_FAILED",
-      message: `Failed to inspect Quartz runtime file: ${QUARTZ_UPLOAD_FORM_COMPONENT_PATH}.`,
-      path: QUARTZ_UPLOAD_FORM_COMPONENT_PATH,
+      message: `Failed to inspect Quartz runtime file: ${component.path}.`,
+      path: component.path,
       hint: error instanceof Error ? error.message : String(error),
     });
   }
 
-  return isMigratableUploadFormComponent(content) || hasDefaultExport(content);
+  return isMigratableLayoutComponent(content, component) || hasDefaultExport(content);
 }
 
 function isMigratableUploadFormComponent(content: string): boolean {
+  const uploadFormComponent = QUARTZ_LAYOUT_COMPONENTS.find(
+    (component) => component.path === QUARTZ_UPLOAD_FORM_COMPONENT_PATH,
+  );
+  return uploadFormComponent !== undefined && isMigratableLayoutComponent(content, uploadFormComponent);
+}
+
+function isMigratableLayoutComponent(
+  content: string,
+  component: (typeof QUARTZ_LAYOUT_COMPONENTS)[number],
+): boolean {
   return (
-    content === componentPlaceholder("LlmWikiUploadForm", "llm-wiki-upload-form") ||
-    content === oldComponentPlaceholder("llm-wiki-upload-form")
+    content === componentPlaceholder(component.componentName, component.className) ||
+    content === oldComponentPlaceholder(component.className) ||
+    (component.componentName === "LlmWikiReviewPanel" && content === reviewPanelComponentContentBeforeBaseAwareLinks())
   );
 }
 
@@ -2854,20 +2905,41 @@ function uploadFormComponentContent(): string {
       }
       return text;
     };
+    const daemonUnavailableHint = "Run llm-wiki explore serve --profile local --with-daemon and keep the daemon running.";
+    const browserGuidance = "Check that the local daemon is still running, then refresh this page to load the current upload token.";
     const showError = (error, fallback) => {
       const shown = error && typeof error === "object" ? error : { code: "UPLOAD_FAILED", message: fallback };
       setStatus(String(shown.message || fallback));
+      const hint = shown.hint || (shown.code === "DAEMON_UNAVAILABLE" ? daemonUnavailableHint : undefined);
       showDetails([
         ["Code", shown.code],
         ["Message", shown.message],
-        ["Hint", shown.hint],
+        ["Hint", hint],
         ["Path", shown.path],
+        ["Browser guidance", browserGuidance],
       ]);
+    };
+    const successStatusMessage = (data) => {
+      const uploadStatus = typeof data.status === "string" ? data.status : "";
+      const queueStatus = typeof data.queue_status === "string" ? data.queue_status : "";
+      if (uploadStatus === "duplicate") {
+        return queueStatus === "ingested" ? "Source already captured and ingested." : "Source already captured.";
+      }
+      if (queueStatus === "queued") return "Upload queued.";
+      if (queueStatus !== "") return "Upload recorded with queue status: " + queueStatus + ".";
+      return "Upload succeeded.";
+    };
+
+    const daemonMetadataUrl = () => {
+      const marker = "/_llm-wiki/";
+      const markerIndex = window.location.pathname.indexOf(marker);
+      const basePath = markerIndex >= 0 ? window.location.pathname.slice(0, markerIndex + 1) : "/";
+      return basePath + "_llm-wiki/runtime/local-daemon.json";
     };
 
     async function loadDaemonMetadata() {
       try {
-        const response = await fetch("/_llm-wiki/runtime/local-daemon.json", { cache: "no-store" });
+        const response = await fetch(daemonMetadataUrl(), { cache: "no-store" });
         if (!response.ok) return null;
         return await response.json();
       } catch {
@@ -2958,8 +3030,9 @@ function uploadFormComponentContent(): string {
         }
 
         const data = body.data || {};
-        setStatus("Upload queued.");
+        setStatus(successStatusMessage(data));
         showDetails([
+          ["Upload status", data.status],
           ["Title", data.title],
           ["Source ID", data.source_id],
           ["Source kind", data.source_kind],
@@ -2990,7 +3063,7 @@ const uploadFormScript = ${JSON.stringify(clientScript)}
 const LlmWikiUploadForm: QuartzComponent = () => {
   return (
     <section class="llm-wiki-upload-form" data-llm-wiki-upload-form="true">
-      <form encType="multipart/form-data">
+      <form encType="multipart/form-data" noValidate>
         <fieldset>
           <legend>Source type</legend>
           <label><input type="radio" name="mode" value="file" checked disabled /> File</label>
@@ -3100,7 +3173,7 @@ function reviewOverviewContent(reviewData: ReviewDataModel): string {
 | Source queue | ${reviewData.queue.counts.total} | [[source-queue|Source queue]] |
 | Recent ingests | ${reviewData.recent_ingests.count} | [[recent-ingests|Recent ingests]] |
 | Needs review | ${reviewData.needs_review.count} | [[needs-review|Needs review]] |
-| Contradictions | ${reviewData.contradictions.count} | [[contradictions|Contradictions]] |
+| Contradictions | ${reviewData.contradictions.count} | [[_llm-wiki/review/contradictions|Contradictions]] |
 | Orphans | ${reviewData.orphans.count} | [[orphans|Orphans]] |
 | Stale pages | ${reviewData.stale_pages.count} | [[stale-pages|Stale pages]] |
 | Visibility warnings | ${reviewData.visibility_warnings.count} | [[visibility-warnings|Visibility warnings]] |

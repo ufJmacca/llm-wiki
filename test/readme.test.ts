@@ -87,3 +87,68 @@ describe("README local agent documentation", () => {
     }
   });
 });
+
+describe("README local Explorer upload and review documentation", () => {
+  it("documents the browser upload workflow, supported modes, local daemon endpoint, and ingest follow-up commands", async () => {
+    // Arrange
+    const requiredDocumentation = [
+      "llm-wiki explore serve --profile local --with-daemon",
+      "Open the local Explorer root URL and use the generated upload form to capture a file, pasted text, or URL source.",
+      "The browser form submits `multipart/form-data` to the local daemon endpoint recorded in `_llm-wiki/runtime/local-daemon.json`: `<daemon.url>/api/raw-upload`.",
+      "File uploads send the `file` field with an optional `title`; pasted text uploads send `text` plus the required `title`; URL uploads send `url` with an optional `title`.",
+      "A successful browser upload shows the title, `source_id`, source kind, queue status, source card path, original path, and next ingest command.",
+      "llm-wiki ingest <source_id>",
+      "llm-wiki ingest <source_id> --auto",
+      "Local browser upload is different from `llm-wiki upload init --target github`: the local form talks only to the loopback daemon in the current wiki, while the remote upload scaffold prepares a future hosted PR-first backend.",
+    ];
+
+    // Act
+    const readme = await readReadme();
+
+    // Assert
+    for (const expectedText of requiredDocumentation) {
+      expect(readme).toContain(expectedText);
+    }
+  });
+
+  it("maps generated review pages to their canonical repository data sources", async () => {
+    // Arrange
+    const requiredDocumentation = [
+      "`llm-wiki explore sync --profile review` and local profile sync generate `_llm-wiki/review/overview.md`, `source-queue.md`, `recent-ingests.md`, `needs-review.md`, `contradictions.md`, `orphans.md`, `stale-pages.md`, `visibility-warnings.md`, and `profile-summary.md`.",
+      "Review pages are derived from live repository state rather than hidden caches.",
+      "`source-queue.md` and queue counts come from `raw/queue/*.json` joined to raw source cards.",
+      "`recent-ingests.md` comes from parsed ingest entries in `curated/log.md`.",
+      "`needs-review.md` comes from curated page frontmatter.",
+      "`contradictions.md` combines curated frontmatter conflict signals with parsed contradiction entries in `curated/log.md`.",
+      "`stale-pages.md` combines `next_review` frontmatter with stale-index lint findings.",
+      "`orphans.md` comes from the Markdown link graph/orphan scanner.",
+      "`visibility-warnings.md` and `profile-summary.md` come from lint results, profile selection rules, and public/private visibility checks.",
+    ];
+
+    // Act
+    const readme = await readReadme();
+
+    // Assert
+    for (const expectedText of requiredDocumentation) {
+      expect(readme).toContain(expectedText);
+    }
+  });
+
+  it("documents local-only daemon token privacy and public output exclusions", async () => {
+    // Arrange
+    const requiredDocumentation = [
+      "Upload tokens are generated per daemon run, written only to local runtime metadata, and must never be committed.",
+      "`_llm-wiki/runtime/local-daemon.json` is generated only for local/review Explorer runtime use and is excluded from public and GitHub Pages output.",
+      "Strict public lint validates live repository inputs selected for public output; it does not scan existing local/review artifacts already under `quartz/content`, so run public sync/build before publishing to regenerate Quartz output without local runtime metadata, daemon tokens, queue data, private review pages, raw source cards, or raw originals.",
+      "The local daemon binds to loopback (`127.0.0.1`, `localhost`, or `::1`) so browser uploads stay on the same machine by default.",
+    ];
+
+    // Act
+    const readme = await readReadme();
+
+    // Assert
+    for (const expectedText of requiredDocumentation) {
+      expect(readme).toContain(expectedText);
+    }
+  });
+});

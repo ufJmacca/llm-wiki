@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "node:child_process";
@@ -297,6 +297,18 @@ async function waitFor<T>(
   throw new Error(`Timed out waiting for ${description}. Last observed: ${String(lastObserved)}`);
 }
 
+async function waitForGeneratedFileContent(
+  wikiDir: string,
+  path: string,
+  expectedText: string,
+): Promise<string> {
+  return waitFor(
+    async () => readGeneratedFile(wikiDir, path),
+    (content) => content.includes(expectedText),
+    `${path} to contain ${expectedText}`,
+  );
+}
+
 describe("explore serve local upload daemon integration", () => {
   beforeEach(() => {
     execFileMock.mockReset();
@@ -436,6 +448,311 @@ describe("explore serve local upload daemon integration", () => {
       await expect(fetch(`${payload.data.daemon.url}/api/raw-upload`)).rejects.toThrow();
     });
   });
+
+  it("regenerates upload, review, status, and root pages after daemon upload watcher syncs and preserves the active token", async () => {
+    await withTempWorkspace("llm-wiki-explore-serve-daemon-watch-sync-", async (workspaceDir) => {
+      // Arrange
+      mockGitOutsideWorkTree({ allowUploadCommit: false });
+      const quartz = mockLongRunningQuartz();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const metadataPath = "quartz/content/_llm-wiki/runtime/local-daemon.json";
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+
+      // Act
+      const serveResult = runCli([
+        "explore",
+        "serve",
+        "--repo",
+        wikiDir,
+        "--profile",
+        "local",
+        "--port",
+        "8795",
+        "--with-daemon",
+        "--daemon-port",
+        "0",
+        "--json",
+      ], {
+        stdout: (message) => stdout.push(message),
+        stderr: (message) => stderr.push(message),
+        stdin: async () => "",
+      });
+      await Promise.race([
+        quartz.waitUntilStarted(),
+        serveResult.then((exitCode) => {
+          throw new Error(`explore serve exited before Quartz started: ${exitCode}; stderr=${stderr.join("\n")}`);
+        }),
+      ]);
+      await waitFor(
+        async () => stdout.join("\n"),
+        (content) => content.includes("\"ok\":true"),
+        "serve JSON readiness envelope with daemon watcher metadata",
+      );
+      const payload = parseExploreServe(stdout);
+      await writeFile(
+        resolve(wikiDir, "curated/index.md"),
+        "---\ntype: index\ntitle: Watcher Root\nvisibility: private\nsource_ids: []\n---\n\n# Watcher Root\n\nRoot watcher marker.\n",
+        "utf8",
+      );
+      const rootPage = await waitForGeneratedFileContent(
+        wikiDir,
+        "quartz/content/index.md",
+        "Root watcher marker.",
+      );
+
+      await writeLocalDaemonRuntimeMetadata(wikiDir, {
+        enabled: true,
+        url: payload.data.daemon.url,
+        upload_path: "/api/raw-upload",
+        token_header: "x-llm-wiki-upload-token",
+        upload_token: "stale-token",
+        commit_uploads: true,
+        auto_ingest_available: true,
+        updated_at: "2026-06-23T00:00:00.000Z",
+      });
+      await writeFile(
+        resolve(wikiDir, "quartz/content/_llm-wiki/upload.md"),
+        "# Stale upload page\n\nstale upload sentinel\n",
+        "utf8",
+      );
+
+      const form = new FormData();
+      form.set("title", "Watcher Upload");
+      form.set("text", "Watcher daemon upload body.\n");
+      const uploadResponse = await fetch(`${payload.data.daemon.url}/api/raw-upload`, {
+        method: "POST",
+        headers: {
+          "x-llm-wiki-upload-token": payload.data.daemon.upload_token,
+        },
+        body: form,
+      });
+      const upload = await uploadResponse.json() as UploadSuccessEnvelope;
+      const sourceQueue = await waitForGeneratedFileContent(
+        wikiDir,
+        "quartz/content/_llm-wiki/review/source-queue.md",
+        upload.data.source_id,
+      );
+      const statusPage = await waitForGeneratedFileContent(
+        wikiDir,
+        "quartz/content/_llm-wiki/review/status.md",
+        "| Queued | 1 |",
+      );
+      const uploadPage = await waitForGeneratedFileContent(
+        wikiDir,
+        "quartz/content/_llm-wiki/upload.md",
+        "component: LlmWikiUploadForm",
+      );
+      await writeLocalDaemonRuntimeMetadata(wikiDir, {
+        enabled: true,
+        url: payload.data.daemon.url,
+        upload_path: "/api/raw-upload",
+        token_header: "x-llm-wiki-upload-token",
+        upload_token: "stale-before-log-sync",
+        commit_uploads: true,
+        auto_ingest_available: true,
+        updated_at: "2026-06-23T00:00:00.000Z",
+      });
+      const staleMetadataBeforeLog = JSON.parse(
+        await readGeneratedFile(wikiDir, metadataPath),
+      ) as LocalDaemonRuntimeMetadata;
+      await writeFile(
+        resolve(wikiDir, "curated/log.md"),
+        `${await readFile(resolve(wikiDir, "curated/log.md"), "utf8")}\n## [2026-06-24T00:00:00.000Z] ingest | ${upload.data.source_id} | Watcher Upload\n\n- actor: test\n- command: llm-wiki ingest ${upload.data.source_id}\n- updated:\n  - curated/index.md\n- contradictions: none\n- follow_ups: none\n`,
+        "utf8",
+      );
+      const recentIngests = await waitForGeneratedFileContent(
+        wikiDir,
+        "quartz/content/_llm-wiki/review/recent-ingests.md",
+        upload.data.source_id,
+      );
+      const metadata = await waitFor(
+        async () => JSON.parse(await readGeneratedFile(wikiDir, metadataPath)) as LocalDaemonRuntimeMetadata,
+        (value) => value.enabled && value.upload_token === payload.data.daemon.upload_token,
+        "daemon metadata to be rewritten with active token after watcher sync",
+      );
+
+      // Assert
+      expect(stderr).toEqual([]);
+      expect(uploadResponse.status).toBe(201);
+      expect(upload).toMatchObject({
+        ok: true,
+        data: {
+          status: "added",
+          title: "Watcher Upload",
+          source_kind: "text",
+          queue_status: "queued",
+          commit: {
+            attempted: false,
+            ok: true,
+          },
+        },
+      });
+      expect(sourceQueue).toContain("Watcher Upload");
+      expect(sourceQueue).toContain(upload.data.source_card_path);
+      expect(sourceQueue).toContain(upload.data.queue_path);
+      expect(statusPage).toContain("| Queued | 1 |");
+      expect(uploadPage).not.toContain("stale upload sentinel");
+      expect(rootPage).toContain("# Watcher Root");
+      expect(recentIngests).toContain("Watcher Upload");
+      expect(recentIngests).toContain("curated/log.md");
+      expect(staleMetadataBeforeLog).toMatchObject({
+        enabled: true,
+        upload_token: "stale-before-log-sync",
+        commit_uploads: true,
+        auto_ingest_available: true,
+        updated_at: "2026-06-23T00:00:00.000Z",
+      });
+      expect(metadata).toMatchObject({
+        enabled: true,
+        url: payload.data.daemon.url,
+        upload_path: "/api/raw-upload",
+        token_header: "x-llm-wiki-upload-token",
+        upload_token: payload.data.daemon.upload_token,
+        commit_uploads: false,
+        auto_ingest_available: false,
+      });
+      expect(metadata).not.toMatchObject({
+        upload_token: "stale-token",
+        commit_uploads: true,
+        auto_ingest_available: true,
+        updated_at: "2026-06-23T00:00:00.000Z",
+      });
+
+      quartz.close();
+      await expect(serveResult).resolves.toBe(0);
+    });
+  }, 15_000);
+
+  it("keeps daemon upload success state when a later watcher sync fails best-effort", async () => {
+    await withTempWorkspace("llm-wiki-explore-serve-daemon-watch-failure-", async (workspaceDir) => {
+      // Arrange
+      mockGitOutsideWorkTree({ allowUploadCommit: false });
+      const quartz = mockLongRunningQuartz();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+
+      // Act
+      const serveResult = runCli([
+        "explore",
+        "serve",
+        "--repo",
+        wikiDir,
+        "--profile",
+        "local",
+        "--port",
+        "8796",
+        "--with-daemon",
+        "--daemon-port",
+        "0",
+        "--json",
+      ], {
+        stdout: (message) => stdout.push(message),
+        stderr: (message) => stderr.push(message),
+        stdin: async () => "",
+      });
+      await Promise.race([
+        quartz.waitUntilStarted(),
+        serveResult.then((exitCode) => {
+          throw new Error(`explore serve exited before Quartz started: ${exitCode}; stderr=${stderr.join("\n")}`);
+        }),
+      ]);
+      await waitFor(
+        async () => stdout.join("\n"),
+        (content) => content.includes("\"ok\":true"),
+        "serve JSON readiness envelope with daemon metadata",
+      );
+      const payload = parseExploreServe(stdout);
+      const form = new FormData();
+      form.set("title", "Best Effort Upload");
+      form.set("text", "Best effort watcher failure body.\n");
+      const uploadResponse = await fetch(`${payload.data.daemon.url}/api/raw-upload`, {
+        method: "POST",
+        headers: {
+          "x-llm-wiki-upload-token": payload.data.daemon.upload_token,
+        },
+        body: form,
+      });
+      const upload = await uploadResponse.json() as UploadSuccessEnvelope;
+      const sourceQueueBeforeFailure = await waitForGeneratedFileContent(
+        wikiDir,
+        "quartz/content/_llm-wiki/review/source-queue.md",
+        upload.data.source_id,
+      );
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+
+      const localProfilePath = resolve(wikiDir, ".llm-wiki/profiles/local.yml");
+      const validLocalProfile = await readFile(localProfilePath, "utf8");
+      await writeFile(
+        resolve(wikiDir, "quartz/content/_llm-wiki/upload.md"),
+        "# Upload sentinel\n\nbest effort upload success sentinel\n",
+        "utf8",
+      );
+      await writeFile(localProfilePath, "name: local\ninclude:\n  - [invalid\n", "utf8");
+      const invalidSync = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "local", "--json"]);
+      await writeFile(
+        resolve(wikiDir, "curated/log.md"),
+        `${await readFile(resolve(wikiDir, "curated/log.md"), "utf8")}\n## [2026-06-24T00:01:00.000Z] ingest | ${upload.data.source_id} | Best Effort Upload\n\n- actor: test\n- command: llm-wiki ingest ${upload.data.source_id}\n- updated:\n  - curated/home.md\n- contradictions: none\n- follow_ups: none\n`,
+        "utf8",
+      );
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
+      const sourceQueueAfterFailure = await readGeneratedFile(
+        wikiDir,
+        "quartz/content/_llm-wiki/review/source-queue.md",
+      );
+      const uploadPageAfterFailure = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/upload.md");
+      await writeFile(localProfilePath, validLocalProfile, "utf8");
+      await writeFile(
+        resolve(wikiDir, "curated/home.md"),
+        `${await readFile(resolve(wikiDir, "curated/home.md"), "utf8")}\nWatcher recovery marker.\n`,
+        "utf8",
+      );
+      const recoveredHome = await waitForGeneratedFileContent(
+        wikiDir,
+        "quartz/content/curated/home.md",
+        "Watcher recovery marker.",
+      );
+
+      // Assert
+      expect(stderr).toEqual([]);
+      expect(uploadResponse.status).toBe(201);
+      expect(upload).toMatchObject({
+        ok: true,
+        data: {
+          status: "added",
+          title: "Best Effort Upload",
+          source_kind: "text",
+          queue_status: "queued",
+          commit: {
+            attempted: false,
+            ok: true,
+          },
+        },
+      });
+      expect(sourceQueueBeforeFailure).toContain("Best Effort Upload");
+      expect(invalidSync.exitCode).toBe(1);
+      expect(invalidSync.stdout.join("\n")).toContain("PROFILE_INVALID");
+      expect(sourceQueueAfterFailure).toContain(upload.data.source_id);
+      expect(sourceQueueAfterFailure).toContain("Best Effort Upload");
+      expect(uploadPageAfterFailure).toContain("best effort upload success sentinel");
+      expect((await readGeneratedFile(wikiDir, upload.data.original_path)).replaceAll("\r\n", "\n")).toBe(
+        "Best effort watcher failure body.\n",
+      );
+      await expect(readGeneratedFile(wikiDir, upload.data.source_card_path)).resolves.toContain("Best Effort Upload");
+      await expect(readGeneratedFile(wikiDir, upload.data.queue_path)).resolves.toContain(upload.data.source_id);
+      expect(recoveredHome).toContain("Watcher recovery marker.");
+
+      quartz.close();
+      await expect(serveResult).resolves.toBe(0);
+    });
+  }, 15_000);
 
   it("prints root readiness and daemon upload details in human mode", async () => {
     await withTempWorkspace("llm-wiki-explore-serve-daemon-human-ready-", async (workspaceDir) => {

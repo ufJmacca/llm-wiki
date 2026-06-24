@@ -8,6 +8,7 @@ import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "n
 import { describe, expect, it, vi } from "vitest";
 
 import { runCli } from "../src/cli.js";
+import { writeLocalDaemonRuntimeMetadata } from "../src/quartz/index.js";
 import * as quartzState from "../src/quartz/state.js";
 import { parseInitJson, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
 
@@ -450,6 +451,61 @@ describe("explore serve command", () => {
       await expect(readFile(resolve(wikiDir, payload.data.state_path), "utf8")).rejects.toMatchObject({
         code: "ENOENT",
       });
+    });
+  });
+
+  it("clears stale daemon metadata during non-daemon serves", async () => {
+    await withTempWorkspace("llm-wiki-explore-serve-no-daemon-metadata-cleanup-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const spawnObservation = mockLongRunningSpawn();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const metadataPath = "quartz/content/_llm-wiki/runtime/local-daemon.json";
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await writeLocalDaemonRuntimeMetadata(wikiDir, {
+        enabled: true,
+        url: "http://127.0.0.1:32123",
+        upload_path: "/api/raw-upload",
+        token_header: "x-llm-wiki-upload-token",
+        upload_token: "stale-token",
+        commit_uploads: false,
+        auto_ingest_available: false,
+      });
+
+      // Act
+      const serveResult = runCli([
+        "explore",
+        "serve",
+        "--repo",
+        wikiDir,
+        "--profile",
+        "local",
+        "--port",
+        "8774",
+        "--json",
+      ], {
+        stdout: (message) => stdout.push(message),
+        stderr: (message) => stderr.push(message),
+        stdin: async () => "",
+      });
+      await spawnObservation.waitUntilStarted();
+      await waitFor(
+        async () => stdout.join("\n"),
+        (content) => content.includes("\"ok\":true"),
+        "serve JSON readiness envelope without daemon metadata",
+      );
+
+      // Assert
+      expect(stderr).toEqual([]);
+      await expect(readFile(resolve(wikiDir, metadataPath), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(parseExploreServe(stdout).data).not.toHaveProperty("daemon");
+
+      spawnObservation.close();
+      await expect(serveResult).resolves.toBe(0);
     });
   });
 

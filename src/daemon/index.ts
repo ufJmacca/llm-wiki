@@ -85,6 +85,7 @@ export type UploadDaemonErrorCode =
   | "UPLOAD_METHOD_NOT_ALLOWED"
   | "UPLOAD_MULTIPART_INVALID"
   | "UPLOAD_NOT_FOUND"
+  | "UPLOAD_ORIGIN_NOT_ALLOWED"
   | "UPLOAD_PAYLOAD_INVALID"
   | "UPLOAD_TOO_LARGE"
   | SourceCaptureError["code"];
@@ -184,6 +185,16 @@ type UploadRequestOptions = {
   uploadToken: string;
   pendingUploadCommits: PendingUploadCommits;
 };
+
+type CorsApproval =
+  | {
+      approved: true;
+      origin: string | null;
+    }
+  | {
+      approved: false;
+      origin: string;
+    };
 
 type UploadWorkSuccess = {
   capture: SourceCaptureSuccess;
@@ -291,6 +302,20 @@ async function handleDaemonRequest(
   response: ServerResponse,
 ): Promise<void> {
   try {
+    const cors = approveCorsOrigin(request);
+    if (!cors.approved) {
+      writeJson(response, 403, failureEnvelope(new UploadDaemonError({
+        code: "UPLOAD_ORIGIN_NOT_ALLOWED",
+        message: "Upload daemon only accepts loopback browser origins.",
+        path: "origin",
+        hint: "Serve the local Explorer from 127.0.0.1, localhost, or [::1].",
+        statusCode: 403,
+      })));
+      return;
+    }
+
+    applyCorsHeaders(response, cors.origin);
+
     if (request.url?.split("?")[0] !== RAW_UPLOAD_PATH) {
       writeJson(response, 404, failureEnvelope(new UploadDaemonError({
         code: "UPLOAD_NOT_FOUND",
@@ -302,12 +327,8 @@ async function handleDaemonRequest(
       return;
     }
 
-    applyUploadCorsHeaders(request, response);
-
     if (request.method === "OPTIONS") {
-      response.writeHead(204, {
-        "content-length": 0,
-      });
+      response.writeHead(204);
       response.end();
       return;
     }
@@ -363,42 +384,48 @@ async function handleDaemonRequest(
   }
 }
 
-function applyUploadCorsHeaders(request: IncomingMessage, response: ServerResponse): void {
-  const origin = allowedLoopbackOrigin(request.headers.origin);
-  if (origin === undefined) {
-    return;
+function approveCorsOrigin(request: IncomingMessage): CorsApproval {
+  const origin = request.headers.origin;
+  if (typeof origin !== "string" || origin.trim() === "") {
+    return {
+      approved: true,
+      origin: null,
+    };
   }
 
-  response.setHeader("access-control-allow-origin", origin);
-  response.setHeader("access-control-allow-methods", CORS_ALLOWED_METHODS);
-  response.setHeader("access-control-allow-headers", CORS_ALLOWED_HEADERS);
-  response.setHeader("vary", "Origin");
+  return isAllowedLoopbackOrigin(origin)
+    ? {
+        approved: true,
+        origin,
+      }
+    : {
+        approved: false,
+        origin,
+      };
 }
 
-function allowedLoopbackOrigin(originHeader: string | string[] | undefined): string | undefined {
-  if (typeof originHeader !== "string") {
-    return undefined;
-  }
-
-  const origin = originHeader.trim();
+function isAllowedLoopbackOrigin(origin: string): boolean {
   let parsed: URL;
   try {
     parsed = new URL(origin);
   } catch {
-    return undefined;
+    return false;
   }
 
-  const hostname = parsed.hostname === "[::1]" ? "::1" : parsed.hostname;
-  if (
-    parsed.protocol !== "http:" ||
-    parsed.port === "" ||
-    parsed.origin !== origin ||
-    !LOCAL_HOSTS.has(hostname)
-  ) {
-    return undefined;
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return parsed.protocol === "http:" && LOCAL_HOSTS.has(hostname) && parsed.port !== "";
+}
+
+function applyCorsHeaders(response: ServerResponse, origin: string | null): void {
+  if (origin === null) {
+    return;
   }
 
-  return origin;
+  response.setHeader("Access-Control-Allow-Origin", origin);
+  response.setHeader("Access-Control-Allow-Methods", CORS_ALLOWED_METHODS);
+  response.setHeader("Access-Control-Allow-Headers", CORS_ALLOWED_HEADERS);
+  response.setHeader("Access-Control-Max-Age", "600");
+  response.setHeader("Vary", "Origin");
 }
 
 async function runInRepoUploadQueue<T>(repoRoot: string, work: () => Promise<T>): Promise<T> {

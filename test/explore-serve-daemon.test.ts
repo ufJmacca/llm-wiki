@@ -71,6 +71,22 @@ type UploadSuccessEnvelope = {
   };
 };
 
+type LocalDaemonRuntimeMetadata =
+  | {
+      enabled: true;
+      url: string;
+      upload_path: "/api/raw-upload";
+      token_header: string;
+      upload_token: string;
+      commit_uploads: boolean;
+      auto_ingest_available: boolean;
+      updated_at: string;
+    }
+  | {
+      enabled: false;
+      updated_at: string;
+    };
+
 async function initializeWiki(targetDir: string): Promise<void> {
   const result = await runCliBuffered(["init", targetDir, "--no-git", "--json"]);
 
@@ -308,6 +324,9 @@ describe("explore serve local upload daemon integration", () => {
         "serve JSON readiness envelope with daemon metadata",
       );
       const payload = parseExploreServe(stdout);
+      const metadata = JSON.parse(
+        await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/runtime/local-daemon.json"),
+      ) as LocalDaemonRuntimeMetadata;
       const form = new FormData();
       form.set("title", "Explorer Upload");
       form.set("text", "Explorer daemon upload body.\n");
@@ -337,6 +356,16 @@ describe("explore serve local upload daemon integration", () => {
       expect(payload.data.daemon.port).toBeGreaterThan(0);
       expect(payload.data.daemon.url).toBe(`http://127.0.0.1:${payload.data.daemon.port}`);
       expect(payload.data.daemon.upload_token).toMatch(/^[a-f0-9]{64}$/);
+      expect(metadata).toMatchObject({
+        enabled: true,
+        url: payload.data.daemon.url,
+        upload_path: "/api/raw-upload",
+        token_header: "x-llm-wiki-upload-token",
+        upload_token: payload.data.daemon.upload_token,
+        commit_uploads: false,
+        auto_ingest_available: false,
+      });
+      expect(metadata.updated_at).toEqual(expect.any(String));
       expect(uploadResponse.status).toBe(201);
       expect(upload).toMatchObject({
         ok: true,
@@ -357,6 +386,13 @@ describe("explore serve local upload daemon integration", () => {
 
       quartz.close();
       await expect(serveResult).resolves.toBe(0);
+      const disabledMetadata = JSON.parse(
+        await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/runtime/local-daemon.json"),
+      ) as LocalDaemonRuntimeMetadata;
+      expect(disabledMetadata).toMatchObject({
+        enabled: false,
+        updated_at: expect.any(String),
+      });
       await expect(fetch(`${payload.data.daemon.url}/api/raw-upload`)).rejects.toThrow();
     });
   });

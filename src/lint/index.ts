@@ -2,7 +2,15 @@ import { readFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 
 import { scanWikiRepository, isRawOriginalPath, type RepoMarkdownFile, type RepoScan, type SourceCard } from "../scanner/repo.js";
-import { computeContentHash, parseSourceId, parseWikilinks, type MarkdownLink, type QueueItem, type WikiLink } from "../scanner/index.js";
+import {
+  computeContentHash,
+  parseSourceId,
+  parseWikilinks,
+  scanMarkdownDocument,
+  type MarkdownLink,
+  type QueueItem,
+  type WikiLink,
+} from "../scanner/index.js";
 import { writeTextFileInsideRoot } from "../utils/fs.js";
 
 export type LintSeverity = "error" | "warning";
@@ -71,6 +79,11 @@ const GENERATED_INDEX_LIST_SECTIONS = new Set(["Concepts", "Entities", "Topics",
 const GENERATED_INDEX_TABLE_SECTIONS = new Set(["Sources"]);
 const PUBLIC_CURATED_SITE_ROUTE_PREFIXES = ["concepts/", "entities/", "topics/", "questions/", "comparisons/", "sources/", "dashboards/"];
 const PUBLIC_FORBIDDEN_RUNTIME_LOG_PATHS = new Set(["curated/log.md"]);
+const PUBLIC_QUARTZ_CONTENT_ROOT = "quartz/content/";
+const PUBLIC_QUARTZ_LLM_WIKI_ROOT = `${PUBLIC_QUARTZ_CONTENT_ROOT}_llm-wiki/`;
+const PUBLIC_QUARTZ_RUNTIME_ROOT = `${PUBLIC_QUARTZ_LLM_WIKI_ROOT}runtime/`;
+const PUBLIC_QUARTZ_REVIEW_ROOT = `${PUBLIC_QUARTZ_LLM_WIKI_ROOT}review/`;
+const PUBLIC_QUARTZ_UPLOAD_ROOT = `${PUBLIC_QUARTZ_LLM_WIKI_ROOT}upload`;
 const PUBLIC_FORBIDDEN_SKIPPED_PROFILE_ROOTS = [
   {
     path: ".llm-wiki/cache",
@@ -116,14 +129,15 @@ const PUBLIC_FORBIDDEN_SKIPPED_PROFILE_ROOTS = [
 const PUBLIC_SKIPPED_NON_MARKDOWN_PROFILE_PATHS = [".llm-wiki/config.yml"] as const;
 
 export async function lintWiki(repoRoot: string, options: LintOptions = {}): Promise<LintResult> {
-  const scan = await scanWikiRepository(repoRoot);
+  const scan = await scanWikiRepository(repoRoot, scanOptionsForLint(options));
   const issues = collectLintIssues(scan, options);
 
   return withCounts({ issues, fixed_paths: [] });
 }
 
 export async function lintWikiWithFix(repoRoot: string, options: LintOptions = {}): Promise<LintResult> {
-  const firstScan = await scanWikiRepository(repoRoot);
+  const scanOptions = scanOptionsForLint(options);
+  const firstScan = await scanWikiRepository(repoRoot, scanOptions);
   const firstIssues = collectLintIssues(firstScan, options);
   const shouldFixIndex = firstIssues.some(
     (issue) => (issue.rule_id === "index_stale" || issue.rule_id === "index_missing") && issue.fixable,
@@ -140,10 +154,23 @@ export async function lintWikiWithFix(repoRoot: string, options: LintOptions = {
     }
   }
 
-  const secondScan = shouldFixIndex ? await scanWikiRepository(repoRoot) : firstScan;
+  const secondScan = shouldFixIndex ? await scanWikiRepository(repoRoot, scanOptions) : firstScan;
   const secondIssues = collectLintIssues(secondScan, options);
 
   return withCounts({ issues: secondIssues, fixed_paths: fixedPaths });
+}
+
+function scanOptionsForLint(options: LintOptions): Parameters<typeof scanWikiRepository>[1] {
+  return {
+    includeGeneratedQuartzContent: shouldScanGeneratedQuartzContentForLint(options),
+  };
+}
+
+function shouldScanGeneratedQuartzContentForLint(options: LintOptions): boolean {
+  return (
+    options.strict === true &&
+    (options.profile === undefined || options.profile === "public" || options.profile === "github-pages")
+  );
 }
 
 export async function rebuildCuratedIndex(repoRoot: string): Promise<string> {
@@ -1422,8 +1449,152 @@ function publicProfileIssues(scan: RepoScan, profileName: string, linkIndex: Lin
 
   issues.push(...publicRawSourceIndexLeakIssues(scan, selectedPaths, markdownByPath, requiredVisibility));
   issues.push(...publicStaleIndexRowLeakIssues(scan, selectedPaths, markdownByPath, requiredVisibility));
+  issues.push(...publicGeneratedQuartzContentLeakIssues(scan));
 
   return issues;
+}
+
+function publicGeneratedQuartzContentLeakIssues(scan: RepoScan): LintIssue[] {
+  const issues: LintIssue[] = [];
+
+  for (const file of scan.generatedQuartzContentFiles) {
+    if (file.path.startsWith(PUBLIC_QUARTZ_RUNTIME_ROOT)) {
+      issues.push({
+        rule_id: "public_quartz_runtime_metadata_leak",
+        severity: "error",
+        path: file.path,
+        message: `Public Quartz output candidate contains local daemon metadata: ${file.path}.`,
+        fix_hint: "Remove generated local daemon metadata from quartz/content before syncing or building public Quartz output.",
+        fixable: false,
+      });
+      continue;
+    }
+
+    if (isGeneratedQuartzUploadPath(file.path)) {
+      issues.push({
+        rule_id: "public_quartz_upload_page_leak",
+        severity: "error",
+        path: file.path,
+        message: `Public Quartz output candidate contains a local upload page: ${file.path}.`,
+        fix_hint: "Remove generated upload pages from quartz/content before syncing or building public Quartz output.",
+        fixable: false,
+      });
+    }
+
+    if (file.path.startsWith(PUBLIC_QUARTZ_REVIEW_ROOT)) {
+      issues.push({
+        rule_id: "public_quartz_review_page_leak",
+        severity: "error",
+        path: file.path,
+        message: `Public Quartz output candidate contains private review content: ${file.path}.`,
+        fix_hint: "Remove generated review pages from quartz/content before syncing or building public Quartz output.",
+        fixable: false,
+      });
+    }
+
+    const generatedMarkdownVisibility = generatedMarkdownFrontmatterVisibility(file);
+    if (
+      !isGeneratedQuartzReservedLeakPath(file.path) &&
+      generatedMarkdownVisibility !== null &&
+      generatedMarkdownVisibility !== "public"
+    ) {
+      issues.push({
+        rule_id: "public_quartz_private_page_leak",
+        severity: "error",
+        path: file.path,
+        message: `Public Quartz output candidate contains non-public Markdown: ${file.path}.`,
+        fix_hint: "Remove stale private generated Markdown from quartz/content before syncing or building public Quartz output.",
+        fixable: false,
+      });
+    }
+
+    const marker = firstGeneratedQuartzPrivateDataMarker(file.content);
+    if (marker !== null) {
+      issues.push({
+        rule_id: "public_quartz_private_data_leak",
+        severity: "error",
+        path: file.path,
+        line: marker.line,
+        message: `Public Quartz output candidate contains ${marker.description}.`,
+        fix_hint: "Remove generated runtime, upload, review, raw path, and queue data from quartz/content before public sync or build.",
+        fixable: false,
+      });
+    }
+  }
+
+  return issues;
+}
+
+function generatedMarkdownFrontmatterVisibility(file: RepoScan["generatedQuartzContentFiles"][number]): string | null {
+  if (!file.path.toLowerCase().endsWith(".md")) {
+    return null;
+  }
+
+  const scan = scanMarkdownDocument({ path: file.path, content: file.content.toString("utf8") });
+  const visibility = scan.frontmatter?.visibility;
+  return typeof visibility === "string" ? visibility : null;
+}
+
+function isGeneratedQuartzReservedLeakPath(path: string): boolean {
+  return (
+    path.startsWith(PUBLIC_QUARTZ_RUNTIME_ROOT) ||
+    path.startsWith(PUBLIC_QUARTZ_REVIEW_ROOT) ||
+    isGeneratedQuartzUploadPath(path)
+  );
+}
+
+function isGeneratedQuartzUploadPath(path: string): boolean {
+  return path === `${PUBLIC_QUARTZ_UPLOAD_ROOT}.md` || path.startsWith(`${PUBLIC_QUARTZ_UPLOAD_ROOT}/`);
+}
+
+function firstGeneratedQuartzPrivateDataMarker(content: Buffer): { line: number; description: string } | null {
+  const text = content.toString("utf8");
+  const markerPatterns = [
+    {
+      pattern: /\bupload_token\b/iu,
+      description: "local upload token metadata",
+    },
+    {
+      pattern: /\bx-llm-wiki-upload-token\b/iu,
+      description: "local upload token header metadata",
+    },
+    {
+      pattern: /\braw\/inputs\/[^\s"'`)<]+/iu,
+      description: "raw original path metadata",
+    },
+    {
+      pattern: /\braw\/queue\/[^\s"'`)<]+|\bqueue_path\b|\boriginal_path\b/iu,
+      description: "raw queue metadata",
+    },
+  ];
+
+  let firstMatch: { index: number; description: string } | null = null;
+  for (const marker of markerPatterns) {
+    const match = marker.pattern.exec(text);
+    if (match?.index === undefined) {
+      continue;
+    }
+
+    if (firstMatch === null || match.index < firstMatch.index) {
+      firstMatch = {
+        index: match.index,
+        description: marker.description,
+      };
+    }
+  }
+
+  if (firstMatch === null) {
+    return null;
+  }
+
+  return {
+    line: lineNumberAtIndex(text, firstMatch.index),
+    description: firstMatch.description,
+  };
+}
+
+function lineNumberAtIndex(content: string, index: number): number {
+  return content.slice(0, index).split(/\r?\n/u).length;
 }
 
 function publicRawSourceIndexLeakIssues(

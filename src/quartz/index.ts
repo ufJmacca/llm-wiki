@@ -2,6 +2,8 @@ import { execFile } from "node:child_process";
 import { lstat, readFile, rm } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
+import { stringify } from "yaml";
+
 import {
   deployProfileBaseUrlError,
   deployProfileCustomDomainBaseUrlError,
@@ -756,7 +758,10 @@ function localExplorerPageDefinitions(
   scan: RepoScan,
   files: readonly RepoMarkdownFile[],
 ): StaticReviewPage[] {
-  const reviewData = buildReviewDataModel(scan, { profile });
+  const reviewData = buildReviewDataModel(scan, {
+    profile,
+    materializedMarkdownPaths: new Set(files.map((file) => file.path)),
+  });
   const fallbackHomepage = localGeneratedHomepageDefinition(files);
 
   return [
@@ -2051,7 +2056,8 @@ async function shouldMigrateQuartzRuntimeEntry(repoRoot: string, entry: Scaffold
     case "quartz/components/LlmWikiQueueDashboard.tsx":
       return (
         content === componentPlaceholder("LlmWikiQueueDashboard", "llm-wiki-queue-dashboard") ||
-        content === oldComponentPlaceholder("llm-wiki-queue-dashboard")
+        content === oldComponentPlaceholder("llm-wiki-queue-dashboard") ||
+        content === queueDashboardComponentContentBeforeFrontmatter()
       );
     case "quartz/components/LlmWikiReviewPanel.tsx":
       return (
@@ -2591,6 +2597,150 @@ function oldComponentPlaceholder(className: string): string {
 }
 
 function queueDashboardComponentContent(): string {
+  return `import { resolveRelative } from "../quartz/util/path"
+import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+import type { FullSlug } from "../quartz/util/path"
+
+type QueueDashboardItem = {
+  title: string
+  source_id: string
+  source_kind: string
+  queue_status: string
+  visibility: string
+  source_card_path: string
+  source_card_materialized: boolean
+  queue_path: string
+}
+
+function numberValue(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : ""
+}
+
+function booleanValue(value: unknown): boolean {
+  return value === true
+}
+
+function queueItems(value: unknown): QueueDashboardItem[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return value.flatMap((item) => {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      return []
+    }
+
+    const record = item as Record<string, unknown>
+    const sourceId = stringValue(record.source_id)
+    const title = stringValue(record.title)
+    if (sourceId === "" && title === "") {
+      return []
+    }
+
+    return [{
+      title: title === "" ? sourceId : title,
+      source_id: sourceId,
+      source_kind: stringValue(record.source_kind),
+      queue_status: stringValue(record.queue_status) || stringValue(record.status),
+      visibility: stringValue(record.visibility),
+      source_card_path: stringValue(record.source_card_path),
+      source_card_materialized: booleanValue(record.source_card_materialized),
+      queue_path: stringValue(record.queue_path),
+    }]
+  })
+}
+
+function slugFromMarkdownPath(path: string): FullSlug {
+  return path.replace(/^quartz\\/content\\//u, "").replace(/\\.md$/u, "") as FullSlug
+}
+
+const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
+  const frontmatter = fileData.frontmatter ?? {}
+  const currentSlug = fileData.slug ?? ("index" as FullSlug)
+  const counts = [
+    ["Total", numberValue(frontmatter.llm_wiki_queue_total)],
+    ["Queued", numberValue(frontmatter.llm_wiki_queue_queued)],
+    ["Ingesting", numberValue(frontmatter.llm_wiki_queue_ingesting)],
+    ["Blocked", numberValue(frontmatter.llm_wiki_queue_blocked)],
+    ["Completed", numberValue(frontmatter.llm_wiki_queue_completed)],
+  ] as const
+  const items = queueItems(frontmatter.llm_wiki_queue_items).slice(0, 8)
+
+  return (
+    <section class="llm-wiki-queue-dashboard" data-llm-wiki-queue-dashboard="true" aria-label="LLM Wiki queue dashboard">
+      <header>
+        <h2>Queue dashboard</h2>
+        <p>{items.length === 0 ? "No sources are currently queued." : "Newest source rows from the generated review queue."}</p>
+      </header>
+      <dl class="llm-wiki-queue-dashboard__metrics">
+        {counts.map(([label, value]) => (
+          <div class="llm-wiki-queue-dashboard__metric">
+            <dt>{label}</dt>
+            <dd>{value}</dd>
+          </div>
+        ))}
+      </dl>
+      {items.length === 0 ? (
+        <div class="llm-wiki-queue-dashboard__zero">
+          <p>No sources are currently queued.</p>
+          <p>
+            <a class="internal" href={resolveRelative(currentSlug, "_llm-wiki/upload" as FullSlug)}>Upload sources</a>{" "}
+            <a class="internal" href={resolveRelative(currentSlug, "_llm-wiki/review/source-queue" as FullSlug)}>Open source queue</a>
+          </p>
+        </div>
+      ) : (
+        <div class="llm-wiki-queue-dashboard__rows">
+          <table>
+            <thead>
+              <tr>
+                <th>Title</th>
+                <th>Source ID</th>
+                <th>Kind</th>
+                <th>Queue status</th>
+                <th>Visibility</th>
+                <th>Source card</th>
+                <th>Queue path</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((item) => (
+                <tr>
+                  <td>{item.title}</td>
+                  <td><code>{item.source_id}</code></td>
+                  <td>{item.source_kind || "unknown"}</td>
+                  <td>{item.queue_status || "unknown"}</td>
+                  <td>{item.visibility || "unknown"}</td>
+                  <td>
+                    {item.source_card_path === "" ? (
+                      "Not generated"
+                    ) : item.source_card_materialized ? (
+                      <a class="internal" href={resolveRelative(currentSlug, slugFromMarkdownPath(item.source_card_path))}>
+                        {item.source_card_path}
+                      </a>
+                    ) : (
+                      <span>{item.source_card_path} <span class="llm-wiki-queue-dashboard__unavailable">(Not generated)</span></span>
+                    )}
+                  </td>
+                  <td>{item.queue_path === "" ? "Not generated" : item.queue_path}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  )
+}
+
+export default (() => LlmWikiQueueDashboard) satisfies QuartzComponentConstructor
+`;
+}
+
+function queueDashboardComponentContentBeforeFrontmatter(): string {
   return `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
 
 const LlmWikiQueueDashboard: QuartzComponent = () => {
@@ -2969,7 +3119,7 @@ function uploadPageContent(): string {
 }
 
 function reviewOverviewContent(reviewData: ReviewDataModel): string {
-  return `${generatedPageFrontmatter("Review Overview", "LlmWikiReviewPanel")}# Review Overview
+  return `${generatedPageFrontmatter("Review Overview", "LlmWikiReviewPanel", queueDashboardFrontmatterFields(reviewData))}# Review Overview
 
 ## Status
 
@@ -2998,7 +3148,7 @@ function reviewOverviewContent(reviewData: ReviewDataModel): string {
 }
 
 function reviewStatusContent(reviewData: ReviewDataModel): string {
-  return `${generatedPageFrontmatter("Review Status", "LlmWikiReviewPanel")}# Review Status
+  return `${generatedPageFrontmatter("Review Status", "LlmWikiReviewPanel", queueDashboardFrontmatterFields(reviewData))}# Review Status
 
 | Status | Count |
 |---|---:|
@@ -3042,7 +3192,7 @@ function sourceQueueContent(reviewData: ReviewDataModel): string {
     ].map((value) => escapeTableCell(String(value))).join(" | "),
   );
 
-  return `${generatedPageFrontmatter("Source Queue", "LlmWikiQueueDashboard")}# Source Queue
+  return `${generatedPageFrontmatter("Source Queue", "LlmWikiQueueDashboard", queueDashboardFrontmatterFields(reviewData))}# Source Queue
 
 | Status | Count |
 |---|---:|
@@ -3056,6 +3206,29 @@ function sourceQueueContent(reviewData: ReviewDataModel): string {
 |---|---|---|---|---|---|---|---|
 ${rows.map((row) => `| ${row} |`).join("\n")}
 `;
+}
+
+function queueDashboardFrontmatterFields(reviewData: ReviewDataModel): string[] {
+  const frontmatter = {
+    llm_wiki_queue_dashboard: true,
+    llm_wiki_queue_total: reviewData.queue.counts.total,
+    llm_wiki_queue_queued: reviewData.queue.counts.queued,
+    llm_wiki_queue_ingesting: reviewData.queue.counts.ingesting,
+    llm_wiki_queue_blocked: reviewData.queue.counts.blocked,
+    llm_wiki_queue_completed: reviewData.queue.counts.completed,
+    llm_wiki_queue_items: reviewData.queue.items.map((item) => ({
+      title: item.title,
+      source_id: item.source_id,
+      source_kind: item.source_kind,
+      queue_status: item.status,
+      visibility: item.visibility,
+      source_card_path: item.source_card_path,
+      source_card_materialized: item.source_card_materialized,
+      queue_path: item.queue_path,
+    })),
+  };
+
+  return stringify(frontmatter).trimEnd().split("\n");
 }
 
 function reviewCategoryContent(options: {

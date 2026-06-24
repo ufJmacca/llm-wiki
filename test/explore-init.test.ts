@@ -141,10 +141,27 @@ describe("explore init command", () => {
       expect(quartzConfig).toContain("enableRSS: false");
       const layout = await readGeneratedFile(wikiDir, "quartz/quartz.layout.ts");
       const uploadComponent = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiUploadForm.tsx");
-      expect(layout).toContain('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"');
-      expect(layout).toContain("LlmWikiUploadForm()");
-      expect(layout).toContain("llm_wiki_upload");
-      expect(layout).toContain('llm_wiki_component === "LlmWikiUploadForm"');
+      const queueDashboardComponent = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiQueueDashboard.tsx");
+      const reviewPanelComponent = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiReviewPanel.tsx");
+      const sourceBadgeComponent = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiSourceBadge.tsx");
+      const visibilityWarningComponent = await readGeneratedFile(
+        wikiDir,
+        "quartz/components/LlmWikiVisibilityWarning.tsx",
+      );
+      for (const gate of [
+        { component: "LlmWikiUploadForm", field: "llm_wiki_upload" },
+        { component: "LlmWikiQueueDashboard", field: "llm_wiki_queue_dashboard" },
+        { component: "LlmWikiReviewPanel", field: "llm_wiki_review_panel" },
+        { component: "LlmWikiSourceBadge", field: "llm_wiki_source_badge" },
+        { component: "LlmWikiVisibilityWarning", field: "llm_wiki_visibility_warning" },
+      ]) {
+        expect(layout).toContain(`import ${gate.component} from "./components/${gate.component}"`);
+        expect(layout).toContain(`${gate.component}()`);
+        expect(layout).toContain(`page.fileData.frontmatter?.${gate.field} === true`);
+        expect(layout).toContain(`page.fileData.frontmatter?.llm_wiki_component === "${gate.component}"`);
+      }
+      expect(layout).toContain('typeof page.fileData.frontmatter?.source_id === "string"');
+      expect(layout).toContain('typeof page.fileData.frontmatter?.source_card_path === "string"');
       expect(uploadComponent).toContain("const LlmWikiUploadForm");
       expect(uploadComponent).toContain("/_llm-wiki/runtime/local-daemon.json");
       expect(uploadComponent).toContain('encType="multipart/form-data"');
@@ -153,9 +170,32 @@ describe("explore init command", () => {
       expect(uploadComponent).toContain("bindLlmWikiUploadForms");
       expect(uploadComponent).toContain('document.addEventListener(\\"nav\\", bindLlmWikiUploadForms)');
       expect(uploadComponent).not.toContain("dangerouslySetInnerHTML");
-      await expect(readGeneratedFile(wikiDir, "quartz/components/LlmWikiReviewPanel.tsx")).resolves.toContain(
-        "llm-wiki-review-panel",
-      );
+      for (const placeholder of [
+        ["LlmWikiUploadForm", "llm-wiki-upload-form", uploadComponent],
+        ["LlmWikiQueueDashboard", "llm-wiki-queue-dashboard", queueDashboardComponent],
+        ["LlmWikiReviewPanel", "llm-wiki-review-panel", reviewPanelComponent],
+        ["LlmWikiSourceBadge", "llm-wiki-source-badge", sourceBadgeComponent],
+        ["LlmWikiVisibilityWarning", "llm-wiki-visibility-warning", visibilityWarningComponent],
+      ]) {
+        const [componentName, className, content] = placeholder;
+        expect(content).not.toContain(
+          `return <section class="${className}" data-llm-wiki-component="${componentName}" />`,
+        );
+        expect(content).not.toContain(`return <div className="${className}" />;`);
+      }
+      expect(queueDashboardComponent).toContain("data-llm-wiki-queue-dashboard");
+      expect(queueDashboardComponent).toContain("Queued");
+      expect(queueDashboardComponent).toContain("Blocked");
+      expect(reviewPanelComponent).toContain("data-llm-wiki-review-panel");
+      expect(reviewPanelComponent).toContain("_llm-wiki/review/source-queue");
+      expect(reviewPanelComponent).toContain("_llm-wiki/review/visibility-warnings");
+      expect(reviewPanelComponent).toContain("resolveRelative(currentSlug, link.href)");
+      expect(reviewPanelComponent).toContain('class="internal"');
+      expect(reviewPanelComponent).not.toContain('href="/_llm-wiki/review/');
+      expect(sourceBadgeComponent).toContain("data-llm-wiki-source-badge");
+      expect(sourceBadgeComponent).toContain("Visibility");
+      expect(visibilityWarningComponent).toContain("data-llm-wiki-visibility-warning");
+      expect(visibilityWarningComponent).toContain("public profiles");
       await expect(readGeneratedFile(wikiDir, "quartz/scripts/llm-wiki-loopback-listen.cjs")).resolves.toContain(
         "LLM_WIKI_EXPLORER_HOST",
       );
@@ -359,7 +399,7 @@ export const defaultContentPageLayout = {
     });
   });
 
-  it("migrates the prior generated layout and upload placeholder to the upload form gate", async () => {
+  it("migrates the prior generated layout and exact component placeholders to frontmatter gates", async () => {
     await withTempWorkspace("llm-wiki-explore-init-upgrade-upload-layout-", async (workspaceDir) => {
       // Arrange
       execFileMock.mockReset();
@@ -368,37 +408,70 @@ export const defaultContentPageLayout = {
       const firstInit = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
       expect(firstInit.exitCode).toBe(0);
       const generatedLayout = await readGeneratedFile(wikiDir, "quartz/quartz.layout.ts");
-      const priorGeneratedLayout = generatedLayout
-        .replace('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"\n', "")
-        .replace(
-          `    Component.ConditionalRender({
-      component: LlmWikiUploadForm(),
+      const gatedComponentSnippet = (component: string, field: string) => `    Component.ConditionalRender({
+      component: ${component}(),
       condition: (page) =>
-        page.fileData.frontmatter?.llm_wiki_upload === true ||
-        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiUploadForm",
+        page.fileData.frontmatter?.${field} === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "${component}",
     }),
-`,
-          "",
-        );
+`;
+      const priorGeneratedLayout = generatedLayout
+        .replace('import LlmWikiQueueDashboard from "./components/LlmWikiQueueDashboard"\n', "")
+        .replace('import LlmWikiReviewPanel from "./components/LlmWikiReviewPanel"\n', "")
+        .replace('import LlmWikiSourceBadge from "./components/LlmWikiSourceBadge"\n', "")
+        .replace('import LlmWikiVisibilityWarning from "./components/LlmWikiVisibilityWarning"\n', "")
+        .replace('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"\n', "")
+        .replace(gatedComponentSnippet("LlmWikiVisibilityWarning", "llm_wiki_visibility_warning"), "")
+        .replace(`    Component.ConditionalRender({
+      component: LlmWikiSourceBadge(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_source_badge === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiSourceBadge" ||
+        typeof page.fileData.frontmatter?.source_id === "string" ||
+        typeof page.fileData.frontmatter?.source_card_path === "string",
+    }),
+`, "")
+        .replace(gatedComponentSnippet("LlmWikiUploadForm", "llm_wiki_upload"), "")
+        .replace(gatedComponentSnippet("LlmWikiQueueDashboard", "llm_wiki_queue_dashboard"), "")
+        .replace(gatedComponentSnippet("LlmWikiReviewPanel", "llm_wiki_review_panel"), "");
       await writeFile(resolve(wikiDir, "quartz/quartz.layout.ts"), priorGeneratedLayout, "utf8");
-      await writeFile(
-        resolve(wikiDir, "quartz/components/LlmWikiUploadForm.tsx"),
-        `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+      for (const placeholder of [
+        ["LlmWikiQueueDashboard", "llm-wiki-queue-dashboard"],
+        ["LlmWikiReviewPanel", "llm-wiki-review-panel"],
+        ["LlmWikiSourceBadge", "llm-wiki-source-badge"],
+        ["LlmWikiUploadForm", "llm-wiki-upload-form"],
+        ["LlmWikiVisibilityWarning", "llm-wiki-visibility-warning"],
+      ]) {
+        const [componentName, className] = placeholder;
+        await writeFile(
+          resolve(wikiDir, `quartz/components/${componentName}.tsx`),
+          `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
 
-const LlmWikiUploadForm: QuartzComponent = () => {
-  return <section class="llm-wiki-upload-form" data-llm-wiki-component="LlmWikiUploadForm" />
+const ${componentName}: QuartzComponent = () => {
+  return <section class="${className}" data-llm-wiki-component="${componentName}" />
 }
 
-export default (() => LlmWikiUploadForm) satisfies QuartzComponentConstructor
+export default (() => ${componentName}) satisfies QuartzComponentConstructor
 `,
-        "utf8",
-      );
+          "utf8",
+        );
+      }
 
       // Act
       const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
       const payload = parseExploreInit(result.stdout);
       const migratedLayout = await readGeneratedFile(wikiDir, "quartz/quartz.layout.ts");
       const migratedUploadComponent = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiUploadForm.tsx");
+      const migratedQueueDashboardComponent = await readGeneratedFile(
+        wikiDir,
+        "quartz/components/LlmWikiQueueDashboard.tsx",
+      );
+      const migratedReviewPanelComponent = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiReviewPanel.tsx");
+      const migratedSourceBadgeComponent = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiSourceBadge.tsx");
+      const migratedVisibilityWarningComponent = await readGeneratedFile(
+        wikiDir,
+        "quartz/components/LlmWikiVisibilityWarning.tsx",
+      );
 
       // Assert
       expect(result.exitCode).toBe(0);
@@ -406,13 +479,93 @@ export default (() => LlmWikiUploadForm) satisfies QuartzComponentConstructor
       const updatedWarning = payload.warnings.find((warning) =>
         warning.startsWith("Updated generated Quartz runtime files:"),
       );
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/components/LlmWikiQueueDashboard.tsx"));
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/components/LlmWikiReviewPanel.tsx"));
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/components/LlmWikiSourceBadge.tsx"));
       expect(updatedWarning).toEqual(expect.stringContaining("quartz/components/LlmWikiUploadForm.tsx"));
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/components/LlmWikiVisibilityWarning.tsx"));
       expect(updatedWarning).toEqual(expect.stringContaining("quartz/quartz.layout.ts"));
-      expect(migratedLayout).toContain('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"');
-      expect(migratedLayout).toContain("LlmWikiUploadForm()");
-      expect(migratedLayout).toContain("llm_wiki_upload");
+      for (const gate of [
+        { component: "LlmWikiUploadForm", field: "llm_wiki_upload" },
+        { component: "LlmWikiQueueDashboard", field: "llm_wiki_queue_dashboard" },
+        { component: "LlmWikiReviewPanel", field: "llm_wiki_review_panel" },
+        { component: "LlmWikiSourceBadge", field: "llm_wiki_source_badge" },
+        { component: "LlmWikiVisibilityWarning", field: "llm_wiki_visibility_warning" },
+      ]) {
+        expect(migratedLayout).toContain(`import ${gate.component} from "./components/${gate.component}"`);
+        expect(migratedLayout).toContain(`${gate.component}()`);
+        expect(migratedLayout).toContain(`page.fileData.frontmatter?.${gate.field} === true`);
+      }
+      expect(migratedLayout).toContain('typeof page.fileData.frontmatter?.source_id === "string"');
+      expect(migratedLayout).toContain('typeof page.fileData.frontmatter?.source_card_path === "string"');
       expect(migratedUploadComponent).toContain("LlmWikiUploadForm.afterDOMLoaded = uploadFormScript");
       expect(migratedUploadComponent).toContain("/_llm-wiki/runtime/local-daemon.json");
+      expect(migratedQueueDashboardComponent).toContain("data-llm-wiki-queue-dashboard");
+      expect(migratedQueueDashboardComponent).not.toContain(
+        'return <section class="llm-wiki-queue-dashboard" data-llm-wiki-component="LlmWikiQueueDashboard" />',
+      );
+      expect(migratedReviewPanelComponent).toContain("_llm-wiki/review/source-queue");
+      expect(migratedReviewPanelComponent).toContain("resolveRelative(currentSlug, link.href)");
+      expect(migratedReviewPanelComponent).not.toContain('href="/_llm-wiki/review/');
+      expect(migratedSourceBadgeComponent).toContain("data-llm-wiki-source-badge");
+      expect(migratedSourceBadgeComponent).not.toContain(
+        'return <section class="llm-wiki-source-badge" data-llm-wiki-component="LlmWikiSourceBadge" />',
+      );
+      expect(migratedVisibilityWarningComponent).toContain("public profiles");
+    });
+  });
+
+  it("migrates the exact prior generated review panel to baseUrl-aware links", async () => {
+    await withTempWorkspace("llm-wiki-explore-init-upgrade-review-links-", async (workspaceDir) => {
+      // Arrange
+      execFileMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const firstInit = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      expect(firstInit.exitCode).toBe(0);
+      await writeFile(
+        resolve(wikiDir, "quartz/components/LlmWikiReviewPanel.tsx"),
+        `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+
+const LlmWikiReviewPanel: QuartzComponent = () => {
+  return (
+    <nav class="llm-wiki-review-panel" data-llm-wiki-review-panel="true" aria-label="LLM Wiki review">
+      <h2>Review panel</h2>
+      <ul>
+        <li><a href="/_llm-wiki/review/overview">Overview</a></li>
+        <li><a href="/_llm-wiki/review/source-queue">Source queue</a></li>
+        <li><a href="/_llm-wiki/review/recent-ingests">Recent ingests</a></li>
+        <li><a href="/_llm-wiki/review/needs-review">Needs review</a></li>
+        <li><a href="/_llm-wiki/review/contradictions">Contradictions</a></li>
+        <li><a href="/_llm-wiki/review/orphans">Orphans</a></li>
+        <li><a href="/_llm-wiki/review/stale-pages">Stale pages</a></li>
+        <li><a href="/_llm-wiki/review/visibility-warnings">Visibility warnings</a></li>
+        <li><a href="/_llm-wiki/review/profile-summary">Profile summary</a></li>
+      </ul>
+    </nav>
+  )
+}
+
+export default (() => LlmWikiReviewPanel) satisfies QuartzComponentConstructor
+`,
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      const payload = parseExploreInit(result.stdout);
+      const migratedReviewPanelComponent = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiReviewPanel.tsx");
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      const updatedWarning = payload.warnings.find((warning) =>
+        warning.startsWith("Updated generated Quartz runtime files:"),
+      );
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/components/LlmWikiReviewPanel.tsx"));
+      expect(migratedReviewPanelComponent).toContain("resolveRelative(currentSlug, link.href)");
+      expect(migratedReviewPanelComponent).toContain('class="internal"');
+      expect(migratedReviewPanelComponent).not.toContain('href="/_llm-wiki/review/');
     });
   });
 
@@ -498,10 +651,28 @@ export const defaultContentPageLayout = {
   right: [],
 };
 `;
+      const customizedQueueDashboard = `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+
+const LlmWikiQueueDashboard: QuartzComponent = () => {
+  return (
+    <section class="llm-wiki-queue-dashboard" data-customized="true">
+      Custom queue dashboard operator notes.
+    </section>
+  )
+}
+
+export default (() => LlmWikiQueueDashboard) satisfies QuartzComponentConstructor
+`;
       await writeFile(resolve(wikiDir, "quartz/package.json"), customizedPackageJson, "utf8");
       await writeFile(resolve(wikiDir, "quartz/README.md"), customizedReadme, "utf8");
       await writeFile(resolve(wikiDir, "quartz/quartz.config.ts"), customizedConfig, "utf8");
       await writeFile(resolve(wikiDir, "quartz/quartz.layout.ts"), customizedLayout, "utf8");
+      await mkdir(resolve(wikiDir, "quartz/components"), { recursive: true });
+      await writeFile(
+        resolve(wikiDir, "quartz/components/LlmWikiQueueDashboard.tsx"),
+        customizedQueueDashboard,
+        "utf8",
+      );
 
       // Act
       const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
@@ -517,6 +688,9 @@ export const defaultContentPageLayout = {
       await expect(readGeneratedFile(wikiDir, "quartz/README.md")).resolves.toBe(customizedReadme);
       await expect(readGeneratedFile(wikiDir, "quartz/quartz.config.ts")).resolves.toBe(customizedConfig);
       await expect(readGeneratedFile(wikiDir, "quartz/quartz.layout.ts")).resolves.toBe(customizedLayout);
+      await expect(readGeneratedFile(wikiDir, "quartz/components/LlmWikiQueueDashboard.tsx")).resolves.toBe(
+        customizedQueueDashboard,
+      );
     });
   });
 

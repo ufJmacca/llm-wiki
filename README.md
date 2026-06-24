@@ -190,7 +190,17 @@ Pass `--install` to run that install command from the generated `quartz/` direct
 cd quartz && npm install
 ```
 
-Pass `--with-daemon` to start the local upload daemon alongside Explorer. The daemon also binds to `127.0.0.1` by default, adds `daemon` metadata to the serve readiness envelope, and is closed when the Explorer process exits. Use `--daemon-port <port>` to choose the upload daemon port. Upload commits remain disabled unless `--commit-uploads` is also passed.
+Pass `--with-daemon` to start the local upload daemon alongside Explorer. The daemon also binds to `127.0.0.1` by default, adds `daemon` metadata to the serve readiness envelope, writes local runtime metadata for the browser upload form, and is closed when the Explorer process exits. Use `--daemon-port <port>` to choose the upload daemon port. Upload commits remain disabled unless `--commit-uploads` is also passed.
+
+Open the local Explorer root URL and use the generated upload form to capture a file, pasted text, or URL source. The browser form submits `multipart/form-data` to the local daemon endpoint recorded in `_llm-wiki/runtime/local-daemon.json`: `<daemon.url>/api/raw-upload`. File uploads send the `file` field with an optional `title`; pasted text uploads send `text` plus the required `title`; URL uploads send `url` with an optional `title`.
+
+A successful browser upload shows the title, `source_id`, source kind, queue status, source card path, original path, and next ingest command. Use `llm-wiki ingest <source_id>` to review and curate the queued source manually, or `llm-wiki ingest <source_id> --auto` when the repository has a default local agent configured.
+
+Local browser upload is different from `llm-wiki upload init --target github`: the local form talks only to the loopback daemon in the current wiki, while the remote upload scaffold prepares a future hosted PR-first backend.
+
+`llm-wiki explore sync --profile review` and local profile sync generate `_llm-wiki/review/overview.md`, `source-queue.md`, `recent-ingests.md`, `needs-review.md`, `contradictions.md`, `orphans.md`, `stale-pages.md`, `visibility-warnings.md`, and `profile-summary.md`.
+
+Review pages are derived from live repository state rather than hidden caches. `source-queue.md` and queue counts come from `raw/queue/*.json` joined to raw source cards. `recent-ingests.md` comes from parsed ingest entries in `curated/log.md`. `needs-review.md` comes from curated page frontmatter. `contradictions.md` combines curated frontmatter conflict signals with parsed contradiction entries in `curated/log.md`. `stale-pages.md` combines `next_review` frontmatter with stale-index lint findings. `orphans.md` comes from the Markdown link graph/orphan scanner. `visibility-warnings.md` and `profile-summary.md` come from lint results, profile selection rules, and public/private visibility checks.
 
 `llm-wiki explore open` reads the recorded Explorer state and prints the current URL. JSON output is stable as `{ url, opened }`; `opened` is currently `false` because the command avoids launching a platform browser process.
 
@@ -222,7 +232,7 @@ Duplicate content returns the existing source metadata with `status: duplicate` 
 
 ## Local Upload Daemon
 
-`llm-wiki daemon` starts a localhost-only HTTP daemon for local raw uploads. It refuses non-local hosts in the MVP; allowed hosts are `127.0.0.1`, `localhost`, and `::1`. JSON readiness output includes `{ host, port, url, upload_path, upload_token, commit_uploads }`, then the process keeps running until interrupted.
+`llm-wiki daemon` starts a localhost-only HTTP daemon for local raw uploads. It refuses non-local hosts in the MVP; allowed hosts are `127.0.0.1`, `localhost`, and `::1`. The local daemon binds to loopback (`127.0.0.1`, `localhost`, or `::1`) so browser uploads stay on the same machine by default. JSON readiness output includes `{ host, port, url, upload_path, upload_token, commit_uploads }`, then the process keeps running until interrupted.
 
 The daemon exposes one endpoint:
 
@@ -237,6 +247,8 @@ Requests must use `multipart/form-data` and include one source payload shape:
 - `url`: HTTP(S) URL field, with optional `title`.
 
 Every upload request must also set the `x-llm-wiki-upload-token` header to the per-run `upload_token` value from daemon readiness output. Missing or invalid tokens are rejected before payload parsing or capture. Multipart field values are capped at the daemon upload byte limit and oversized text, URL, or title fields fail instead of being truncated.
+
+Upload tokens are generated per daemon run, written only to local runtime metadata, and must never be committed. `_llm-wiki/runtime/local-daemon.json` is generated only for local/review Explorer runtime use and is excluded from public and GitHub Pages output.
 
 Successful responses return `{ ok: true, data }` where `data` includes `status`, `source_id`, `source_kind`, `queue_path`, `source_card_path`, `original_path`, `created_paths`, and `commit`. Duplicate uploads return `status: duplicate` with the existing source paths and no new created paths. The daemon does not serve raw originals or static repository files; public Explorer profiles still exclude raw source cards and raw originals.
 
@@ -361,7 +373,7 @@ Current lint rules detect raw source hash drift, malformed source cards, queue/s
 
 `llm-wiki lint --fix` only performs deterministic safe repairs. Currently it regenerates `curated/index.md` from source cards and valid curated pages. It does not rewrite raw originals and does not invent missing provenance.
 
-`llm-wiki lint --profile public --strict` fails closed when a public profile would select private pages, raw originals, public pages that link raw content, public pages that link private targets, or private nodes/text that would leak into public graph/search output.
+`llm-wiki lint --profile public --strict` fails closed when a public profile would select private pages, raw originals, public pages that link raw content, public pages that link private targets, or private nodes/text that would leak into public graph/search output. Strict public lint validates live repository inputs selected for public output; it does not scan existing local/review artifacts already under `quartz/content`, so run public sync/build before publishing to regenerate Quartz output without local runtime metadata, daemon tokens, queue data, private review pages, raw source cards, or raw originals.
 
 `llm-wiki index rebuild` writes `.llm-wiki/cache/pages.json`, `sources.json`, `queue.json`, `graph.json`, and `metadata.json`. These caches are rebuildable and non-authoritative; existing `.llm-wiki/cache/*` files are ignored as scan inputs.
 
@@ -422,7 +434,6 @@ Agent-specific files are thin pointers:
 
 The following PRD features are not implemented in this foundation slice:
 
-- Full Quartz browser feature wiring beyond the generated runtime defaults.
-- Remote upload workflows, remote API, and browser upload form.
+- Remote upload workflows and remote upload API hosting.
 
-Until those features land, the supported product behavior is repo initialization plus local source capture, local daemon uploads, remote upload scaffold generation, ingest and query task scaffolding, local agent execution, validation, optional provider proposal mode, queue/log inspection, lint/index rebuild, status reporting, Git snapshots, offline search/navigation over local Markdown, Quartz init/sync/serve/open/build workflows, and GitHub Pages deploy workflow generation/preflight.
+Until those features land, the supported product behavior is repo initialization plus local source capture, local browser upload through the loopback daemon, remote upload scaffold generation, ingest and query task scaffolding, local agent execution, validation, optional provider proposal mode, queue/log inspection, lint/index rebuild, status reporting, Git snapshots, offline search/navigation over local Markdown, Quartz init/sync/serve/open/build workflows, and GitHub Pages deploy workflow generation/preflight.

@@ -38,6 +38,18 @@ export type ReviewQueueData = {
   items: ReviewQueueItem[];
 };
 
+export type ReviewSourceBadgeData = {
+  source_id: string;
+  title: string;
+  source_kind: string | null;
+  queue_status: string | null;
+  visibility: string | null;
+  source_card_path: string | null;
+  queue_path: string | null;
+  original_path: string | null;
+  page_path: string | null;
+};
+
 export type ReviewQueueItem = {
   source_id: string;
   title: string;
@@ -49,6 +61,7 @@ export type ReviewQueueItem = {
   original_path: string | null;
   captured_at: string | null;
   updated_at: string | null;
+  source: ReviewSourceBadgeData;
 };
 
 export type ReviewCategory<Item> = {
@@ -64,6 +77,7 @@ export type ReviewRecentIngestItem = {
   log_line: number;
   source_card_path: string | null;
   queue_path: string | null;
+  source: ReviewSourceBadgeData | null;
 };
 
 export type ReviewPageItem = {
@@ -73,6 +87,7 @@ export type ReviewPageItem = {
   visibility: string | null;
   source_ids: string[];
   review_status: string;
+  sources: ReviewSourceBadgeData[];
 };
 
 export type ReviewContradictionItem =
@@ -83,6 +98,7 @@ export type ReviewContradictionItem =
       page_type: string | null;
       visibility: string | null;
       source_ids: string[];
+      sources: ReviewSourceBadgeData[];
     }
   | {
       source: "log";
@@ -92,6 +108,7 @@ export type ReviewContradictionItem =
       title: string;
       timestamp: string;
       text: string;
+      source_badge: ReviewSourceBadgeData | null;
     };
 
 export type ReviewStalePageItem =
@@ -111,6 +128,7 @@ export type ReviewStalePageItem =
       visibility: string | null;
       source_ids: string[];
       next_review: string;
+      sources: ReviewSourceBadgeData[];
     };
 
 export type ReviewLintPageItem = ReviewLintIssueItem & {
@@ -118,6 +136,7 @@ export type ReviewLintPageItem = ReviewLintIssueItem & {
   page_type: string | null;
   visibility: string | null;
   source_ids: string[];
+  sources: ReviewSourceBadgeData[];
 };
 
 export type ReviewLintIssueItem = {
@@ -127,6 +146,10 @@ export type ReviewLintIssueItem = {
   severity: LintIssue["severity"];
   message: string;
   fix_hint: string;
+  reason: string;
+  public_impact: string;
+  recommended_action: string;
+  source: ReviewSourceBadgeData | null;
 };
 
 export type BuildReviewDataModelOptions = {
@@ -143,17 +166,18 @@ export function buildReviewDataModel(
 ): ReviewDataModel {
   const generatedAt = options.generatedAt ?? new Date();
   const lintIssues = options.lintResult?.issues ?? collectLintIssues(scan, lintOptionsForProfile(options.profile));
+  const sourceBadgesById = buildSourceBadgeIndex(scan);
 
   return {
     generated_at: generatedAt.toISOString(),
     profile: options.profile === undefined ? null : toProfileMetadata(options.profile),
-    queue: buildQueueData(scan),
-    recent_ingests: category(buildRecentIngestItems(scan)),
-    needs_review: category(buildNeedsReviewItems(scan)),
-    contradictions: category(buildContradictionItems(scan)),
-    stale_pages: category(buildStalePageItems(scan, lintIssues, generatedAt)),
-    orphans: category(buildOrphanItems(scan, lintIssues)),
-    visibility_warnings: category(buildVisibilityWarningItems(lintIssues)),
+    queue: buildQueueData(scan, sourceBadgesById),
+    recent_ingests: category(buildRecentIngestItems(scan, sourceBadgesById)),
+    needs_review: category(buildNeedsReviewItems(scan, sourceBadgesById)),
+    contradictions: category(buildContradictionItems(scan, sourceBadgesById)),
+    stale_pages: category(buildStalePageItems(scan, lintIssues, generatedAt, sourceBadgesById)),
+    orphans: category(buildOrphanItems(scan, lintIssues, sourceBadgesById)),
+    visibility_warnings: category(buildVisibilityWarningItems(scan, lintIssues, sourceBadgesById)),
   };
 }
 
@@ -182,7 +206,7 @@ function toProfileMetadata(profile: WikiProfile): ReviewProfileMetadata {
   };
 }
 
-function buildQueueData(scan: RepoScan): ReviewQueueData {
+function buildQueueData(scan: RepoScan, sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>): ReviewQueueData {
   const sourceCardsById = new Map(
     scan.sourceCards.flatMap((card) => (card.source_id === null ? [] : [[card.source_id, card] as const])),
   );
@@ -190,6 +214,7 @@ function buildQueueData(scan: RepoScan): ReviewQueueData {
     .map((queueFile) => {
       const card = sourceCardsById.get(queueFile.item.source_id);
       const sourceKind = stringValue(card?.scan.frontmatter?.source_kind) ?? stringValue(queueFile.item.source_kind) ?? queueFile.item.kind;
+      const source = sourceBadgesById.get(queueFile.item.source_id) ?? sourceBadgeFromQueueItem(queueFile, card);
 
       return {
         source_id: queueFile.item.source_id,
@@ -202,6 +227,7 @@ function buildQueueData(scan: RepoScan): ReviewQueueData {
         original_path: stringValue(queueFile.item.original_path),
         captured_at: stringValue(card?.scan.frontmatter?.captured_at) ?? stringValue(queueFile.item.captured_at),
         updated_at: stringValue(card?.scan.frontmatter?.updated_at) ?? stringValue(queueFile.item.updated_at),
+        source,
       };
     })
     .sort((left, right) => left.source_id.localeCompare(right.source_id));
@@ -218,7 +244,10 @@ function buildQueueData(scan: RepoScan): ReviewQueueData {
   };
 }
 
-function buildRecentIngestItems(scan: RepoScan): ReviewRecentIngestItem[] {
+function buildRecentIngestItems(
+  scan: RepoScan,
+  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
+): ReviewRecentIngestItem[] {
   const sourceCardsById = sourceCardsByIdMap(scan);
   const queuePathsById = new Map(scan.queueItems.map((queueFile) => [queueFile.item.source_id, queueFile.path]));
 
@@ -232,29 +261,36 @@ function buildRecentIngestItems(scan: RepoScan): ReviewRecentIngestItem[] {
       log_line: entry.line,
       source_card_path: sourceCardsById.get(entry.affectedId)?.path ?? null,
       queue_path: queuePathsById.get(entry.affectedId) ?? null,
+      source: sourceBadgesById.get(entry.affectedId) ?? null,
     }))
     .sort((left, right) => right.timestamp.localeCompare(left.timestamp) || left.source_id.localeCompare(right.source_id));
 }
 
-function buildNeedsReviewItems(scan: RepoScan): ReviewPageItem[] {
+function buildNeedsReviewItems(
+  scan: RepoScan,
+  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
+): ReviewPageItem[] {
   return scan.curatedPages
     .filter((page) => stringValue(page.scan.frontmatter?.review_status) === "needs-human-review")
     .map((page) => ({
-      ...toPageItem(page),
+      ...toPageItem(page, sourceBadgesById),
       review_status: "needs-human-review",
     }))
     .sort((left, right) => left.path.localeCompare(right.path));
 }
 
-function buildContradictionItems(scan: RepoScan): ReviewContradictionItem[] {
+function buildContradictionItems(
+  scan: RepoScan,
+  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
+): ReviewContradictionItem[] {
   const frontmatterItems: ReviewContradictionItem[] = scan.curatedPages
     .filter(hasContradictionFrontmatterSignal)
     .map((page) => ({
       source: "frontmatter" as const,
-      ...toPageItem(page),
+      ...toPageItem(page, sourceBadgesById),
     }))
     .sort((left, right) => left.path.localeCompare(right.path));
-  const logItems = (scan.log?.scan.entries ?? []).flatMap(logContradictionItems);
+  const logItems = (scan.log?.scan.entries ?? []).flatMap((entry) => logContradictionItems(entry, sourceBadgesById));
 
   return [...frontmatterItems, ...logItems];
 }
@@ -273,7 +309,10 @@ function hasContradictionFrontmatterSignal(page: RepoMarkdownFile): boolean {
   return typeof contradictions === "string" ? contradictions.trim() !== "" : Array.isArray(contradictions) && contradictions.length > 0;
 }
 
-function logContradictionItems(entry: RuntimeLogEntry): ReviewContradictionItem[] {
+function logContradictionItems(
+  entry: RuntimeLogEntry,
+  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
+): ReviewContradictionItem[] {
   return readLogContradictions(entry.body).map((text) => ({
     source: "log",
     path: entry.path,
@@ -282,6 +321,7 @@ function logContradictionItems(entry: RuntimeLogEntry): ReviewContradictionItem[
     title: entry.title,
     timestamp: entry.timestamp,
     text,
+    source_badge: sourceBadgesById.get(entry.affectedId) ?? null,
   }));
 }
 
@@ -329,7 +369,12 @@ function isRealContradictionValue(value: string): boolean {
   return value !== "" && value.toLowerCase() !== "none";
 }
 
-function buildStalePageItems(scan: RepoScan, lintIssues: readonly LintIssue[], generatedAt: Date): ReviewStalePageItem[] {
+function buildStalePageItems(
+  scan: RepoScan,
+  lintIssues: readonly LintIssue[],
+  generatedAt: Date,
+  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
+): ReviewStalePageItem[] {
   const lintItems = lintIssues
     .filter((issue) => issue.rule_id === "index_stale")
     .map((issue) => ({
@@ -351,7 +396,7 @@ function buildStalePageItems(scan: RepoScan, lintIssues: readonly LintIssue[], g
       return [
         {
           source: "frontmatter" as const,
-          ...toPageItem(page),
+          ...toPageItem(page, sourceBadgesById),
           next_review: nextReview,
         },
       ];
@@ -366,7 +411,11 @@ function isDueBy(dateValue: string, generatedAt: Date): boolean {
   return Number.isFinite(parsed) && parsed <= generatedAt.getTime();
 }
 
-function buildOrphanItems(scan: RepoScan, lintIssues: readonly LintIssue[]): ReviewLintPageItem[] {
+function buildOrphanItems(
+  scan: RepoScan,
+  lintIssues: readonly LintIssue[],
+  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
+): ReviewLintPageItem[] {
   const pagesByPath = new Map(scan.curatedPages.map((page) => [page.path, page]));
 
   return lintIssues
@@ -380,15 +429,29 @@ function buildOrphanItems(scan: RepoScan, lintIssues: readonly LintIssue[]): Rev
         page_type: page === undefined ? null : stringValue(page.scan.frontmatter?.type),
         visibility: page === undefined ? null : stringValue(page.scan.frontmatter?.visibility),
         source_ids: page === undefined ? [] : sourceIdsValue(page),
+        sources: page === undefined ? [] : sourceBadgesForIds(sourceIdsValue(page), sourceBadgesById),
       };
     })
     .sort((left, right) => left.path.localeCompare(right.path));
 }
 
-function buildVisibilityWarningItems(lintIssues: readonly LintIssue[]): ReviewLintIssueItem[] {
+function buildVisibilityWarningItems(
+  scan: RepoScan,
+  lintIssues: readonly LintIssue[],
+  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
+): ReviewLintIssueItem[] {
+  const sourceBadgesByPath = sourceBadgePathIndex(sourceBadgesById);
+  const pagesByPath = new Map(scan.markdown.map((page) => [page.path, page]));
+
   return lintIssues
     .filter((issue) => isVisibilityWarningRule(issue.rule_id))
-    .map(toLintIssueItem)
+    .map((issue) => ({
+      ...toLintIssueItem(issue),
+      reason: issue.message,
+      public_impact: publicImpactForVisibilityRule(issue.rule_id),
+      recommended_action: issue.fix_hint,
+      source: sourceBadgeForIssue(issue, sourceBadgesByPath, pagesByPath, sourceBadgesById),
+    }))
     .sort((left, right) => left.path.localeCompare(right.path) || left.rule_id.localeCompare(right.rule_id));
 }
 
@@ -404,16 +467,26 @@ function toLintIssueItem(issue: LintIssue): ReviewLintIssueItem {
     severity: issue.severity,
     message: issue.message,
     fix_hint: issue.fix_hint,
+    reason: issue.message,
+    public_impact: publicImpactForVisibilityRule(issue.rule_id),
+    recommended_action: issue.fix_hint,
+    source: null,
   };
 }
 
-function toPageItem(page: RepoMarkdownFile): Omit<ReviewPageItem, "review_status"> {
+function toPageItem(
+  page: RepoMarkdownFile,
+  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
+): Omit<ReviewPageItem, "review_status"> {
+  const sourceIds = sourceIdsValue(page);
+
   return {
     path: page.path,
     title: titleValue(page),
     page_type: stringValue(page.scan.frontmatter?.type),
     visibility: stringValue(page.scan.frontmatter?.visibility),
-    source_ids: sourceIdsValue(page),
+    source_ids: sourceIds,
+    sources: sourceBadgesForIds(sourceIds, sourceBadgesById),
   };
 }
 
@@ -431,6 +504,120 @@ function stringArrayValue(value: unknown): string[] {
 
 function sourceCardsByIdMap(scan: RepoScan): Map<string, SourceCard> {
   return new Map(scan.sourceCards.flatMap((card) => (card.source_id === null ? [] : [[card.source_id, card] as const])));
+}
+
+function buildSourceBadgeIndex(scan: RepoScan): Map<string, ReviewSourceBadgeData> {
+  const sourceCardsById = sourceCardsByIdMap(scan);
+  const queueItemsById = new Map(scan.queueItems.map((queueFile) => [queueFile.item.source_id, queueFile]));
+  const sourceIds = new Set([...sourceCardsById.keys(), ...queueItemsById.keys()]);
+  const badges = new Map<string, ReviewSourceBadgeData>();
+
+  for (const sourceId of [...sourceIds].sort()) {
+    const card = sourceCardsById.get(sourceId);
+    const queueFile = queueItemsById.get(sourceId);
+    if (queueFile !== undefined) {
+      badges.set(sourceId, sourceBadgeFromQueueItem(queueFile, card));
+    } else if (card !== undefined) {
+      badges.set(sourceId, sourceBadgeFromCard(card));
+    }
+  }
+
+  return badges;
+}
+
+function sourceBadgeFromQueueItem(
+  queueFile: RepoScan["queueItems"][number],
+  card: SourceCard | undefined,
+): ReviewSourceBadgeData {
+  const sourceId = queueFile.item.source_id;
+  const sourceCardPath = card?.path ?? stringValue(queueFile.item.path);
+
+  return {
+    source_id: sourceId,
+    title: card?.title ?? queueFile.item.title,
+    source_kind: stringValue(card?.scan.frontmatter?.source_kind) ?? stringValue(queueFile.item.source_kind) ?? queueFile.item.kind,
+    queue_status: queueFile.item.status,
+    visibility: card?.visibility ?? stringValue(queueFile.item.visibility),
+    source_card_path: sourceCardPath,
+    queue_path: queueFile.path,
+    original_path: stringValue(queueFile.item.original_path),
+    page_path: sourceCardPath,
+  };
+}
+
+function sourceBadgeFromCard(card: SourceCard): ReviewSourceBadgeData {
+  return {
+    source_id: card.source_id ?? "",
+    title: card.title ?? card.path,
+    source_kind: stringValue(card.scan.frontmatter?.source_kind),
+    queue_status: card.status,
+    visibility: card.visibility,
+    source_card_path: card.path,
+    queue_path: null,
+    original_path: null,
+    page_path: card.path,
+  };
+}
+
+function sourceBadgesForIds(
+  sourceIds: readonly string[],
+  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
+): ReviewSourceBadgeData[] {
+  return sourceIds.flatMap((sourceId) => {
+    const source = sourceBadgesById.get(sourceId);
+    return source === undefined ? [] : [source];
+  });
+}
+
+function sourceBadgePathIndex(
+  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
+): Map<string, ReviewSourceBadgeData> {
+  const byPath = new Map<string, ReviewSourceBadgeData>();
+  for (const source of sourceBadgesById.values()) {
+    for (const path of [source.source_card_path, source.queue_path, source.original_path, source.page_path]) {
+      if (path !== null) {
+        byPath.set(path, source);
+      }
+    }
+  }
+
+  return byPath;
+}
+
+function sourceBadgeForIssue(
+  issue: LintIssue,
+  sourceBadgesByPath: ReadonlyMap<string, ReviewSourceBadgeData>,
+  pagesByPath: ReadonlyMap<string, RepoMarkdownFile>,
+  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
+): ReviewSourceBadgeData | null {
+  const directSource = sourceBadgesByPath.get(issue.path);
+  if (directSource !== undefined) {
+    return directSource;
+  }
+
+  const page = pagesByPath.get(issue.path);
+  const sourceId = page === undefined ? undefined : sourceIdsValue(page)[0];
+  return sourceId === undefined ? null : sourceBadgesById.get(sourceId) ?? null;
+}
+
+function publicImpactForVisibilityRule(ruleId: string): string {
+  if (ruleId === "raw_sources_default_private") {
+    return "Raw source metadata or queue state could appear in public output if selected.";
+  }
+
+  if (ruleId.includes("raw")) {
+    return "Raw originals, source cards, or queue data could become visible in public output.";
+  }
+
+  if (ruleId.includes("private")) {
+    return "Private page text, links, search snippets, or graph nodes could become visible in public output.";
+  }
+
+  if (ruleId.startsWith("public_")) {
+    return "Public profile output could include content that has not been reviewed for publication.";
+  }
+
+  return "Review this item before publishing public output.";
 }
 
 function stringValue(value: unknown): string | null {

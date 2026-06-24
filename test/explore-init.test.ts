@@ -415,13 +415,24 @@ export const defaultContentPageLayout = {
         page.fileData.frontmatter?.llm_wiki_component === "${component}",
     }),
 `;
+      const visibilityWarningSnippet = `    Component.ConditionalRender({
+      component: LlmWikiVisibilityWarning(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_visibility_warning === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiVisibilityWarning" ||
+        page.fileData.frontmatter?.visibility === "private" ||
+        page.fileData.frontmatter?.type === "raw_source" ||
+        page.fileData.frontmatter?.public_safe === false ||
+        page.fileData.frontmatter?.llm_wiki_public_unsafe === true,
+    }),
+`;
       const priorGeneratedLayout = generatedLayout
         .replace('import LlmWikiQueueDashboard from "./components/LlmWikiQueueDashboard"\n', "")
         .replace('import LlmWikiReviewPanel from "./components/LlmWikiReviewPanel"\n', "")
         .replace('import LlmWikiSourceBadge from "./components/LlmWikiSourceBadge"\n', "")
         .replace('import LlmWikiVisibilityWarning from "./components/LlmWikiVisibilityWarning"\n', "")
         .replace('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"\n', "")
-        .replace(gatedComponentSnippet("LlmWikiVisibilityWarning", "llm_wiki_visibility_warning"), "")
+        .replace(visibilityWarningSnippet, "")
         .replace(`    Component.ConditionalRender({
       component: LlmWikiSourceBadge(),
       condition: (page) =>
@@ -434,6 +445,7 @@ export const defaultContentPageLayout = {
         .replace(gatedComponentSnippet("LlmWikiUploadForm", "llm_wiki_upload"), "")
         .replace(gatedComponentSnippet("LlmWikiQueueDashboard", "llm_wiki_queue_dashboard"), "")
         .replace(gatedComponentSnippet("LlmWikiReviewPanel", "llm_wiki_review_panel"), "");
+      expect(priorGeneratedLayout).not.toContain("LlmWikiVisibilityWarning()");
       await writeFile(resolve(wikiDir, "quartz/quartz.layout.ts"), priorGeneratedLayout, "utf8");
       for (const placeholder of [
         ["LlmWikiQueueDashboard", "llm-wiki-queue-dashboard"],
@@ -512,6 +524,129 @@ export default (() => ${componentName}) satisfies QuartzComponentConstructor
         'return <section class="llm-wiki-source-badge" data-llm-wiki-component="LlmWikiSourceBadge" />',
       );
       expect(migratedVisibilityWarningComponent).toContain("public profiles");
+    });
+  });
+
+  it("migrates the historical pre-source-badge layout with old visibility gates", async () => {
+    await withTempWorkspace("llm-wiki-explore-init-upgrade-source-badge-layout-", async (workspaceDir) => {
+      // Arrange
+      execFileMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const firstInit = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      expect(firstInit.exitCode).toBe(0);
+      const generatedLayout = await readGeneratedFile(wikiDir, "quartz/quartz.layout.ts");
+      const currentVisibilityPredicate = `        page.fileData.frontmatter?.llm_wiki_visibility_warning === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiVisibilityWarning" ||
+        page.fileData.frontmatter?.visibility === "private" ||
+        page.fileData.frontmatter?.type === "raw_source" ||
+        page.fileData.frontmatter?.public_safe === false ||
+        page.fileData.frontmatter?.llm_wiki_public_unsafe === true,`;
+      const previousVisibilityPredicate = `        page.fileData.frontmatter?.llm_wiki_visibility_warning === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiVisibilityWarning",`;
+      const sourceBadgeGate = `    Component.ConditionalRender({
+      component: LlmWikiSourceBadge(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_source_badge === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiSourceBadge" ||
+        typeof page.fileData.frontmatter?.source_id === "string" ||
+        typeof page.fileData.frontmatter?.source_card_path === "string",
+    }),
+`;
+      const historicalLayout = generatedLayout
+        .replace('import LlmWikiSourceBadge from "./components/LlmWikiSourceBadge"\n', "")
+        .replace(sourceBadgeGate, "")
+        .replace(currentVisibilityPredicate, previousVisibilityPredicate);
+      await writeFile(resolve(wikiDir, "quartz/quartz.layout.ts"), historicalLayout, "utf8");
+
+      // Act
+      const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      const payload = parseExploreInit(result.stdout);
+      const migratedLayout = await readGeneratedFile(wikiDir, "quartz/quartz.layout.ts");
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      const updatedWarning = payload.warnings.find((warning) =>
+        warning.startsWith("Updated generated Quartz runtime files:"),
+      );
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/quartz.layout.ts"));
+      expect(migratedLayout).toContain('import LlmWikiSourceBadge from "./components/LlmWikiSourceBadge"');
+      expect(migratedLayout).toContain("LlmWikiSourceBadge()");
+      expect(migratedLayout).toContain('typeof page.fileData.frontmatter?.source_id === "string"');
+      expect(migratedLayout).toContain('page.fileData.frontmatter?.visibility === "private"');
+      expect(migratedLayout).toContain('page.fileData.frontmatter?.type === "raw_source"');
+      expect(migratedLayout).toContain("page.fileData.frontmatter?.llm_wiki_public_unsafe === true");
+    });
+  });
+
+  it("migrates exact historical source badge and visibility warning components", async () => {
+    await withTempWorkspace("llm-wiki-explore-init-upgrade-badge-warning-components-", async (workspaceDir) => {
+      // Arrange
+      execFileMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const firstInit = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      expect(firstInit.exitCode).toBe(0);
+      const historicalSourceBadge = `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+
+const LlmWikiSourceBadge: QuartzComponent = () => {
+  return (
+    <aside class="llm-wiki-source-badge" data-llm-wiki-source-badge="true" aria-label="LLM Wiki source status">
+      <strong>Source status</strong>
+      <dl>
+        <dt>Visibility</dt>
+        <dd>Read this page's frontmatter before publishing.</dd>
+        <dt>Review</dt>
+        <dd>Use linked source cards and queue entries to verify provenance.</dd>
+      </dl>
+    </aside>
+  )
+}
+
+export default (() => LlmWikiSourceBadge) satisfies QuartzComponentConstructor
+`;
+      const historicalVisibilityWarning = `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+
+const LlmWikiVisibilityWarning: QuartzComponent = () => {
+  return (
+    <aside class="llm-wiki-visibility-warning" data-llm-wiki-visibility-warning="true" role="note">
+      <strong>Local or review-only content</strong>
+      <p>This page can include private titles, queue state, or upload metadata. Keep it out of public profiles.</p>
+    </aside>
+  )
+}
+
+export default (() => LlmWikiVisibilityWarning) satisfies QuartzComponentConstructor
+`;
+      await writeFile(resolve(wikiDir, "quartz/components/LlmWikiSourceBadge.tsx"), historicalSourceBadge, "utf8");
+      await writeFile(
+        resolve(wikiDir, "quartz/components/LlmWikiVisibilityWarning.tsx"),
+        historicalVisibilityWarning,
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      const payload = parseExploreInit(result.stdout);
+      const migratedSourceBadge = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiSourceBadge.tsx");
+      const migratedVisibilityWarning = await readGeneratedFile(
+        wikiDir,
+        "quartz/components/LlmWikiVisibilityWarning.tsx",
+      );
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      const updatedWarning = payload.warnings.find((warning) =>
+        warning.startsWith("Updated generated Quartz runtime files:"),
+      );
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/components/LlmWikiSourceBadge.tsx"));
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/components/LlmWikiVisibilityWarning.tsx"));
+      expect(migratedSourceBadge).toContain("LlmWikiSourceBadge.afterDOMLoaded = sourceBadgeScript");
+      expect(migratedSourceBadge).toContain("Source badges render next to generated review item data.");
+      expect(migratedVisibilityWarning).toContain("LlmWikiVisibilityWarning.afterDOMLoaded = visibilityWarningScript");
+      expect(migratedVisibilityWarning).toContain("Recommended action");
     });
   });
 
@@ -663,6 +798,35 @@ const LlmWikiQueueDashboard: QuartzComponent = () => {
 
 export default (() => LlmWikiQueueDashboard) satisfies QuartzComponentConstructor
 `;
+      const customizedSourceBadge = `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+
+const LlmWikiSourceBadge: QuartzComponent = () => {
+  return (
+    <aside class="llm-wiki-source-badge" data-llm-wiki-source-badge="true" data-customized="true" aria-label="LLM Wiki source status">
+      <strong>Source status</strong>
+      <p>Read this page's frontmatter before publishing.</p>
+      <p>Use linked source cards and queue entries to verify provenance.</p>
+      <p>Custom source badge operator notes that must not be overwritten.</p>
+    </aside>
+  )
+}
+
+export default (() => LlmWikiSourceBadge) satisfies QuartzComponentConstructor
+`;
+      const customizedVisibilityWarning = `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+
+const LlmWikiVisibilityWarning: QuartzComponent = () => {
+  return (
+    <aside class="llm-wiki-visibility-warning" data-llm-wiki-visibility-warning="true" data-customized="true" role="note">
+      <strong>Local or review-only content</strong>
+      <p>This page can include private titles, queue state, or upload metadata. Keep it out of public profiles.</p>
+      <p>Custom visibility warning operator notes that must not be overwritten.</p>
+    </aside>
+  )
+}
+
+export default (() => LlmWikiVisibilityWarning) satisfies QuartzComponentConstructor
+`;
       await writeFile(resolve(wikiDir, "quartz/package.json"), customizedPackageJson, "utf8");
       await writeFile(resolve(wikiDir, "quartz/README.md"), customizedReadme, "utf8");
       await writeFile(resolve(wikiDir, "quartz/quartz.config.ts"), customizedConfig, "utf8");
@@ -671,6 +835,12 @@ export default (() => LlmWikiQueueDashboard) satisfies QuartzComponentConstructo
       await writeFile(
         resolve(wikiDir, "quartz/components/LlmWikiQueueDashboard.tsx"),
         customizedQueueDashboard,
+        "utf8",
+      );
+      await writeFile(resolve(wikiDir, "quartz/components/LlmWikiSourceBadge.tsx"), customizedSourceBadge, "utf8");
+      await writeFile(
+        resolve(wikiDir, "quartz/components/LlmWikiVisibilityWarning.tsx"),
+        customizedVisibilityWarning,
         "utf8",
       );
 
@@ -691,6 +861,67 @@ export default (() => LlmWikiQueueDashboard) satisfies QuartzComponentConstructo
       await expect(readGeneratedFile(wikiDir, "quartz/components/LlmWikiQueueDashboard.tsx")).resolves.toBe(
         customizedQueueDashboard,
       );
+      await expect(readGeneratedFile(wikiDir, "quartz/components/LlmWikiSourceBadge.tsx")).resolves.toBe(
+        customizedSourceBadge,
+      );
+      await expect(readGeneratedFile(wikiDir, "quartz/components/LlmWikiVisibilityWarning.tsx")).resolves.toBe(
+        customizedVisibilityWarning,
+      );
+    });
+  });
+
+  it("preserves customized Quartz layouts that import managed components through local wrappers", async () => {
+    await withTempWorkspace("llm-wiki-explore-init-customized-wrapper-layout-", async (workspaceDir) => {
+      // Arrange
+      execFileMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const firstInit = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      expect(firstInit.exitCode).toBe(0);
+      const customizedLayout = `import { PageLayout, SharedLayout } from "./quartz/cfg"
+import * as Component from "./quartz/components"
+import { LlmWikiSourceBadge } from "./components/LlmWikiComponents"
+
+export const sharedPageComponents: SharedLayout = {
+  head: Component.Head(),
+  header: [],
+  afterBody: [],
+  footer: Component.Footer({
+    links: {},
+  }),
+}
+
+export const defaultContentPageLayout = {
+  beforeBody: [
+    Component.ArticleTitle(),
+    Component.ConditionalRender({
+      component: LlmWikiSourceBadge(),
+      condition: () => true,
+    }),
+  ],
+  left: [Component.PageTitle()],
+  right: [],
+} satisfies PageLayout
+
+export const defaultListPageLayout: PageLayout = {
+  beforeBody: [Component.ArticleTitle()],
+  left: [Component.PageTitle()],
+  right: [],
+}
+`;
+      await writeFile(resolve(wikiDir, "quartz/quartz.layout.ts"), customizedLayout, "utf8");
+
+      // Act
+      const result = await runCliBuffered(["explore", "init", "--repo", wikiDir, "--json"]);
+      const payload = parseExploreInit(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(execFile).not.toHaveBeenCalled();
+      expect(payload.warnings).toEqual(expect.arrayContaining([expect.stringContaining("quartz/quartz.layout.ts")]));
+      expect(payload.warnings.find((warning) => warning.startsWith("Updated generated Quartz runtime files:"))).toBeUndefined();
+      await expect(readGeneratedFile(wikiDir, "quartz/quartz.layout.ts")).resolves.toBe(customizedLayout);
     });
   });
 

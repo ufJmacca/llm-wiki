@@ -788,6 +788,7 @@ function localExplorerPageDefinitions(
         title: "Recent Ingests",
         component: "LlmWikiReviewPanel",
         category: reviewData.recent_ingests,
+        extraFrontmatter: ["llm_wiki_source_badge: true"],
       }),
     },
     {
@@ -797,6 +798,7 @@ function localExplorerPageDefinitions(
         title: "Needs Review",
         component: "LlmWikiReviewPanel",
         category: reviewData.needs_review,
+        extraFrontmatter: ["llm_wiki_source_badge: true"],
       }),
     },
     {
@@ -806,6 +808,7 @@ function localExplorerPageDefinitions(
         title: "Contradictions",
         component: "LlmWikiReviewPanel",
         category: reviewData.contradictions,
+        extraFrontmatter: ["llm_wiki_source_badge: true"],
       }),
     },
     {
@@ -815,6 +818,7 @@ function localExplorerPageDefinitions(
         title: "Orphans",
         component: "LlmWikiReviewPanel",
         category: reviewData.orphans,
+        extraFrontmatter: ["llm_wiki_source_badge: true"],
       }),
     },
     {
@@ -824,16 +828,13 @@ function localExplorerPageDefinitions(
         title: "Stale Pages",
         component: "LlmWikiReviewPanel",
         category: reviewData.stale_pages,
+        extraFrontmatter: ["llm_wiki_source_badge: true"],
       }),
     },
     {
       path: "quartz/content/_llm-wiki/review/visibility-warnings.md",
       title: "Visibility Warnings",
-      content: reviewCategoryContent({
-        title: "Visibility Warnings",
-        component: "LlmWikiVisibilityWarning",
-        category: reviewData.visibility_warnings,
-      }),
+      content: visibilityWarningsContent(reviewData.visibility_warnings),
     },
     {
       path: "quartz/content/_llm-wiki/review/status.md",
@@ -2046,7 +2047,9 @@ async function shouldMigrateQuartzRuntimeEntry(repoRoot: string, entry: Scaffold
         content === OLD_PLACEHOLDER_QUARTZ_LAYOUT ||
         content === quartzLayoutContentBeforeUploadForm() ||
         content === quartzLayoutContentBeforeReviewGates() ||
-        content === quartzLayoutContentBeforeSourceBadge()
+        content === quartzLayoutContentBeforeManagedReviewComponents() ||
+        content === quartzLayoutContentBeforeSourceBadge() ||
+        content === quartzLayoutContentBeforeVisibilityWarningFrontmatter()
       );
     case "quartz/components/LlmWikiQueueDashboard.tsx":
       return (
@@ -2062,7 +2065,8 @@ async function shouldMigrateQuartzRuntimeEntry(repoRoot: string, entry: Scaffold
     case "quartz/components/LlmWikiSourceBadge.tsx":
       return (
         content === componentPlaceholder("LlmWikiSourceBadge", "llm-wiki-source-badge") ||
-        content === oldComponentPlaceholder("llm-wiki-source-badge")
+        content === oldComponentPlaceholder("llm-wiki-source-badge") ||
+        content === sourceBadgeComponentContentBeforeRowBadges()
       );
     case "quartz/components/LlmWikiUploadForm.tsx":
       return (
@@ -2072,7 +2076,8 @@ async function shouldMigrateQuartzRuntimeEntry(repoRoot: string, entry: Scaffold
     case "quartz/components/LlmWikiVisibilityWarning.tsx":
       return (
         content === componentPlaceholder("LlmWikiVisibilityWarning", "llm-wiki-visibility-warning") ||
-        content === oldComponentPlaceholder("llm-wiki-visibility-warning")
+        content === oldComponentPlaceholder("llm-wiki-visibility-warning") ||
+        content === visibilityWarningComponentContentBeforeDetails()
       );
     default:
       return false;
@@ -2290,7 +2295,11 @@ export const defaultContentPageLayout = {
       component: LlmWikiVisibilityWarning(),
       condition: (page) =>
         page.fileData.frontmatter?.llm_wiki_visibility_warning === true ||
-        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiVisibilityWarning",
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiVisibilityWarning" ||
+        page.fileData.frontmatter?.visibility === "private" ||
+        page.fileData.frontmatter?.type === "raw_source" ||
+        page.fileData.frontmatter?.public_safe === false ||
+        page.fileData.frontmatter?.llm_wiki_public_unsafe === true,
     }),
 ${includeSourceBadge ? `    Component.ConditionalRender({
       component: LlmWikiSourceBadge(),
@@ -2363,7 +2372,151 @@ export const defaultListPageLayout: PageLayout = {
 }
 
 function quartzLayoutContentBeforeSourceBadge(): string {
-  return quartzLayoutContent({ includeSourceBadge: false });
+  return `import { PageLayout, SharedLayout } from "./quartz/cfg"
+import * as Component from "./quartz/components"
+import LlmWikiQueueDashboard from "./components/LlmWikiQueueDashboard"
+import LlmWikiReviewPanel from "./components/LlmWikiReviewPanel"
+import LlmWikiUploadForm from "./components/LlmWikiUploadForm"
+import LlmWikiVisibilityWarning from "./components/LlmWikiVisibilityWarning"
+
+export const sharedPageComponents: SharedLayout = {
+  head: Component.Head(),
+  header: [],
+  afterBody: [],
+  footer: Component.Footer({
+    links: {},
+  }),
+}
+
+export const defaultContentPageLayout = {
+  beforeBody: [
+    Component.ConditionalRender({
+      component: Component.Breadcrumbs(),
+      condition: (page) => page.fileData.slug !== "index",
+    }),
+    Component.ArticleTitle(),
+    Component.ContentMeta(),
+    Component.TagList(),
+    Component.ConditionalRender({
+      component: LlmWikiVisibilityWarning(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_visibility_warning === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiVisibilityWarning",
+    }),
+    Component.ConditionalRender({
+      component: LlmWikiUploadForm(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_upload === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiUploadForm",
+    }),
+    Component.ConditionalRender({
+      component: LlmWikiQueueDashboard(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_queue_dashboard === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiQueueDashboard",
+    }),
+    Component.ConditionalRender({
+      component: LlmWikiReviewPanel(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_review_panel === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiReviewPanel",
+    }),
+  ],
+  left: [
+    Component.PageTitle(),
+    Component.MobileOnly(Component.Spacer()),
+    Component.Flex({
+      components: [
+        {
+          Component: Component.Search(),
+          grow: true,
+        },
+        { Component: Component.Darkmode() },
+        { Component: Component.ReaderMode() },
+      ],
+    }),
+    Component.Explorer(),
+  ],
+  right: [
+    Component.Graph(),
+    Component.DesktopOnly(Component.TableOfContents()),
+    Component.Backlinks(),
+  ],
+} satisfies PageLayout
+
+export const defaultListPageLayout: PageLayout = {
+  beforeBody: [Component.Breadcrumbs(), Component.ArticleTitle(), Component.ContentMeta()],
+  left: [
+    Component.PageTitle(),
+    Component.MobileOnly(Component.Spacer()),
+    Component.Flex({
+      components: [
+        {
+          Component: Component.Search(),
+          grow: true,
+        },
+        { Component: Component.Darkmode() },
+      ],
+    }),
+    Component.Explorer(),
+  ],
+  right: [],
+}
+`;
+}
+
+function quartzLayoutContentBeforeManagedReviewComponents(): string {
+  const gatedComponentSnippet = (component: string, field: string) => `    Component.ConditionalRender({
+      component: ${component}(),
+      condition: (page) =>
+        page.fileData.frontmatter?.${field} === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "${component}",
+    }),
+`;
+  const visibilityWarningSnippet = `    Component.ConditionalRender({
+      component: LlmWikiVisibilityWarning(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_visibility_warning === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiVisibilityWarning" ||
+        page.fileData.frontmatter?.visibility === "private" ||
+        page.fileData.frontmatter?.type === "raw_source" ||
+        page.fileData.frontmatter?.public_safe === false ||
+        page.fileData.frontmatter?.llm_wiki_public_unsafe === true,
+    }),
+`;
+
+  return quartzLayoutContent()
+    .replace('import LlmWikiQueueDashboard from "./components/LlmWikiQueueDashboard"\n', "")
+    .replace('import LlmWikiReviewPanel from "./components/LlmWikiReviewPanel"\n', "")
+    .replace('import LlmWikiSourceBadge from "./components/LlmWikiSourceBadge"\n', "")
+    .replace('import LlmWikiVisibilityWarning from "./components/LlmWikiVisibilityWarning"\n', "")
+    .replace('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"\n', "")
+    .replace(visibilityWarningSnippet, "")
+    .replace(`    Component.ConditionalRender({
+      component: LlmWikiSourceBadge(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_source_badge === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiSourceBadge" ||
+        typeof page.fileData.frontmatter?.source_id === "string" ||
+        typeof page.fileData.frontmatter?.source_card_path === "string",
+    }),
+`, "")
+    .replace(gatedComponentSnippet("LlmWikiUploadForm", "llm_wiki_upload"), "")
+    .replace(gatedComponentSnippet("LlmWikiQueueDashboard", "llm_wiki_queue_dashboard"), "")
+    .replace(gatedComponentSnippet("LlmWikiReviewPanel", "llm_wiki_review_panel"), "");
+}
+
+function quartzLayoutContentBeforeVisibilityWarningFrontmatter(): string {
+  const currentVisibilityPredicate = `        page.fileData.frontmatter?.llm_wiki_visibility_warning === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiVisibilityWarning" ||
+        page.fileData.frontmatter?.visibility === "private" ||
+        page.fileData.frontmatter?.type === "raw_source" ||
+        page.fileData.frontmatter?.public_safe === false ||
+        page.fileData.frontmatter?.llm_wiki_public_unsafe === true,`;
+  const previousVisibilityPredicate = `        page.fileData.frontmatter?.llm_wiki_visibility_warning === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiVisibilityWarning",`;
+
+  return quartzLayoutContent().replace(currentVisibilityPredicate, previousVisibilityPredicate);
 }
 
 function quartzLayoutContentBeforeUploadForm(): string {
@@ -2680,7 +2833,7 @@ export default (() => LlmWikiReviewPanel) satisfies QuartzComponentConstructor
 `;
 }
 
-function sourceBadgeComponentContent(): string {
+function sourceBadgeComponentContentBeforeRowBadges(): string {
   return `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
 
 const LlmWikiSourceBadge: QuartzComponent = () => {
@@ -2696,6 +2849,242 @@ const LlmWikiSourceBadge: QuartzComponent = () => {
     </aside>
   )
 }
+
+export default (() => LlmWikiSourceBadge) satisfies QuartzComponentConstructor
+`;
+}
+
+function sourceBadgeComponentContent(): string {
+  const clientScript = `const llmWikiSourceBadgeText = (value, fallback) => {
+  if (typeof value !== "string" || value.trim() === "") return fallback;
+  return value;
+};
+
+const llmWikiSourceBadgeHref = (path, currentSlug) => {
+  if (typeof path !== "string" || path.trim() === "") return null;
+  const route = path.trim().replace(/\\.md$/u, "").replace(/^\\/+|\\/+$/gu, "");
+  if (route === "") return null;
+  const slug = typeof currentSlug === "string" && currentSlug.trim() !== "" ? currentSlug.trim() : "index";
+  const slugSegments = slug.replace(/\\.md$/u, "").replace(/^\\/+|\\/+$/gu, "").split("/").filter(Boolean);
+  slugSegments.pop();
+  const pathToRoot = slugSegments.map(() => "..").join("/");
+  return pathToRoot === "" ? route : pathToRoot + "/" + route;
+};
+
+const llmWikiSourceBadgeIsRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+const llmWikiSourceBadgeAddSource = (sources, candidate) => {
+  if (!llmWikiSourceBadgeIsRecord(candidate) || typeof candidate.source_id !== "string") return;
+  sources.push(candidate);
+};
+
+const llmWikiSourceBadgeSourcesForItem = (item) => {
+  const sources = [];
+  if (!llmWikiSourceBadgeIsRecord(item)) return sources;
+  llmWikiSourceBadgeAddSource(sources, item.source);
+  llmWikiSourceBadgeAddSource(sources, item.source_badge);
+  if (Array.isArray(item.sources)) {
+    for (const source of item.sources) llmWikiSourceBadgeAddSource(sources, source);
+  }
+  if (
+    typeof item.source_id === "string" &&
+    (typeof item.source_kind === "string" ||
+      typeof item.queue_status === "string" ||
+      typeof item.status === "string" ||
+      typeof item.source_card_path === "string")
+  ) {
+    llmWikiSourceBadgeAddSource(sources, item);
+  }
+  return sources;
+};
+
+const llmWikiSourceBadgeRender = (source, currentSlug) => {
+  const article = document.createElement("article");
+  article.className = "llm-wiki-source-badge__pill";
+  article.dataset.llmWikiSourceBadgeRendered = "true";
+
+  const title = document.createElement("strong");
+  title.textContent = llmWikiSourceBadgeText(source.title, source.source_id);
+  article.append(title);
+
+  const details = document.createElement("dl");
+  const rows = [
+    ["Source kind", llmWikiSourceBadgeText(source.source_kind, "unknown")],
+    ["Queue status", llmWikiSourceBadgeText(source.queue_status || source.status, "unknown")],
+    ["Visibility", llmWikiSourceBadgeText(source.visibility, "unknown")],
+  ];
+  for (const [label, value] of rows) {
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    description.textContent = value;
+    details.append(term, description);
+  }
+
+  const linkPath = source.source_card_path || source.page_path;
+  const linkHref = llmWikiSourceBadgeHref(linkPath, currentSlug);
+  if (linkHref !== null) {
+    const term = document.createElement("dt");
+    term.textContent = source.source_card_path ? "Source card" : "Page";
+    const description = document.createElement("dd");
+    const link = document.createElement("a");
+    link.className = "internal";
+    link.href = linkHref;
+    link.textContent = String(linkPath);
+    description.append(link);
+    details.append(term, description);
+  }
+
+  article.append(details);
+  return article;
+};
+
+const bindLlmWikiSourceBadges = () => {
+  const marker = document.querySelector('[data-llm-wiki-source-badge="true"]');
+  if (!(marker instanceof HTMLElement)) return;
+
+  const article = marker.closest("article") || document.querySelector("article");
+  if (!(article instanceof HTMLElement)) return;
+  const currentSlug = marker.dataset.llmWikiCurrentSlug || "index";
+
+  for (const code of article.querySelectorAll("pre code")) {
+    if (!(code instanceof HTMLElement) || code.dataset.llmWikiSourceBadgeBound === "true") continue;
+    const text = code.textContent || "";
+    if (!text.includes("source_id")) continue;
+
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(parsed)) continue;
+
+    const seen = new Set();
+    const sources = [];
+    for (const item of parsed) {
+      for (const source of llmWikiSourceBadgeSourcesForItem(item)) {
+        const key = [source.source_id, source.source_card_path || source.page_path || ""].join("|");
+        if (seen.has(key)) continue;
+        seen.add(key);
+        sources.push(source);
+      }
+    }
+    if (sources.length === 0) continue;
+
+    code.dataset.llmWikiSourceBadgeBound = "true";
+    const list = document.createElement("section");
+    list.className = "llm-wiki-source-badge__list";
+    list.dataset.llmWikiSourceBadgeList = "true";
+    for (const source of sources) {
+      list.append(llmWikiSourceBadgeRender(source, currentSlug));
+    }
+    code.closest("pre")?.after(list);
+  }
+};
+
+document.addEventListener("nav", bindLlmWikiSourceBadges);
+bindLlmWikiSourceBadges();`;
+
+  return `import { resolveRelative } from "../quartz/util/path"
+import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+import type { FullSlug } from "../quartz/util/path"
+
+const sourceBadgeScript = ${JSON.stringify(clientScript)}
+
+type SourceBadgeData = {
+  source_id: string
+  title: string
+  source_kind: string | null
+  queue_status: string | null
+  visibility: string | null
+  source_card_path: string | null
+  page_path: string | null
+}
+
+const knownSourceKinds = new Set(["file", "text", "url"])
+const knownQueueStatuses = new Set(["queued", "ingesting", "blocked", "ingested"])
+const knownVisibilities = new Set(["private", "public"])
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value : null
+}
+
+function normalizedValue(value: unknown, knownValues: ReadonlySet<string>): string | null {
+  const text = stringValue(value)
+  return text !== null && knownValues.has(text) ? text : text
+}
+
+function routeForMarkdownPath(path: string): FullSlug {
+  return path.replace(/\\.md$/u, "") as FullSlug
+}
+
+function sourceFromFrontmatter(frontmatter: Record<string, unknown> | undefined, currentSlug: FullSlug): SourceBadgeData | null {
+  const sourceId = stringValue(frontmatter?.source_id)
+  const sourceCardPath = stringValue(frontmatter?.source_card_path)
+  if (sourceId === null && sourceCardPath === null) {
+    return null
+  }
+
+  const pagePath = stringValue(frontmatter?.page_path) ?? \`\${currentSlug}.md\`
+  return {
+    source_id: sourceId ?? sourceCardPath ?? pagePath,
+    title: stringValue(frontmatter?.title) ?? sourceId ?? sourceCardPath ?? pagePath,
+    source_kind: normalizedValue(frontmatter?.source_kind, knownSourceKinds),
+    queue_status: normalizedValue(frontmatter?.queue_status ?? frontmatter?.status, knownQueueStatuses),
+    visibility: normalizedValue(frontmatter?.visibility, knownVisibilities),
+    source_card_path: sourceCardPath,
+    page_path: pagePath,
+  }
+}
+
+function displayValue(value: string | null): string {
+  return value ?? "unknown"
+}
+
+function SourceBadgeDetails({ source, currentSlug }: { source: SourceBadgeData; currentSlug: FullSlug }) {
+  const linkPath = source.source_card_path ?? source.page_path
+  const linkLabel = source.source_card_path === null ? "Page" : "Source card"
+
+  return (
+    <dl>
+      <dt>Source kind</dt>
+      <dd>{displayValue(source.source_kind)}</dd>
+      <dt>Queue status</dt>
+      <dd>{displayValue(source.queue_status)}</dd>
+      <dt>Visibility</dt>
+      <dd>{displayValue(source.visibility)}</dd>
+      {linkPath === null ? null : (
+        <>
+          <dt>{linkLabel}</dt>
+          <dd>
+            <a class="internal" href={resolveRelative(currentSlug, routeForMarkdownPath(linkPath))}>
+              {linkPath}
+            </a>
+          </dd>
+        </>
+      )}
+    </dl>
+  )
+}
+
+const LlmWikiSourceBadge: QuartzComponent = ({ fileData }) => {
+  const currentSlug = fileData.slug ?? ("index" as FullSlug)
+  const source = sourceFromFrontmatter(fileData.frontmatter as Record<string, unknown> | undefined, currentSlug)
+
+  return (
+    <aside class="llm-wiki-source-badge" data-llm-wiki-source-badge="true" data-llm-wiki-current-slug={currentSlug} aria-label="LLM Wiki source status">
+      <strong>Source status</strong>
+      {source === null ? (
+        <p data-llm-wiki-source-badge-list="true">Source badges render next to generated review item data.</p>
+      ) : (
+        <SourceBadgeDetails source={source} currentSlug={currentSlug} />
+      )}
+    </aside>
+  )
+}
+
+LlmWikiSourceBadge.afterDOMLoaded = sourceBadgeScript
 
 export default (() => LlmWikiSourceBadge) satisfies QuartzComponentConstructor
 `;
@@ -2915,7 +3304,7 @@ export default (() => LlmWikiUploadForm) satisfies QuartzComponentConstructor
 `;
 }
 
-function visibilityWarningComponentContent(): string {
+function visibilityWarningComponentContentBeforeDetails(): string {
   return `import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
 
 const LlmWikiVisibilityWarning: QuartzComponent = () => {
@@ -2926,6 +3315,247 @@ const LlmWikiVisibilityWarning: QuartzComponent = () => {
     </aside>
   )
 }
+
+export default (() => LlmWikiVisibilityWarning) satisfies QuartzComponentConstructor
+`;
+}
+
+function visibilityWarningComponentContent(): string {
+  const clientScript = `const llmWikiVisibilityWarningText = (value, fallback) => {
+  if (typeof value !== "string" || value.trim() === "") return fallback;
+  return value;
+};
+
+const llmWikiVisibilityWarningIsRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+const llmWikiVisibilityWarningIsVisibilityRule = (ruleId) =>
+  typeof ruleId === "string" && (ruleId.startsWith("public_") || ruleId === "raw_sources_default_private" || ruleId === "private_visibility");
+
+const llmWikiVisibilityWarningHref = (path, currentSlug) => {
+  if (typeof path !== "string" || path.trim() === "") return null;
+  const route = path.trim().replace(/\\.md$/u, "").replace(/^\\/+|\\/+$/gu, "");
+  if (route === "") return null;
+  const slug = typeof currentSlug === "string" && currentSlug.trim() !== "" ? currentSlug.trim() : "index";
+  const slugSegments = slug.replace(/\\.md$/u, "").replace(/^\\/+|\\/+$/gu, "").split("/").filter(Boolean);
+  slugSegments.pop();
+  const pathToRoot = slugSegments.map(() => "..").join("/");
+  return pathToRoot === "" ? route : pathToRoot + "/" + route;
+};
+
+const llmWikiVisibilityWarningRender = (warning) => {
+  const article = document.createElement("article");
+  article.className = "llm-wiki-visibility-warning__item";
+  article.dataset.llmWikiVisibilityWarningRendered = "true";
+
+  const title = document.createElement("strong");
+  title.textContent = llmWikiVisibilityWarningText(warning.severity, "warning") + ": " + llmWikiVisibilityWarningText(warning.rule_id, "visibility_review");
+  article.append(title);
+
+  const details = document.createElement("dl");
+  const rows = [
+    ["Severity", llmWikiVisibilityWarningText(warning.severity, "warning")],
+    ["Reason", llmWikiVisibilityWarningText(warning.reason || warning.message, "Review visibility before publishing.")],
+    ["Affected path", llmWikiVisibilityWarningText(warning.path, "current page")],
+    ["Public impact", llmWikiVisibilityWarningText(warning.public_impact, "Public output could include private or unsafe content.")],
+    ["Recommended action", llmWikiVisibilityWarningText(warning.recommended_action || warning.fix_hint, "Review profile summary before publishing.")],
+  ];
+  for (const [label, value] of rows) {
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    description.textContent = value;
+    details.append(term, description);
+  }
+  article.append(details);
+  return article;
+};
+
+const llmWikiVisibilityWarningReviewLink = (href, label) => {
+  const link = document.createElement("a");
+  link.className = "internal";
+  link.href = href || "#";
+  link.textContent = label;
+  return link;
+};
+
+const llmWikiVisibilityWarningReviewLinks = (currentSlug) => {
+  const nav = document.createElement("nav");
+  nav.className = "llm-wiki-visibility-warning__links";
+  nav.dataset.llmWikiVisibilityWarningLinks = "true";
+  nav.append(
+    llmWikiVisibilityWarningReviewLink(
+      llmWikiVisibilityWarningHref("_llm-wiki/review/visibility-warnings", currentSlug),
+      "Visibility warnings",
+    ),
+    llmWikiVisibilityWarningReviewLink(
+      llmWikiVisibilityWarningHref("_llm-wiki/review/profile-summary", currentSlug),
+      "Profile summary",
+    ),
+  );
+  return nav;
+};
+
+const bindLlmWikiVisibilityWarnings = () => {
+  const marker = document.querySelector('[data-llm-wiki-visibility-warning="true"]');
+  if (!(marker instanceof HTMLElement)) return;
+
+  const article = marker.closest("article") || document.querySelector("article");
+  if (!(article instanceof HTMLElement)) return;
+  const currentSlug = marker.dataset.llmWikiCurrentSlug || "index";
+
+  for (const code of article.querySelectorAll("pre code")) {
+    if (!(code instanceof HTMLElement) || code.dataset.llmWikiVisibilityWarningBound === "true") continue;
+    const text = code.textContent || "";
+    if (!text.includes("rule_id") || !text.includes("severity")) continue;
+
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(parsed)) continue;
+    const warnings = parsed.filter((item) => llmWikiVisibilityWarningIsRecord(item) && llmWikiVisibilityWarningIsVisibilityRule(item.rule_id));
+    if (warnings.length === 0) continue;
+
+    code.dataset.llmWikiVisibilityWarningBound = "true";
+    const list = document.createElement("section");
+    list.className = "llm-wiki-visibility-warning__list";
+    list.dataset.llmWikiVisibilityWarningList = "true";
+    for (const warning of warnings) {
+      list.append(llmWikiVisibilityWarningRender(warning));
+    }
+    list.append(llmWikiVisibilityWarningReviewLinks(currentSlug));
+    code.closest("pre")?.after(list);
+  }
+};
+
+document.addEventListener("nav", bindLlmWikiVisibilityWarnings);
+bindLlmWikiVisibilityWarnings();`;
+
+  return `import { resolveRelative } from "../quartz/util/path"
+import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+import type { FullSlug } from "../quartz/util/path"
+
+const visibilityWarningScript = ${JSON.stringify(clientScript)}
+
+type VisibilityWarningData = {
+  severity: "error" | "warning"
+  rule_id: string
+  reason: string
+  path: string
+  public_impact: string
+  recommended_action: string
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value : null
+}
+
+function pagePathForSlug(slug: FullSlug): string {
+  return slug === "index" ? "index.md" : \`\${slug}.md\`
+}
+
+function pageWarningFromFrontmatter(
+  frontmatter: Record<string, unknown> | undefined,
+  currentSlug: FullSlug,
+): VisibilityWarningData | null {
+  const affectedPath = stringValue(frontmatter?.path) ?? pagePathForSlug(currentSlug)
+  const visibility = stringValue(frontmatter?.visibility)
+
+  if (frontmatter?.llm_wiki_public_unsafe === true || frontmatter?.public_safe === false) {
+    return {
+      severity: "error",
+      rule_id: "public_private_page_selected",
+      reason: "Page frontmatter marks this content as unsafe for public output.",
+      path: affectedPath,
+      public_impact: "Public output could include content that has not been approved for publication.",
+      recommended_action: "Review the page and set visibility: public only after it is safe to publish.",
+    }
+  }
+
+  if (frontmatter?.type === "raw_source" && visibility === "public") {
+    return {
+      severity: "error",
+      rule_id: "raw_sources_default_private",
+      reason: "Raw source cards must remain private.",
+      path: affectedPath,
+      public_impact: "Raw source metadata or queue state could appear in public output if selected.",
+      recommended_action: "Keep raw source cards private and publish reviewed curated summaries instead.",
+    }
+  }
+
+  if (visibility === "private") {
+    return {
+      severity: "warning",
+      rule_id: "private_visibility",
+      reason: "This page is marked visibility: private.",
+      path: affectedPath,
+      public_impact: "Private page text, links, search snippets, or graph nodes could become visible if selected by a public profile.",
+      recommended_action: "Exclude this page from public profiles or review it and set visibility: public.",
+    }
+  }
+
+  return null
+}
+
+function ReviewLink({
+  currentSlug,
+  href,
+  children,
+}: {
+  currentSlug: FullSlug
+  href: FullSlug
+  children: string
+}) {
+  return (
+    <a class="internal" href={resolveRelative(currentSlug, href)}>
+      {children}
+    </a>
+  )
+}
+
+const LlmWikiVisibilityWarning: QuartzComponent = ({ fileData }) => {
+  const currentSlug = fileData.slug ?? ("index" as FullSlug)
+  const pageWarning = pageWarningFromFrontmatter(fileData.frontmatter as Record<string, unknown> | undefined, currentSlug)
+  const warning = pageWarning ?? {
+    severity: "warning" as const,
+    rule_id: "visibility_review",
+    reason: "Review generated visibility warning items before publishing.",
+    path: pagePathForSlug(currentSlug),
+    public_impact: "Public output could include private or unsafe content.",
+    recommended_action: "Open visibility warnings and profile summary before publishing.",
+  }
+
+  return (
+    <aside class="llm-wiki-visibility-warning" data-llm-wiki-visibility-warning="true" data-llm-wiki-current-slug={currentSlug} role="note">
+      <strong>{warning.severity}: {warning.rule_id}</strong>
+      <dl>
+        <dt>Severity</dt>
+        <dd>{warning.severity}</dd>
+        <dt>Reason</dt>
+        <dd>{warning.reason}</dd>
+        <dt>Affected path</dt>
+        <dd>{warning.path}</dd>
+        <dt>Public impact</dt>
+        <dd>{warning.public_impact}</dd>
+        <dt>Recommended action</dt>
+        <dd>{warning.recommended_action}</dd>
+      </dl>
+      <nav data-llm-wiki-visibility-warning-list="true" aria-label="LLM Wiki visibility review links">
+        <ReviewLink currentSlug={currentSlug} href={"_llm-wiki/review/visibility-warnings" as FullSlug}>
+          Visibility warnings
+        </ReviewLink>
+        {" · "}
+        <ReviewLink currentSlug={currentSlug} href={"_llm-wiki/review/profile-summary" as FullSlug}>
+          Profile summary
+        </ReviewLink>
+      </nav>
+    </aside>
+  )
+}
+
+LlmWikiVisibilityWarning.afterDOMLoaded = visibilityWarningScript
 
 export default (() => LlmWikiVisibilityWarning) satisfies QuartzComponentConstructor
 `;
@@ -3042,7 +3672,7 @@ function sourceQueueContent(reviewData: ReviewDataModel): string {
     ].map((value) => escapeTableCell(String(value))).join(" | "),
   );
 
-  return `${generatedPageFrontmatter("Source Queue", "LlmWikiQueueDashboard")}# Source Queue
+  return `${generatedPageFrontmatter("Source Queue", "LlmWikiQueueDashboard", ["llm_wiki_source_badge: true"])}# Source Queue
 
 | Status | Count |
 |---|---:|
@@ -3055,6 +3685,10 @@ function sourceQueueContent(reviewData: ReviewDataModel): string {
 | Source ID | Title | Status | Kind | Visibility | Source card | Queue file | Original |
 |---|---|---|---|---|---|---|---|
 ${rows.map((row) => `| ${row} |`).join("\n")}
+
+## Source Badge Data
+
+${reviewItemsJson(reviewData.queue.items)}
 `;
 }
 
@@ -3062,12 +3696,43 @@ function reviewCategoryContent(options: {
   title: string;
   component: string;
   category: ReviewCategory<unknown>;
+  extraFrontmatter?: readonly string[];
 }): string {
-  return `${generatedPageFrontmatter(options.title, options.component)}# ${options.title}
+  return `${generatedPageFrontmatter(options.title, options.component, options.extraFrontmatter ?? [])}# ${options.title}
 
 Count: ${options.category.count}
 
 ${reviewItemsJson(options.category.items)}
+`;
+}
+
+function visibilityWarningsContent(category: ReviewCategory<unknown>): string {
+  const warningItems = category.items as Array<{
+    severity?: string;
+    reason?: string;
+    path?: string;
+    public_impact?: string;
+    recommended_action?: string;
+  }>;
+  const rows = warningItems.map((item) =>
+    [
+      item.severity ?? "",
+      item.reason ?? "",
+      item.path ?? "",
+      item.public_impact ?? "",
+      item.recommended_action ?? "",
+    ].map((value) => escapeTableCell(String(value))).join(" | "),
+  );
+
+  return `${generatedPageFrontmatter("Visibility Warnings", "LlmWikiVisibilityWarning", ["llm_wiki_source_badge: true"])}# Visibility Warnings
+
+Count: ${category.count}
+
+| Severity | Reason | Affected path | Public impact | Recommended action |
+|---|---|---|---|---|
+${rows.map((row) => `| ${row} |`).join("\n")}
+
+${reviewItemsJson(category.items)}
 `;
 }
 

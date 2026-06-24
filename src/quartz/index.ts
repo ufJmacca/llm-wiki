@@ -22,6 +22,8 @@ import {
 import { gitCommandEnv } from "../utils/git.js";
 import { validateTextFileWriteInsideRoot, writeTextFileInsideRoot, type ScaffoldEntry } from "../utils/fs.js";
 
+export { buildReviewDataModel, type ReviewDataModel } from "./reviewData.js";
+
 export type QuartzInstallResult = {
   attempted: boolean;
   ok: boolean;

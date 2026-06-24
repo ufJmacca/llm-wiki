@@ -77,7 +77,7 @@ describe("explore open command", () => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
       await initializeWiki(wikiDir);
-      await writeExplorerState(wikiDir, "http://127.0.0.1:8123");
+      await writeExplorerState(wikiDir, "http://127.0.0.1:8123/");
 
       // Act
       const result = await runCliBuffered(["explore", "open", "--repo", wikiDir, "--json"]);
@@ -91,7 +91,7 @@ describe("explore open command", () => {
         command: "explore.open",
         repo: wikiDir,
         data: {
-          url: "http://127.0.0.1:8123",
+          url: "http://127.0.0.1:8123/",
           opened: false,
         },
         warnings: [],
@@ -104,7 +104,7 @@ describe("explore open command", () => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
       await initializeWiki(wikiDir);
-      await writeExplorerState(wikiDir, "http://127.0.0.1:8123");
+      await writeExplorerState(wikiDir, "http://127.0.0.1:8123/");
 
       // Act
       const result = await runCliBuffered(["explore", "open", "--repo", wikiDir]);
@@ -112,7 +112,7 @@ describe("explore open command", () => {
       // Assert
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toEqual([]);
-      expect(result.stdout).toEqual(["http://127.0.0.1:8123"]);
+      expect(result.stdout).toEqual(["http://127.0.0.1:8123/"]);
     });
   });
 

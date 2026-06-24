@@ -605,6 +605,7 @@ describe("explore sync command", () => {
       const overviewFrontmatter = parseFrontmatter(overview);
       const sourceQueueFrontmatter = parseFrontmatter(sourceQueue);
       const statusFrontmatter = parseFrontmatter(status);
+      const visibilityWarningItems = parseReviewCategoryItems(visibilityWarnings);
 
       // Assert
       expect(result.exitCode).toBe(0);
@@ -674,9 +675,11 @@ describe("explore sync command", () => {
       expect(overview).toContain("| Recent ingests | 1 |");
       expect(overview).toContain("| Needs review | 1 |");
       expect(overview).toContain("| Contradictions | 2 |");
+      expect(overview).toContain("| Contradictions | 2 | [[_llm-wiki/review/contradictions|Contradictions]] |");
+      expect(overview).not.toContain("[[contradictions|Contradictions]]");
       expect(overview).toContain("| Orphans | 1 |");
       expect(overview).toContain("| Stale pages | 1 |");
-      expect(overview).toContain("| Visibility warnings | 1 |");
+      expect(overview).toContain(`| Visibility warnings | ${visibilityWarningItems.length} |`);
       expect(overview).toContain("| Profile summary | 1 |");
       expect(overview).toContain("| Status | 4 |");
       expect(profileSummary).toContain("| Profile | review |");
@@ -740,13 +743,92 @@ describe("explore sync command", () => {
           source_ids: [ingested.sourceId],
         }),
       ]);
-      expect(visibilityWarnings).toContain("Count: 1");
-      expect(parseReviewCategoryItems(visibilityWarnings)).toEqual([
+      expect(visibilityWarnings).toContain(`Count: ${visibilityWarningItems.length}`);
+      expect(visibilityWarningItems).toEqual(expect.arrayContaining([
         expect.objectContaining({
           path: blocked.sourceCardPath,
           rule_id: "raw_sources_default_private",
         }),
+        expect.objectContaining({
+          path: "curated/questions/sync-review.md",
+          rule_id: "public_private_page_selected",
+        }),
+      ]));
+    });
+  });
+
+  it("filters generated review data through profile exclusions and keeps selected visibility warnings", async () => {
+    await withTempWorkspace("llm-wiki-explore-sync-review-profile-filter-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const profilePath = resolve(wikiDir, ".llm-wiki/profiles/review.yml");
+      const profileContent = await readFile(profilePath, "utf8");
+      await writeFile(
+        profilePath,
+        profileContent.replace(
+          "exclude:\n  - raw/inputs/**/original.*\n",
+          "exclude:\n  - curated/private/**\n  - raw/inputs/**/original.*\n",
+        ),
+        "utf8",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/questions/visible-review.md",
+        {
+          type: "question",
+          title: "Visible Review Question",
+          visibility: "private",
+          source_ids: [],
+          review_status: "needs-human-review",
+        },
+        "# Visible Review Question\n",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/private/hidden-review.md",
+        {
+          type: "question",
+          title: "Hidden Review Question",
+          visibility: "private",
+          source_ids: [],
+          review_status: "needs-human-review",
+        },
+        "# Hidden Review Question\n",
+      );
+
+      // Act
+      const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "review", "--json"]);
+      const payload = parseExploreSync(result.stdout);
+      const needsReview = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/needs-review.md");
+      const visibilityWarnings = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/visibility-warnings.md");
+      const needsReviewItems = parseReviewCategoryItems(needsReview);
+      const visibilityWarningItems = parseReviewCategoryItems(visibilityWarnings);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.materialized_paths).toContain("quartz/content/curated/questions/visible-review.md");
+      expect(payload.data.materialized_paths).not.toContain("quartz/content/curated/private/hidden-review.md");
+      expect(needsReviewItems).toEqual([
+        expect.objectContaining({
+          path: "curated/questions/visible-review.md",
+          title: "Visible Review Question",
+          review_status: "needs-human-review",
+        }),
       ]);
+      expect(needsReviewItems).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: "curated/private/hidden-review.md" }),
+      ]));
+      expect(visibilityWarningItems).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          path: "curated/questions/visible-review.md",
+          rule_id: "public_private_page_selected",
+        }),
+      ]));
+      expect(visibilityWarningItems).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: "curated/private/hidden-review.md" }),
+      ]));
     });
   });
 
@@ -1575,6 +1657,51 @@ visibility:
         expect(payload.data.warnings).toEqual(payload.warnings);
         expect(gitignore).toContain("quartz/content/\n");
         expect(await pathExists(resolve(wikiDir, "quartz/content/curated/topics/public-topic.md"))).toBe(true);
+      });
+    },
+  );
+
+  it.each(["public", "github-pages"] as const)(
+    "rejects generated local Explorer leaks before %s sync output",
+    async (profile) => {
+      await withTempWorkspace(`llm-wiki-explore-sync-${profile}-generated-leak-`, async (workspaceDir) => {
+        // Arrange
+        const wikiDir = resolve(workspaceDir, "wiki");
+        await initializeWiki(wikiDir);
+        await makeDefaultCuratedPagesPublic(wikiDir);
+        if (profile === "github-pages") {
+          await prepareGitHubPagesSyncProfile(wikiDir);
+        }
+        const leakedUploadPath = "quartz/content/_llm-wiki/upload.md";
+        await mkdir(resolve(wikiDir, "quartz/content/_llm-wiki"), { recursive: true });
+        await writeFile(
+          resolve(wikiDir, leakedUploadPath),
+          "---\ntype: dashboard\ntitle: Upload\nvisibility: private\nllm_wiki_upload: true\n---\n\n# Upload\n",
+          "utf8",
+        );
+
+        // Act
+        const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", profile, "--json"]);
+        const payload = parseExploreSyncFailure(result.stdout);
+
+        // Assert
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toEqual([]);
+        expect(payload.error).toEqual({
+          code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+          message: "Public profile leak check failed: public_quartz_upload_page_leak.",
+          hint: "Remove generated upload pages from quartz/content before syncing or building public Quartz output.",
+        });
+        expect(payload.issues).toEqual([
+          expect.objectContaining({
+            severity: "error",
+            code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+            path: leakedUploadPath,
+            hint: "Remove generated upload pages from quartz/content before syncing or building public Quartz output.",
+          }),
+        ]);
+        expect(await pathExists(resolve(wikiDir, leakedUploadPath))).toBe(true);
+        expect(await pathExists(resolve(wikiDir, `.llm-wiki/cache/quartz-manifest.${profile}.json`))).toBe(false);
       });
     },
   );

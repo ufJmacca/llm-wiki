@@ -801,6 +801,7 @@ async function startExplorerWatchers(
           }
 
           await onSynced?.(syncResult.data);
+          await refreshWatchTargets();
         })
         .catch(() => undefined)
         .finally(() => {

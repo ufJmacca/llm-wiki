@@ -60,6 +60,7 @@ describe("review data model", () => {
           status: "blocked",
           visibility: "private",
           source_card_path: source.sourceCardPath,
+          source_card_materialized: true,
           queue_path: source.queuePath,
           original_path: source.originalPath,
           captured_at: "2026-06-23T08:00:00.000Z",
@@ -76,6 +77,55 @@ describe("review data model", () => {
             page_path: source.sourceCardPath,
           },
         },
+      ]);
+    });
+  });
+
+  it("marks queue source card paths as not materialized when the source card is missing", async () => {
+    await withTempWorkspace("llm-wiki-review-data-missing-source-card-", async (repoRoot) => {
+      // Arrange
+      const source = sourceFixture(
+        "src_2026_06_23_missing_card_666666",
+        "Missing Card",
+        "queued",
+        "text",
+        "2026-06-23T08:00:00.000Z",
+      );
+      await writeRepoFile(
+        repoRoot,
+        source.queuePath,
+        `${JSON.stringify(
+          {
+            kind: source.sourceKind,
+            source_id: source.sourceId,
+            title: source.title,
+            source_kind: source.sourceKind,
+            captured_at: source.capturedAt,
+            content_hash: source.contentHash,
+            status: source.status,
+            visibility: "private",
+            path: source.sourceCardPath,
+            original_path: source.originalPath,
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      const scan = await scanWikiRepository(repoRoot);
+
+      // Act
+      const reviewData = buildReviewDataModel(scan, {
+        generatedAt,
+        lintResult: emptyLintResult(),
+      });
+
+      // Assert
+      expect(reviewData.queue.items).toEqual([
+        expect.objectContaining({
+          source_id: source.sourceId,
+          source_card_path: source.sourceCardPath,
+          source_card_materialized: false,
+        }),
       ]);
     });
   });
@@ -197,22 +247,31 @@ describe("review data model", () => {
           required_value: "public",
         },
       });
-      const publicProfile = profileFixture("public");
+      await writeProfile(repoRoot, "review", {
+        name: "review",
+        mode: "review",
+        include: ["curated/**", "raw/inputs/**/_source.md", "raw/queue/**"],
+        exclude: [],
+        visibility: {
+          include_private: true,
+        },
+      });
+      const reviewProfile = profileFixture("review");
       const scan = await scanWikiRepository(repoRoot);
 
       // Act
       const reviewData = buildReviewDataModel(scan, {
         generatedAt,
-        profile: publicProfile,
+        profile: reviewProfile,
       });
 
       // Assert
       expect(reviewData.generated_at).toBe("2026-06-23T10:30:00.000Z");
       expect(reviewData.profile).toMatchObject({
-        requested_name: "public",
-        source_name: "public",
-        include_private: false,
-        required_visibility: "public",
+        requested_name: "review",
+        source_name: "review",
+        include_private: true,
+        required_visibility: null,
       });
       expect(reviewData.queue.counts).toEqual({
         total: 4,
@@ -223,22 +282,23 @@ describe("review data model", () => {
       });
       expect(reviewData.queue.items).toEqual([
         expect.objectContaining({
+          source_id: ingested.sourceId,
+          status: "ingested",
+          source_card_path: ingested.sourceCardPath,
+          queue_path: ingested.queuePath,
+        }),
+        expect.objectContaining({
           source_id: blocked.sourceId,
           title: "Blocked Note",
           source_kind: "url",
           status: "blocked",
           visibility: "private",
           source_card_path: blocked.sourceCardPath,
+          source_card_materialized: false,
           queue_path: blocked.queuePath,
           original_path: blocked.originalPath,
           captured_at: "2026-06-23T09:10:00.000Z",
           updated_at: "2026-06-23T10:05:00.000Z",
-        }),
-        expect.objectContaining({
-          source_id: ingested.sourceId,
-          status: "ingested",
-          source_card_path: ingested.sourceCardPath,
-          queue_path: ingested.queuePath,
         }),
         expect.objectContaining({
           source_id: ingesting.sourceId,
@@ -492,7 +552,9 @@ async function writeRepoFile(repoRoot: string, path: string, content: string): P
   await writeFile(absolutePath, content, "utf8");
 }
 
-function profileFixture(name: "public"): WikiProfile {
+function profileFixture(name: "public" | "review"): WikiProfile {
+  const includePrivate = name === "review";
+
   return {
     requestedName: name,
     sourceName: name,
@@ -501,8 +563,8 @@ function profileFixture(name: "public"): WikiProfile {
     customDomain: null,
     include: ["curated/**", "raw/inputs/**/_source.md", "raw/queue/**"],
     exclude: [],
-    includePrivate: false,
-    requiredVisibility: "public",
+    includePrivate,
+    requiredVisibility: includePrivate ? null : "public",
   };
 }
 

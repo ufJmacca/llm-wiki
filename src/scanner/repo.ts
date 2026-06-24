@@ -44,6 +44,10 @@ export type RepoLogFile = RepoFile & {
   scan: RuntimeLogScan;
 };
 
+export type RepoGeneratedFile = RepoFile & {
+  content: Buffer;
+};
+
 export type SourceCard = RepoMarkdownFile & {
   source_id: string | null;
   title: string | null;
@@ -63,6 +67,7 @@ export type RepoScan = {
   queueItems: Array<RepoQueueFile & { item: QueueItem }>;
   profiles: RepoProfileFile[];
   rawOriginals: RepoOriginalFile[];
+  generatedQuartzContentFiles: RepoGeneratedFile[];
   log: RepoLogFile | null;
 };
 
@@ -70,6 +75,7 @@ export type RepoScanMode = "full" | "liveMarkdown";
 
 export type ScanWikiRepositoryOptions = {
   mode?: RepoScanMode;
+  includeGeneratedQuartzContent?: boolean;
 };
 
 const SKIPPED_ROOTS = [
@@ -162,6 +168,8 @@ export async function scanWikiRepository(
 
   const sourceCards = markdown.filter(isSourceCardMarkdown).map(toSourceCard);
   const queueItems = queueFiles.flatMap((queueFile) => (queueFile.scan.item ? [{ ...queueFile, item: queueFile.scan.item }] : []));
+  const generatedQuartzContentFiles =
+    mode === "full" && options.includeGeneratedQuartzContent === true ? await scanGeneratedQuartzContentFiles(rootDir) : [];
 
   return {
     rootDir,
@@ -174,6 +182,7 @@ export async function scanWikiRepository(
     queueItems: sortByPath(queueItems),
     profiles: sortByPath(profiles),
     rawOriginals: sortByPath(rawOriginals),
+    generatedQuartzContentFiles,
     log,
   };
 }
@@ -285,6 +294,65 @@ async function listInputFiles(
   return { filePaths: paths.sort(), linkableFilePaths: linkableFilePaths.sort() };
 }
 
+async function scanGeneratedQuartzContentFiles(rootDir: string): Promise<RepoGeneratedFile[]> {
+  const paths = await listGeneratedQuartzContentPaths(rootDir);
+  const files: RepoGeneratedFile[] = [];
+  for (const path of paths) {
+    const content = await readFile(resolve(rootDir, path));
+    files.push({
+      path,
+      content,
+      content_hash: computeContentHash(content),
+    });
+  }
+
+  return sortByPath(files);
+}
+
+async function listGeneratedQuartzContentPaths(rootDir: string): Promise<string[]> {
+  const root = "quartz/content";
+  const rootPath = resolve(rootDir, root);
+  try {
+    const rootState = await lstat(rootPath);
+    if (!rootState.isDirectory() || rootState.isSymbolicLink()) {
+      return [];
+    }
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return [];
+    }
+
+    throw error;
+  }
+
+  const paths: string[] = [];
+
+  async function visit(relativeDir: string): Promise<void> {
+    const absoluteDir = resolve(rootDir, relativeDir);
+    const entries = await readdir(absoluteDir);
+    for (const entry of entries.sort()) {
+      const path = joinRelativePath(relativeDir, entry);
+      const absolutePath = resolve(rootDir, path);
+      const state = await lstat(absolutePath);
+      if (state.isSymbolicLink()) {
+        continue;
+      }
+
+      if (state.isDirectory()) {
+        await visit(path);
+        continue;
+      }
+
+      if (state.isFile()) {
+        paths.push(toPosixPath(relative(rootDir, absolutePath)));
+      }
+    }
+  }
+
+  await visit(root);
+  return paths.sort();
+}
+
 function shouldSkipRoot(path: string): boolean {
   if (path.split("/").includes("node_modules")) {
     return true;
@@ -303,4 +371,8 @@ function toPosixPath(path: string): string {
 
 function sortByPath<T extends { path: string }>(values: T[]): T[] {
   return [...values].sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }

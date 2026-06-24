@@ -87,4 +87,31 @@ describe("repository scanner", () => {
       expect(scan.markdown.map((file) => file.path)).toEqual(["curated/topics/live-page.md"]);
     });
   });
+
+  it("scans generated Quartz content only when explicitly requested", async () => {
+    await withTempWorkspace("llm-wiki-repo-scan-generated-quartz-content-", async (workspaceDir) => {
+      await mkdir(resolve(workspaceDir, "curated/topics"), { recursive: true });
+      await mkdir(resolve(workspaceDir, "quartz/content/curated/topics"), { recursive: true });
+      await writeFile(
+        resolve(workspaceDir, "curated/topics/live-page.md"),
+        "---\ntype: topic\ntitle: Live Page\nvisibility: private\nsource_ids: []\n---\n\n# Live Page\n",
+        "utf8",
+      );
+      await writeFile(
+        resolve(workspaceDir, "quartz/content/curated/topics/stale-private.md"),
+        "---\ntype: topic\ntitle: Stale Private\nvisibility: private\nsource_ids: []\n---\n\n# Stale Private\n",
+        "utf8",
+      );
+
+      const defaultScan = await scanWikiRepository(workspaceDir);
+      const generatedScan = await scanWikiRepository(workspaceDir, { includeGeneratedQuartzContent: true });
+
+      expect(defaultScan.files.map((file) => file.path)).toEqual(["curated/topics/live-page.md"]);
+      expect(defaultScan.generatedQuartzContentFiles).toEqual([]);
+      expect(generatedScan.files.map((file) => file.path)).toEqual(["curated/topics/live-page.md"]);
+      expect(generatedScan.generatedQuartzContentFiles.map((file) => file.path)).toEqual([
+        "quartz/content/curated/topics/stale-private.md",
+      ]);
+    });
+  });
 });

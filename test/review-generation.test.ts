@@ -186,22 +186,31 @@ describe("review data model", () => {
           required_value: "public",
         },
       });
-      const publicProfile = profileFixture("public");
+      await writeProfile(repoRoot, "review", {
+        name: "review",
+        mode: "review",
+        include: ["curated/**", "raw/inputs/**/_source.md", "raw/queue/**"],
+        exclude: [],
+        visibility: {
+          include_private: true,
+        },
+      });
+      const reviewProfile = profileFixture("review");
       const scan = await scanWikiRepository(repoRoot);
 
       // Act
       const reviewData = buildReviewDataModel(scan, {
         generatedAt,
-        profile: publicProfile,
+        profile: reviewProfile,
       });
 
       // Assert
       expect(reviewData.generated_at).toBe("2026-06-23T10:30:00.000Z");
       expect(reviewData.profile).toMatchObject({
-        requested_name: "public",
-        source_name: "public",
-        include_private: false,
-        required_visibility: "public",
+        requested_name: "review",
+        source_name: "review",
+        include_private: true,
+        required_visibility: null,
       });
       expect(reviewData.queue.counts).toEqual({
         total: 4,
@@ -481,7 +490,9 @@ async function writeRepoFile(repoRoot: string, path: string, content: string): P
   await writeFile(absolutePath, content, "utf8");
 }
 
-function profileFixture(name: "public"): WikiProfile {
+function profileFixture(name: "public" | "review"): WikiProfile {
+  const includePrivate = name === "review";
+
   return {
     requestedName: name,
     sourceName: name,
@@ -490,8 +501,8 @@ function profileFixture(name: "public"): WikiProfile {
     customDomain: null,
     include: ["curated/**", "raw/inputs/**/_source.md", "raw/queue/**"],
     exclude: [],
-    includePrivate: false,
-    requiredVisibility: "public",
+    includePrivate,
+    requiredVisibility: includePrivate ? null : "public",
   };
 }
 

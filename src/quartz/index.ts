@@ -21,7 +21,7 @@ import {
 } from "../profiles/index.js";
 import { gitCommandEnv } from "../utils/git.js";
 import { validateTextFileWriteInsideRoot, writeTextFileInsideRoot, type ScaffoldEntry } from "../utils/fs.js";
-import { buildReviewDataModel, type ReviewCategory, type ReviewDataModel } from "./reviewData.js";
+import { buildReviewDataModel, filterReviewScanForProfile, type ReviewCategory, type ReviewDataModel } from "./reviewData.js";
 
 export { buildReviewDataModel, type ReviewDataModel } from "./reviewData.js";
 
@@ -808,6 +808,7 @@ function localExplorerPageDefinitions(
   scan: RepoScan,
   files: readonly RepoMarkdownFile[],
 ): StaticReviewPage[] {
+  const reviewScan = filterReviewScanForProfile(scan, profile);
   const reviewData = buildReviewDataModel(scan, { profile });
   const fallbackHomepage = localGeneratedHomepageDefinition(files);
 
@@ -826,7 +827,7 @@ function localExplorerPageDefinitions(
     {
       path: "quartz/content/_llm-wiki/review/profile-summary.md",
       title: "Profile Summary",
-      content: profileSummaryContent(reviewData, scan),
+      content: profileSummaryContent(reviewData, reviewScan),
     },
     {
       path: "quartz/content/_llm-wiki/review/source-queue.md",
@@ -2938,20 +2939,41 @@ function uploadFormComponentContent(): string {
       }
       return text;
     };
+    const daemonUnavailableHint = "Run llm-wiki explore serve --profile local --with-daemon and keep the daemon running.";
+    const browserGuidance = "Check that the local daemon is still running, then refresh this page to load the current upload token.";
     const showError = (error, fallback) => {
       const shown = error && typeof error === "object" ? error : { code: "UPLOAD_FAILED", message: fallback };
       setStatus(String(shown.message || fallback));
+      const hint = shown.hint || (shown.code === "DAEMON_UNAVAILABLE" ? daemonUnavailableHint : undefined);
       showDetails([
         ["Code", shown.code],
         ["Message", shown.message],
-        ["Hint", shown.hint],
+        ["Hint", hint],
         ["Path", shown.path],
+        ["Browser guidance", browserGuidance],
       ]);
+    };
+    const successStatusMessage = (data) => {
+      const uploadStatus = typeof data.status === "string" ? data.status : "";
+      const queueStatus = typeof data.queue_status === "string" ? data.queue_status : "";
+      if (uploadStatus === "duplicate") {
+        return queueStatus === "ingested" ? "Source already captured and ingested." : "Source already captured.";
+      }
+      if (queueStatus === "queued") return "Upload queued.";
+      if (queueStatus !== "") return "Upload recorded with queue status: " + queueStatus + ".";
+      return "Upload succeeded.";
+    };
+
+    const daemonMetadataUrl = () => {
+      const marker = "/_llm-wiki/";
+      const markerIndex = window.location.pathname.indexOf(marker);
+      const basePath = markerIndex >= 0 ? window.location.pathname.slice(0, markerIndex + 1) : "/";
+      return basePath + "_llm-wiki/runtime/local-daemon.json";
     };
 
     async function loadDaemonMetadata() {
       try {
-        const response = await fetch("/_llm-wiki/runtime/local-daemon.json", { cache: "no-store" });
+        const response = await fetch(daemonMetadataUrl(), { cache: "no-store" });
         if (!response.ok) return null;
         return await response.json();
       } catch {
@@ -3042,8 +3064,9 @@ function uploadFormComponentContent(): string {
         }
 
         const data = body.data || {};
-        setStatus("Upload queued.");
+        setStatus(successStatusMessage(data));
         showDetails([
+          ["Upload status", data.status],
           ["Title", data.title],
           ["Source ID", data.source_id],
           ["Source kind", data.source_kind],
@@ -3074,7 +3097,7 @@ const uploadFormScript = ${JSON.stringify(clientScript)}
 const LlmWikiUploadForm: QuartzComponent = () => {
   return (
     <section class="llm-wiki-upload-form" data-llm-wiki-upload-form="true">
-      <form encType="multipart/form-data">
+      <form encType="multipart/form-data" noValidate>
         <fieldset>
           <legend>Source type</legend>
           <label><input type="radio" name="mode" value="file" checked disabled /> File</label>
@@ -3184,7 +3207,7 @@ function reviewOverviewContent(reviewData: ReviewDataModel): string {
 | Source queue | ${reviewData.queue.counts.total} | [[source-queue|Source queue]] |
 | Recent ingests | ${reviewData.recent_ingests.count} | [[recent-ingests|Recent ingests]] |
 | Needs review | ${reviewData.needs_review.count} | [[needs-review|Needs review]] |
-| Contradictions | ${reviewData.contradictions.count} | [[contradictions|Contradictions]] |
+| Contradictions | ${reviewData.contradictions.count} | [[_llm-wiki/review/contradictions|Contradictions]] |
 | Orphans | ${reviewData.orphans.count} | [[orphans|Orphans]] |
 | Stale pages | ${reviewData.stale_pages.count} | [[stale-pages|Stale pages]] |
 | Visibility warnings | ${reviewData.visibility_warnings.count} | [[visibility-warnings|Visibility warnings]] |

@@ -1,7 +1,7 @@
 import { collectLintIssues, type LintIssue, type LintResult } from "../lint/index.js";
 import type { RuntimeLogEntry } from "../scanner/index.js";
 import type { RepoMarkdownFile, RepoScan, SourceCard } from "../scanner/repo.js";
-import type { WikiProfile } from "../profiles/index.js";
+import { matchesFileProfile, selectMarkdownForProfile, type WikiProfile } from "../profiles/index.js";
 
 export type ReviewDataModel = {
   generated_at: string;
@@ -142,18 +142,40 @@ export function buildReviewDataModel(
   options: BuildReviewDataModelOptions = {},
 ): ReviewDataModel {
   const generatedAt = options.generatedAt ?? new Date();
-  const lintIssues = options.lintResult?.issues ?? collectLintIssues(scan, lintOptionsForProfile(options.profile));
+  const reviewScan = options.profile === undefined ? scan : filterReviewScanForProfile(scan, options.profile);
+  const lintIssues = options.lintResult?.issues ?? collectLintIssues(reviewScan, lintOptionsForProfile(options.profile));
+  const visibilityLintIssues = options.lintResult?.issues ?? visibilityLintIssuesForProfile(reviewScan, options.profile, lintIssues);
 
   return {
     generated_at: generatedAt.toISOString(),
     profile: options.profile === undefined ? null : toProfileMetadata(options.profile),
-    queue: buildQueueData(scan),
-    recent_ingests: category(buildRecentIngestItems(scan)),
-    needs_review: category(buildNeedsReviewItems(scan)),
-    contradictions: category(buildContradictionItems(scan)),
-    stale_pages: category(buildStalePageItems(scan, lintIssues, generatedAt)),
-    orphans: category(buildOrphanItems(scan, lintIssues)),
-    visibility_warnings: category(buildVisibilityWarningItems(lintIssues)),
+    queue: buildQueueData(reviewScan),
+    recent_ingests: category(buildRecentIngestItems(reviewScan)),
+    needs_review: category(buildNeedsReviewItems(reviewScan)),
+    contradictions: category(buildContradictionItems(reviewScan)),
+    stale_pages: category(buildStalePageItems(reviewScan, lintIssues, generatedAt)),
+    orphans: category(buildOrphanItems(reviewScan, lintIssues)),
+    visibility_warnings: category(buildVisibilityWarningItems(visibilityLintIssues, options.profile)),
+  };
+}
+
+export function filterReviewScanForProfile(scan: RepoScan, profile: WikiProfile): RepoScan {
+  const selection = selectMarkdownForProfile(profile, scan.markdown, scan.rawOriginals);
+  const selectedMarkdownPaths = new Set(selection.markdown.map((file) => file.path));
+  const queueFiles = scan.queueFiles.filter((file) => matchesFileProfile(file.path, profile));
+  const selectedQueuePaths = new Set(queueFiles.map((file) => file.path));
+
+  return {
+    ...scan,
+    files: scan.files.filter((file) => matchesFileProfile(file.path, profile)),
+    linkableFilePaths: scan.linkableFilePaths.filter((path) => matchesFileProfile(path, profile)),
+    markdown: selection.markdown,
+    curatedPages: selection.markdown.filter((file) => file.path.startsWith("curated/")),
+    sourceCards: scan.sourceCards.filter((card) => selectedMarkdownPaths.has(card.path)),
+    queueFiles,
+    queueItems: scan.queueItems.filter((file) => selectedQueuePaths.has(file.path)),
+    rawOriginals: scan.rawOriginals.filter((file) => matchesFileProfile(file.path, profile)),
+    log: scan.log !== null && selectedMarkdownPaths.has(scan.log.path) ? scan.log : null,
   };
 }
 
@@ -166,6 +188,18 @@ function lintOptionsForProfile(profile: WikiProfile | undefined): { profile?: st
     profile: profile.sourceName,
     strict: profile.requestedName === "public" || profile.requestedName === "github-pages",
   };
+}
+
+function visibilityLintIssuesForProfile(
+  scan: RepoScan,
+  profile: WikiProfile | undefined,
+  lintIssues: readonly LintIssue[],
+): readonly LintIssue[] {
+  if (profile === undefined || profile.requestedName === "public" || profile.requestedName === "github-pages") {
+    return lintIssues;
+  }
+
+  return collectLintIssues(scan, { profile: "public", strict: true });
 }
 
 function toProfileMetadata(profile: WikiProfile): ReviewProfileMetadata {
@@ -385,9 +419,10 @@ function buildOrphanItems(scan: RepoScan, lintIssues: readonly LintIssue[]): Rev
     .sort((left, right) => left.path.localeCompare(right.path));
 }
 
-function buildVisibilityWarningItems(lintIssues: readonly LintIssue[]): ReviewLintIssueItem[] {
+function buildVisibilityWarningItems(lintIssues: readonly LintIssue[], profile: WikiProfile | undefined): ReviewLintIssueItem[] {
   return lintIssues
     .filter((issue) => isVisibilityWarningRule(issue.rule_id))
+    .filter((issue) => profile === undefined || matchesFileProfile(issue.path, profile))
     .map(toLintIssueItem)
     .sort((left, right) => left.path.localeCompare(right.path) || left.rule_id.localeCompare(right.rule_id));
 }

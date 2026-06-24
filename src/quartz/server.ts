@@ -664,7 +664,7 @@ async function allocateEphemeralPort(host: string): Promise<number> {
 
 function explorerUrl(host: string, port: number): string {
   const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-  return `http://${urlHost}:${port}/curated/`;
+  return `http://${urlHost}:${port}/`;
 }
 
 function quartzServeEnvironment(host: string): NodeJS.ProcessEnv {

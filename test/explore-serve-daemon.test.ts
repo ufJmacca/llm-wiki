@@ -149,7 +149,8 @@ function mockLongRunningQuartz(): {
     const wikiDir = resolve(cwd, "..");
     syncedBeforeServe =
       existsSync(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.local.json")) &&
-      existsSync(resolve(wikiDir, "quartz/content/curated/home.md"));
+      existsSync(resolve(wikiDir, "quartz/content/curated/home.md")) &&
+      existsSync(resolve(wikiDir, "quartz/content/index.md"));
     try {
       metadataBeforeServe = readFileSync(resolve(wikiDir, "quartz/content/_llm-wiki/runtime/local-daemon.json"), "utf8");
     } catch {
@@ -351,6 +352,7 @@ describe("explore serve local upload daemon integration", () => {
         "serve JSON readiness envelope with daemon metadata",
       );
       const payload = parseExploreServe(stdout);
+      const metadataAtSpawn = JSON.parse(quartz.metadataBeforeServe() ?? "null") as LocalDaemonRuntimeMetadata | null;
       const metadata = JSON.parse(
         await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/runtime/local-daemon.json"),
       ) as LocalDaemonRuntimeMetadata;
@@ -373,7 +375,7 @@ describe("explore serve local upload daemon integration", () => {
         profile: "local",
         host: "127.0.0.1",
         port: 8788,
-        url: "http://127.0.0.1:8788/curated/",
+        url: "http://127.0.0.1:8788/",
         daemon: {
           host: "127.0.0.1",
           upload_path: "/api/raw-upload",
@@ -383,6 +385,16 @@ describe("explore serve local upload daemon integration", () => {
       expect(payload.data.daemon.port).toBeGreaterThan(0);
       expect(payload.data.daemon.url).toBe(`http://127.0.0.1:${payload.data.daemon.port}`);
       expect(payload.data.daemon.upload_token).toMatch(/^[a-f0-9]{64}$/);
+      expect(metadataAtSpawn).toMatchObject({
+        enabled: true,
+        url: payload.data.daemon.url,
+        upload_path: "/api/raw-upload",
+        token_header: "x-llm-wiki-upload-token",
+        upload_token: payload.data.daemon.upload_token,
+        commit_uploads: false,
+        auto_ingest_available: false,
+      });
+      expect(metadataAtSpawn?.updated_at).toEqual(expect.any(String));
       expect(metadata).toMatchObject({
         enabled: true,
         url: payload.data.daemon.url,
@@ -422,6 +434,69 @@ describe("explore serve local upload daemon integration", () => {
       });
       expect(disabledMetadata).not.toHaveProperty("upload_token");
       await expect(fetch(`${payload.data.daemon.url}/api/raw-upload`)).rejects.toThrow();
+    });
+  });
+
+  it("prints root readiness and daemon upload details in human mode", async () => {
+    await withTempWorkspace("llm-wiki-explore-serve-daemon-human-ready-", async (workspaceDir) => {
+      // Arrange
+      mockGitOutsideWorkTree({ allowUploadCommit: false });
+      const quartz = mockLongRunningQuartz();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+
+      // Act
+      const serveResult = runCli([
+        "explore",
+        "serve",
+        "--repo",
+        wikiDir,
+        "--profile",
+        "local",
+        "--port",
+        "8794",
+        "--with-daemon",
+        "--daemon-port",
+        "0",
+      ], {
+        stdout: (message) => stdout.push(message),
+        stderr: (message) => stderr.push(message),
+        stdin: async () => "",
+      });
+      await Promise.race([
+        quartz.waitUntilStarted(),
+        serveResult.then((exitCode) => {
+          throw new Error(`explore serve exited before Quartz started: ${exitCode}; stderr=${stderr.join("\n")}`);
+        }),
+      ]);
+      const output = await waitFor(
+        async () => stdout.join("\n"),
+        (content) => content.includes("URL: http://127.0.0.1:8794/"),
+        "human serve readiness output with root Explorer URL",
+      );
+      const metadata = JSON.parse(
+        await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/runtime/local-daemon.json"),
+      ) as LocalDaemonRuntimeMetadata;
+      if (!metadata.enabled) {
+        throw new Error("Expected enabled local daemon metadata before human readiness assertions.");
+      }
+
+      // Assert
+      expect(stderr).toEqual([]);
+      expect(output).toContain("Quartz Explorer serving");
+      expect(output).toContain("Profile: local");
+      expect(output).toContain("URL: http://127.0.0.1:8794/");
+      expect(output).toContain(`Upload endpoint: ${metadata.url}${metadata.upload_path}`);
+      expect(output).toContain(`Upload token header: ${metadata.token_header}: ${metadata.upload_token}`);
+      expect(output).toContain("Commit uploads: disabled");
+      expect(metadata.upload_token).toMatch(/^[a-f0-9]{64}$/);
+
+      quartz.close();
+      await expect(serveResult).resolves.toBe(0);
     });
   });
 

@@ -139,6 +139,7 @@ export const GITHUB_PAGES_CNAME_CACHE_PATH = ".llm-wiki/cache/github-pages-CNAME
 const QUARTZ_BUILD_HOMEPAGE_SOURCE_PATH = "curated/index.md";
 const QUARTZ_BUILD_HOMEPAGE_CONTENT_PATH = "quartz/content/index.md";
 const QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH = "quartz/content/_llm-wiki/runtime/local-daemon.json";
+const QUARTZ_UPLOAD_FORM_COMPONENT_PATH = "quartz/components/LlmWikiUploadForm.tsx";
 const QUARTZ_PARENT_GITIGNORE_PATH = "quartz/.gitignore";
 const QUARTZ_PARENT_CONTENT_IGNORE_RULE = "content/";
 const QUARTZ_RUNTIME_IGNORE_RULE = "quartz/quartz/";
@@ -222,8 +223,9 @@ export async function initializeQuartzRuntime(
   const skippedPaths: string[] = [];
   for (const entry of entries) {
     if (await quartzRuntimeFileExists(repoRoot, entry.path)) {
-      if (await shouldMigrateQuartzRuntimeEntry(repoRoot, entry)) {
-        await writeQuartzRuntimeEntry(repoRoot, entry);
+      const migrationContent = await quartzRuntimeEntryMigrationContent(repoRoot, entry);
+      if (migrationContent !== null) {
+        await writeQuartzRuntimeEntry(repoRoot, { ...entry, content: migrationContent });
         updatedPaths.push(entry.path);
         continue;
       }
@@ -375,9 +377,15 @@ export async function writeLocalDaemonRuntimeMetadata(
   repoRoot: string,
   metadata: QuartzLocalDaemonRuntimeMetadata,
 ): Promise<void> {
+  const runtimeMetadata = metadata.enabled
+    ? metadata
+    : {
+        enabled: false,
+        updated_at: metadata.updated_at,
+      };
   const content = `${JSON.stringify(
     {
-      ...metadata,
+      ...runtimeMetadata,
       updated_at: metadata.updated_at ?? new Date().toISOString(),
     },
     null,
@@ -392,6 +400,33 @@ export async function writeLocalDaemonRuntimeMetadata(
       hint: writeResult.error.hint,
     });
   }
+}
+
+export async function writeDisabledLocalDaemonRuntimeMetadataIfCurrent(
+  repoRoot: string,
+  expected: Pick<Extract<QuartzLocalDaemonRuntimeMetadata, { enabled: true }>, "url" | "upload_token">,
+): Promise<void> {
+  let content: string;
+  try {
+    content = await readFile(resolve(repoRoot, QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH), "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return;
+    }
+
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to inspect local daemon runtime metadata.",
+      path: QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH,
+      hint: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  if (!localDaemonRuntimeMetadataMatches(content, expected)) {
+    return;
+  }
+
+  await writeLocalDaemonRuntimeMetadata(repoRoot, { enabled: false });
 }
 
 async function readQuartzManifestContentPaths(
@@ -2014,7 +2049,7 @@ async function writeQuartzRuntimeEntry(repoRoot: string, entry: ScaffoldEntry): 
   }
 }
 
-async function shouldMigrateQuartzRuntimeEntry(repoRoot: string, entry: ScaffoldEntry): Promise<boolean> {
+async function quartzRuntimeEntryMigrationContent(repoRoot: string, entry: ScaffoldEntry): Promise<string | null> {
   let content: string;
   try {
     content = await readFile(resolve(repoRoot, entry.path), "utf8");
@@ -2028,33 +2063,96 @@ async function shouldMigrateQuartzRuntimeEntry(repoRoot: string, entry: Scaffold
   }
 
   if (content === entry.content) {
-    return false;
+    return null;
   }
 
   switch (entry.path) {
     case "quartz/package.json":
-      return content === OLD_PLACEHOLDER_QUARTZ_PACKAGE_JSON;
+      return content === OLD_PLACEHOLDER_QUARTZ_PACKAGE_JSON ? entry.content : null;
     case "quartz/README.md":
-      return content === OLD_PLACEHOLDER_QUARTZ_README;
+      return content === OLD_PLACEHOLDER_QUARTZ_README ? entry.content : null;
     case "quartz/quartz.config.ts":
       return (
         content === OLD_PLACEHOLDER_QUARTZ_CONFIG ||
         content === quartzConfigContent({ enableContentIndexFeeds: true })
-      );
+      )
+        ? entry.content
+        : null;
     case "quartz/quartz.layout.ts":
-      return content === OLD_PLACEHOLDER_QUARTZ_LAYOUT || content === quartzLayoutContentBeforeUploadForm();
-    case "quartz/components/LlmWikiUploadForm.tsx":
-      return (
-        content === componentPlaceholder("LlmWikiUploadForm", "llm-wiki-upload-form") ||
-        content === oldComponentPlaceholder("llm-wiki-upload-form")
-      );
+      if (content === OLD_PLACEHOLDER_QUARTZ_LAYOUT) {
+        return await uploadFormComponentSupportsDefaultLayoutImport(repoRoot)
+          ? entry.content
+          : quartzLayoutContentBeforeUploadForm();
+      }
+
+      if (content !== quartzLayoutContentBeforeUploadForm()) {
+        return null;
+      }
+
+      return await uploadFormComponentSupportsDefaultLayoutImport(repoRoot) ? entry.content : null;
+    case QUARTZ_UPLOAD_FORM_COMPONENT_PATH:
+      return isMigratableUploadFormComponent(content) ? entry.content : null;
     default:
-      return false;
+      return null;
   }
+}
+
+async function uploadFormComponentSupportsDefaultLayoutImport(repoRoot: string): Promise<boolean> {
+  let content: string;
+  try {
+    content = await readFile(resolve(repoRoot, QUARTZ_UPLOAD_FORM_COMPONENT_PATH), "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return true;
+    }
+
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: `Failed to inspect Quartz runtime file: ${QUARTZ_UPLOAD_FORM_COMPONENT_PATH}.`,
+      path: QUARTZ_UPLOAD_FORM_COMPONENT_PATH,
+      hint: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return isMigratableUploadFormComponent(content) || hasDefaultExport(content);
+}
+
+function isMigratableUploadFormComponent(content: string): boolean {
+  return (
+    content === componentPlaceholder("LlmWikiUploadForm", "llm-wiki-upload-form") ||
+    content === oldComponentPlaceholder("llm-wiki-upload-form")
+  );
+}
+
+function hasDefaultExport(content: string): boolean {
+  const withoutComments = content
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+
+  return (
+    /^\s*export\s+default\b/m.test(withoutComments) ||
+    /^\s*export\s*\{[^}]*\bas\s+default\b[^}]*\}/ms.test(withoutComments)
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function localDaemonRuntimeMetadataMatches(
+  content: string,
+  expected: Pick<Extract<QuartzLocalDaemonRuntimeMetadata, { enabled: true }>, "url" | "upload_token">,
+): boolean {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (!isRecord(parsed)) {
+      return false;
+    }
+
+    return parsed.enabled === true && parsed.url === expected.url && parsed.upload_token === expected.upload_token;
+  } catch {
+    return false;
+  }
 }
 
 function skippedInstall(repoRoot: string): QuartzInstallResult {
@@ -2596,7 +2694,11 @@ function uploadFormComponentContent(): string {
         });
         const body = await response.json().catch(() => null);
         if (!response.ok || body?.ok !== true) {
-          showError(body?.error, "Upload failed.");
+          const error =
+            body?.error && typeof body.error === "object"
+              ? { ...body.error, path: body.error.path || body?.issues?.[0]?.path }
+              : body?.error;
+          showError(error, "Upload failed.");
           return;
         }
 

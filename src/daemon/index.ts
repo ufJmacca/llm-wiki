@@ -417,7 +417,6 @@ function allowedLoopbackOrigin(originHeader: string | string[] | undefined): str
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
   if (
     parsed.protocol !== "http:" ||
-    parsed.port === "" ||
     parsed.origin !== origin ||
     !LOCAL_HOSTS.has(hostname)
   ) {

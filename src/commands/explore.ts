@@ -14,6 +14,7 @@ import {
   initializeQuartzRuntime,
   QuartzOperationError,
   syncQuartzContent,
+  writeDisabledLocalDaemonRuntimeMetadataIfCurrent,
   writeLocalDaemonRuntimeMetadata,
 } from "../quartz/index.js";
 import {
@@ -259,7 +260,10 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
     const daemon = uploadDaemon;
     await daemon?.close();
     if (daemon !== undefined && daemonMetadataWritten && isLocalReviewProfile(profile)) {
-      await writeLocalDaemonRuntimeMetadata(resolvedRepo.value.rootDir, { enabled: false }).catch(() => undefined);
+      await writeDisabledLocalDaemonRuntimeMetadataIfCurrent(resolvedRepo.value.rootDir, {
+        url: daemon.url,
+        upload_token: daemon.uploadToken,
+      }).catch(() => undefined);
     }
   }
 

@@ -354,10 +354,13 @@ describe("local upload daemon", () => {
       await initializeWiki(wikiDir);
       const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
       const origins = [
+        "http://127.0.0.1",
         "http://127.0.0.1:8080",
         "http://127.0.0.1:49152",
+        "http://localhost",
         "http://localhost:3000",
         "http://localhost:8080",
+        "http://[::1]",
         "http://[::1]:43210",
         "http://[::1]:8080",
       ];

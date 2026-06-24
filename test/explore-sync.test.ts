@@ -3,7 +3,7 @@ import { mkdir, readFile, readdir, rename, symlink, writeFile } from "node:fs/pr
 import { dirname, resolve } from "node:path";
 import { promisify } from "node:util";
 
-import { stringify } from "yaml";
+import { parse, stringify } from "yaml";
 import { describe, expect, it } from "vitest";
 
 import { syncQuartzContent } from "../src/quartz/index.js";
@@ -344,6 +344,12 @@ function parseReviewCategoryItems(content: string): unknown[] {
   return JSON.parse(match?.[1] ?? "[]") as unknown[];
 }
 
+function parseFrontmatter(content: string): Record<string, unknown> {
+  const match = /^---\n([\s\S]*?)\n---\n/u.exec(content);
+  expect(match).not.toBeNull();
+  return parse(match?.[1] ?? "") as Record<string, unknown>;
+}
+
 async function listTree(rootDir: string, relativeDir: string): Promise<string[]> {
   const absoluteDir = resolve(rootDir, relativeDir);
   if (!(await pathExists(absoluteDir))) {
@@ -596,6 +602,9 @@ describe("explore sync command", () => {
       const profileSummary = reviewPages.get("quartz/content/_llm-wiki/review/profile-summary.md") ?? "";
       const sourceQueue = reviewPages.get("quartz/content/_llm-wiki/review/source-queue.md") ?? "";
       const status = reviewPages.get("quartz/content/_llm-wiki/review/status.md") ?? "";
+      const overviewFrontmatter = parseFrontmatter(overview);
+      const sourceQueueFrontmatter = parseFrontmatter(sourceQueue);
+      const statusFrontmatter = parseFrontmatter(status);
       const visibilityWarningItems = parseReviewCategoryItems(visibilityWarnings);
 
       // Assert
@@ -608,6 +617,54 @@ describe("explore sync command", () => {
       expectGeneratedReviewFrontmatter(profileSummary, "Profile Summary", "LlmWikiReviewPanel");
       expectGeneratedReviewFrontmatter(sourceQueue, "Source Queue", "LlmWikiQueueDashboard");
       expectGeneratedReviewFrontmatter(status, "Review Status", "LlmWikiReviewPanel");
+      for (const frontmatter of [overviewFrontmatter, sourceQueueFrontmatter, statusFrontmatter]) {
+        expect(frontmatter).toMatchObject({
+          llm_wiki_queue_dashboard: true,
+          llm_wiki_queue_total: 4,
+          llm_wiki_queue_queued: 1,
+          llm_wiki_queue_ingesting: 1,
+          llm_wiki_queue_blocked: 1,
+          llm_wiki_queue_completed: 1,
+        });
+        expect(frontmatter.llm_wiki_queue_items).toEqual([
+          expect.objectContaining({
+            title: "Sync Ingested",
+            source_id: ingested.sourceId,
+            source_kind: "text",
+            queue_status: "ingested",
+            visibility: "private",
+            source_card_path: ingested.sourceCardPath,
+            queue_path: ingested.queuePath,
+          }),
+          expect.objectContaining({
+            title: "Sync Blocked",
+            source_id: blocked.sourceId,
+            source_kind: "url",
+            queue_status: "blocked",
+            visibility: "public",
+            source_card_path: blocked.sourceCardPath,
+            queue_path: blocked.queuePath,
+          }),
+          expect.objectContaining({
+            title: "Sync Ingesting",
+            source_id: ingesting.sourceId,
+            source_kind: "file",
+            queue_status: "ingesting",
+            visibility: "private",
+            source_card_path: ingesting.sourceCardPath,
+            queue_path: ingesting.queuePath,
+          }),
+          expect.objectContaining({
+            title: "Sync Queued",
+            source_id: queued.sourceId,
+            source_kind: "text",
+            queue_status: "queued",
+            visibility: "private",
+            source_card_path: queued.sourceCardPath,
+            queue_path: queued.queuePath,
+          }),
+        ]);
+      }
       expectGeneratedReviewFrontmatter(recentIngests, "Recent Ingests", "LlmWikiReviewPanel");
       expectGeneratedReviewFrontmatter(needsReview, "Needs Review", "LlmWikiReviewPanel");
       expectGeneratedReviewFrontmatter(contradictions, "Contradictions", "LlmWikiReviewPanel");

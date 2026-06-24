@@ -1,7 +1,7 @@
 import { collectLintIssues, type LintIssue, type LintResult } from "../lint/index.js";
+import { matchesFileProfile, selectMarkdownForProfile, type WikiProfile } from "../profiles/index.js";
 import type { RuntimeLogEntry } from "../scanner/index.js";
 import type { RepoMarkdownFile, RepoScan, SourceCard } from "../scanner/repo.js";
-import type { WikiProfile } from "../profiles/index.js";
 
 export type ReviewDataModel = {
   generated_at: string;
@@ -45,6 +45,7 @@ export type ReviewQueueItem = {
   status: "queued" | "ingesting" | "ingested" | "blocked";
   visibility: string | null;
   source_card_path: string | null;
+  source_card_materialized: boolean;
   queue_path: string;
   original_path: string | null;
   captured_at: string | null;
@@ -132,6 +133,7 @@ export type ReviewLintIssueItem = {
 export type BuildReviewDataModelOptions = {
   generatedAt?: Date;
   lintResult?: LintResult;
+  materializedMarkdownPaths?: ReadonlySet<string>;
   profile?: WikiProfile;
 };
 
@@ -142,19 +144,50 @@ export function buildReviewDataModel(
   options: BuildReviewDataModelOptions = {},
 ): ReviewDataModel {
   const generatedAt = options.generatedAt ?? new Date();
-  const lintIssues = options.lintResult?.issues ?? collectLintIssues(scan, lintOptionsForProfile(options.profile));
+  const reviewScan = options.profile === undefined ? scan : filterReviewScanForProfile(scan, options.profile);
+  const lintIssues = options.lintResult?.issues ?? collectLintIssues(reviewScan, lintOptionsForProfile(options.profile));
+  const visibilityLintIssues = options.lintResult?.issues ?? visibilityLintIssuesForProfile(reviewScan, options.profile, lintIssues);
+  const materializedMarkdownPaths = options.materializedMarkdownPaths ?? defaultMaterializedMarkdownPaths(options.profile);
 
   return {
     generated_at: generatedAt.toISOString(),
     profile: options.profile === undefined ? null : toProfileMetadata(options.profile),
-    queue: buildQueueData(scan),
-    recent_ingests: category(buildRecentIngestItems(scan)),
-    needs_review: category(buildNeedsReviewItems(scan)),
-    contradictions: category(buildContradictionItems(scan)),
-    stale_pages: category(buildStalePageItems(scan, lintIssues, generatedAt)),
-    orphans: category(buildOrphanItems(scan, lintIssues)),
-    visibility_warnings: category(buildVisibilityWarningItems(lintIssues)),
+    queue: buildQueueData(reviewScan, materializedMarkdownPaths),
+    recent_ingests: category(buildRecentIngestItems(reviewScan)),
+    needs_review: category(buildNeedsReviewItems(reviewScan)),
+    contradictions: category(buildContradictionItems(reviewScan)),
+    stale_pages: category(buildStalePageItems(reviewScan, lintIssues, generatedAt)),
+    orphans: category(buildOrphanItems(reviewScan, lintIssues)),
+    visibility_warnings: category(buildVisibilityWarningItems(visibilityLintIssues, options.profile)),
   };
+}
+
+export function filterReviewScanForProfile(scan: RepoScan, profile: WikiProfile): RepoScan {
+  const selection = selectMarkdownForProfile(profile, scan.markdown, scan.rawOriginals);
+  const selectedMarkdownPaths = new Set(selection.markdown.map((file) => file.path));
+  const queueFiles = scan.queueFiles.filter((file) => matchesFileProfile(file.path, profile));
+  const selectedQueuePaths = new Set(queueFiles.map((file) => file.path));
+
+  return {
+    ...scan,
+    files: scan.files.filter((file) => matchesFileProfile(file.path, profile)),
+    linkableFilePaths: scan.linkableFilePaths.filter((path) => matchesFileProfile(path, profile)),
+    markdown: selection.markdown,
+    curatedPages: selection.markdown.filter((file) => file.path.startsWith("curated/")),
+    sourceCards: scan.sourceCards.filter((card) => selectedMarkdownPaths.has(card.path)),
+    queueFiles,
+    queueItems: scan.queueItems.filter((file) => selectedQueuePaths.has(file.path)),
+    rawOriginals: scan.rawOriginals.filter((file) => matchesFileProfile(file.path, profile)),
+    log: scan.log !== null && selectedMarkdownPaths.has(scan.log.path) ? scan.log : null,
+  };
+}
+
+function defaultMaterializedMarkdownPaths(profile: WikiProfile | undefined): ReadonlySet<string> | undefined {
+  if (profile === undefined) {
+    return undefined;
+  }
+
+  return new Set();
 }
 
 function lintOptionsForProfile(profile: WikiProfile | undefined): { profile?: string; strict?: boolean } {
@@ -166,6 +199,18 @@ function lintOptionsForProfile(profile: WikiProfile | undefined): { profile?: st
     profile: profile.sourceName,
     strict: profile.requestedName === "public" || profile.requestedName === "github-pages",
   };
+}
+
+function visibilityLintIssuesForProfile(
+  scan: RepoScan,
+  profile: WikiProfile | undefined,
+  lintIssues: readonly LintIssue[],
+): readonly LintIssue[] {
+  if (profile === undefined || profile.requestedName === "public" || profile.requestedName === "github-pages") {
+    return lintIssues;
+  }
+
+  return collectLintIssues(scan, { profile: "public", strict: true });
 }
 
 function toProfileMetadata(profile: WikiProfile): ReviewProfileMetadata {
@@ -182,7 +227,7 @@ function toProfileMetadata(profile: WikiProfile): ReviewProfileMetadata {
   };
 }
 
-function buildQueueData(scan: RepoScan): ReviewQueueData {
+function buildQueueData(scan: RepoScan, materializedMarkdownPaths: ReadonlySet<string> | undefined): ReviewQueueData {
   const sourceCardsById = new Map(
     scan.sourceCards.flatMap((card) => (card.source_id === null ? [] : [[card.source_id, card] as const])),
   );
@@ -198,13 +243,14 @@ function buildQueueData(scan: RepoScan): ReviewQueueData {
         status: queueFile.item.status,
         visibility: card?.visibility ?? stringValue(queueFile.item.visibility),
         source_card_path: card?.path ?? stringValue(queueFile.item.path),
+        source_card_materialized: card === undefined ? false : (materializedMarkdownPaths?.has(card.path) ?? true),
         queue_path: queueFile.path,
         original_path: stringValue(queueFile.item.original_path),
         captured_at: stringValue(card?.scan.frontmatter?.captured_at) ?? stringValue(queueFile.item.captured_at),
         updated_at: stringValue(card?.scan.frontmatter?.updated_at) ?? stringValue(queueFile.item.updated_at),
       };
     })
-    .sort((left, right) => left.source_id.localeCompare(right.source_id));
+    .sort(compareQueueItemsNewestFirst);
 
   return {
     counts: {
@@ -216,6 +262,13 @@ function buildQueueData(scan: RepoScan): ReviewQueueData {
     },
     items,
   };
+}
+
+function compareQueueItemsNewestFirst(left: ReviewQueueItem, right: ReviewQueueItem): number {
+  const leftKey = left.captured_at ?? left.updated_at ?? "";
+  const rightKey = right.captured_at ?? right.updated_at ?? "";
+
+  return rightKey.localeCompare(leftKey) || right.source_id.localeCompare(left.source_id);
 }
 
 function buildRecentIngestItems(scan: RepoScan): ReviewRecentIngestItem[] {
@@ -385,9 +438,10 @@ function buildOrphanItems(scan: RepoScan, lintIssues: readonly LintIssue[]): Rev
     .sort((left, right) => left.path.localeCompare(right.path));
 }
 
-function buildVisibilityWarningItems(lintIssues: readonly LintIssue[]): ReviewLintIssueItem[] {
+function buildVisibilityWarningItems(lintIssues: readonly LintIssue[], profile: WikiProfile | undefined): ReviewLintIssueItem[] {
   return lintIssues
     .filter((issue) => isVisibilityWarningRule(issue.rule_id))
+    .filter((issue) => profile === undefined || matchesFileProfile(issue.path, profile))
     .map(toLintIssueItem)
     .sort((left, right) => left.path.localeCompare(right.path) || left.rule_id.localeCompare(right.rule_id));
 }

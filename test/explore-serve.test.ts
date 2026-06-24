@@ -8,6 +8,7 @@ import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "n
 import { describe, expect, it, vi } from "vitest";
 
 import { runCli } from "../src/cli.js";
+import { writeLocalDaemonRuntimeMetadata } from "../src/quartz/index.js";
 import * as quartzState from "../src/quartz/state.js";
 import { parseInitJson, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
 
@@ -130,7 +131,8 @@ function mockSuccessfulSpawn(): { syncedBeforeServe: () => boolean } {
     const wikiDir = resolve(cwd, "..");
     syncedBeforeServe =
       existsSync(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.local.json")) &&
-      existsSync(resolve(wikiDir, "quartz/content/curated/home.md"));
+      existsSync(resolve(wikiDir, "quartz/content/curated/home.md")) &&
+      existsSync(resolve(wikiDir, "quartz/content/index.md"));
 
     const child = new EventEmitter() as ChildProcessWithoutNullStreams;
     const stdout = new PassThrough();
@@ -169,7 +171,8 @@ function mockLongRunningSpawn(mockOptions: { pid?: number } = {}): {
     const wikiDir = resolve(cwd, "..");
     syncedBeforeServe =
       existsSync(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.local.json")) &&
-      existsSync(resolve(wikiDir, "quartz/content/curated/home.md"));
+      existsSync(resolve(wikiDir, "quartz/content/curated/home.md")) &&
+      existsSync(resolve(wikiDir, "quartz/content/index.md"));
 
     child = new EventEmitter() as ChildProcessWithoutNullStreams;
     if (mockOptions.pid !== undefined) {
@@ -413,7 +416,7 @@ describe("explore serve command", () => {
         host: "127.0.0.1",
         port: 8765,
         ws_port: payload.data.ws_port,
-        url: "http://127.0.0.1:8765/curated/",
+        url: "http://127.0.0.1:8765/",
         state_path: ".llm-wiki/cache/explorer-state.json",
         sync: {
           manifest_path: ".llm-wiki/cache/quartz-manifest.local.json",
@@ -436,7 +439,7 @@ describe("explore serve command", () => {
         "raw/queue/*.json",
       ]);
       expect(state).toMatchObject({
-        url: "http://127.0.0.1:8765/curated/",
+        url: "http://127.0.0.1:8765/",
         profile: "local",
         host: "127.0.0.1",
         port: 8765,
@@ -450,6 +453,61 @@ describe("explore serve command", () => {
       await expect(readFile(resolve(wikiDir, payload.data.state_path), "utf8")).rejects.toMatchObject({
         code: "ENOENT",
       });
+    });
+  });
+
+  it("clears stale daemon metadata during non-daemon serves", async () => {
+    await withTempWorkspace("llm-wiki-explore-serve-no-daemon-metadata-cleanup-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const spawnObservation = mockLongRunningSpawn();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const metadataPath = "quartz/content/_llm-wiki/runtime/local-daemon.json";
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await writeLocalDaemonRuntimeMetadata(wikiDir, {
+        enabled: true,
+        url: "http://127.0.0.1:32123",
+        upload_path: "/api/raw-upload",
+        token_header: "x-llm-wiki-upload-token",
+        upload_token: "stale-token",
+        commit_uploads: false,
+        auto_ingest_available: false,
+      });
+
+      // Act
+      const serveResult = runCli([
+        "explore",
+        "serve",
+        "--repo",
+        wikiDir,
+        "--profile",
+        "local",
+        "--port",
+        "8774",
+        "--json",
+      ], {
+        stdout: (message) => stdout.push(message),
+        stderr: (message) => stderr.push(message),
+        stdin: async () => "",
+      });
+      await spawnObservation.waitUntilStarted();
+      await waitFor(
+        async () => stdout.join("\n"),
+        (content) => content.includes("\"ok\":true"),
+        "serve JSON readiness envelope without daemon metadata",
+      );
+
+      // Assert
+      expect(stderr).toEqual([]);
+      await expect(readFile(resolve(wikiDir, metadataPath), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(parseExploreServe(stdout).data).not.toHaveProperty("daemon");
+
+      spawnObservation.close();
+      await expect(serveResult).resolves.toBe(0);
     });
   });
 
@@ -492,7 +550,7 @@ describe("explore serve command", () => {
         );
 
         const statePath = resolve(wikiDir, ".llm-wiki/cache/explorer-state.json");
-        await expect(readFile(statePath, "utf8")).resolves.toContain("http://127.0.0.1:8766/curated/");
+        await expect(readFile(statePath, "utf8")).resolves.toContain("http://127.0.0.1:8766/");
         const addedSigintListeners = process.listeners("SIGINT").filter((listener) => !beforeSigint.has(listener));
         expect(addedSigintListeners).toHaveLength(1);
 
@@ -635,7 +693,7 @@ describe("explore serve command", () => {
         host: "127.0.0.1",
         port: 8768,
         ws_port: 18768,
-        url: "http://127.0.0.1:8768/curated/",
+        url: "http://127.0.0.1:8768/",
         updated_at: "2026-06-19T00:00:00.000Z",
         watch_paths: [],
       };
@@ -719,12 +777,12 @@ describe("explore serve command", () => {
       await spawnController.waitUntilStarted();
       await waitFor(
         async () => stdout.join("\n"),
-        (content) => content.includes("URL: http://127.0.0.1:8767/curated/"),
+        (content) => content.includes("URL: http://127.0.0.1:8767/"),
         "serve URL",
       );
 
       // Assert
-      expect(stdout.join("\n")).toContain("URL: http://127.0.0.1:8767/curated/");
+      expect(stdout.join("\n")).toContain("URL: http://127.0.0.1:8767/");
       expect(stderr).toEqual([]);
 
       spawnController.close();
@@ -775,7 +833,7 @@ describe("explore serve command", () => {
       expect(exitCode).toBe(1);
       expect(stdout).toHaveLength(1);
       expect(stderr).toEqual([]);
-      expect(payload.data.url).toBe("http://127.0.0.1:8771/curated/");
+      expect(payload.data.url).toBe("http://127.0.0.1:8771/");
     });
   });
 
@@ -1062,7 +1120,7 @@ describe("explore serve command", () => {
       // Assert
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toEqual([]);
-      expect(payload.data.url).toBe("http://127.0.0.1:8766/curated/");
+      expect(payload.data.url).toBe("http://127.0.0.1:8766/");
       expect(syncedCuratedPage).toContain("Curated watcher marker.");
       expect(syncedSourceCard).toContain("Source card watcher marker.");
       expect(syncedQueue).toContain("blocked");
@@ -1161,7 +1219,7 @@ describe("explore serve command", () => {
       // Assert
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toEqual([]);
-      expect(payload.data.url).toBe("http://127.0.0.1:8772/curated/");
+      expect(payload.data.url).toBe("http://127.0.0.1:8772/");
       expect(syncedNestedPage).toContain("Updated nested watcher marker.");
       expect(syncedSourceCard).toContain("Late source card edit marker.");
     });
@@ -1209,7 +1267,7 @@ describe("explore serve command", () => {
       // Assert
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toEqual([]);
-      expect(payload.data.url).toBe("http://127.0.0.1:8773/curated/");
+      expect(payload.data.url).toBe("http://127.0.0.1:8773/");
       expect(afterGeneratedOutputMtimeMs).toBe(beforeGeneratedOutputMtimeMs);
     });
   }, 15_000);

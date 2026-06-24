@@ -351,7 +351,15 @@ describe("local upload daemon", () => {
     await withTempWorkspace("llm-wiki-daemon-cors-loopback-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
-      const origin = "http://127.0.0.1:8080";
+      const origins = [
+        "http://127.0.0.1:8080",
+        "http://127.0.0.1:49152",
+        "http://localhost:3000",
+        "http://localhost:8080",
+        "http://[::1]:43210",
+        "http://[::1]:8080",
+      ];
+      const origin = origins[0] ?? "http://127.0.0.1:8080";
       await initializeWiki(wikiDir);
       const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
 
@@ -361,14 +369,17 @@ describe("local upload daemon", () => {
         form.set("text", "CORS upload body.\n");
 
         // Act
-        const preflight = await fetch(`${daemon.url}/api/raw-upload`, {
-          method: "OPTIONS",
-          headers: {
-            Origin: origin,
-            "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": UPLOAD_TOKEN_HEADER,
-          },
-        });
+        const preflights = await Promise.all(origins.map(async (allowedOrigin) => ({
+          origin: allowedOrigin,
+          response: await fetch(`${daemon.url}/api/raw-upload`, {
+            method: "OPTIONS",
+            headers: {
+              Origin: allowedOrigin,
+              "Access-Control-Request-Method": "POST",
+              "Access-Control-Request-Headers": UPLOAD_TOKEN_HEADER,
+            },
+          }),
+        })));
         const rejectedUpload = await fetch(`${daemon.url}/api/raw-upload`, {
           method: "POST",
           headers: {
@@ -380,10 +391,18 @@ describe("local upload daemon", () => {
         const rejectedBody = await rejectedUpload.json() as UploadFailureEnvelope;
 
         // Assert
-        expect(preflight.status).toBe(204);
-        expect(preflight.headers.get("access-control-allow-origin")).toBe(origin);
-        expect(preflight.headers.get("access-control-allow-methods")).toBe("POST, OPTIONS");
-        expect(preflight.headers.get("access-control-allow-headers")).toContain(UPLOAD_TOKEN_HEADER);
+        for (const { origin: allowedOrigin, response } of preflights) {
+          expect(response.status).toBe(204);
+          expect(response.headers.get("access-control-allow-origin")).toBe(allowedOrigin);
+          expect(response.headers.get("access-control-allow-methods")).toBe("POST, OPTIONS");
+          const allowedHeaders = response.headers.get("access-control-allow-headers")
+            ?.split(",")
+            .map((header) => header.trim().toLowerCase()) ?? [];
+          expect(allowedHeaders).toContain(UPLOAD_TOKEN_HEADER);
+          expect(allowedHeaders).toContain("content-type");
+          expect(response.headers.get("access-control-max-age")).toBe("600");
+          expect(response.headers.get("vary")).toContain("Origin");
+        }
         expect(rejectedUpload.status).toBe(403);
         expect(rejectedUpload.headers.get("access-control-allow-origin")).toBe(origin);
         expect(rejectedBody).toMatchObject({
@@ -853,6 +872,66 @@ describe("local upload daemon", () => {
           severity: "error",
           code: "UPLOAD_CSRF_TOKEN_INVALID",
           path: UPLOAD_TOKEN_HEADER,
+        });
+        expect(commitUpload).not.toHaveBeenCalled();
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("keeps token rejection envelopes unchanged for loopback browser uploads", async () => {
+    await withTempWorkspace("llm-wiki-daemon-cors-csrf-token-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const commitUpload = vi.fn(async () => ({
+        attempted: true,
+        ok: true,
+        committed_paths: ["raw/queue/example.json"],
+      }));
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({
+        repoRoot: wikiDir,
+        port: 0,
+        commitUploads: true,
+        commitUpload,
+      });
+
+      try {
+        const form = new FormData();
+        form.set("title", "Forged Browser Upload");
+        form.set("text", "This should not be captured.\n");
+
+        // Act
+        const response = await fetch(`${daemon.url}/api/raw-upload`, {
+          method: "POST",
+          headers: {
+            origin: "http://127.0.0.1:8080",
+            [UPLOAD_TOKEN_HEADER]: "not-the-daemon-token",
+          },
+          body: form,
+        });
+        const payload = await response.json() as UploadFailureEnvelope;
+
+        // Assert
+        expect(response.status).toBe(403);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://127.0.0.1:8080");
+        expect(payload).toEqual({
+          ok: false,
+          error: {
+            code: "UPLOAD_CSRF_TOKEN_INVALID",
+            message: "Raw upload requests must include a valid upload token.",
+            hint: `Set the ${UPLOAD_TOKEN_HEADER} header to the daemon upload_token value from readiness output.`,
+          },
+          issues: [
+            {
+              severity: "error",
+              code: "UPLOAD_CSRF_TOKEN_INVALID",
+              message: "Raw upload requests must include a valid upload token.",
+              path: UPLOAD_TOKEN_HEADER,
+              hint: `Set the ${UPLOAD_TOKEN_HEADER} header to the daemon upload_token value from readiness output.`,
+            },
+          ],
         });
         expect(commitUpload).not.toHaveBeenCalled();
       } finally {

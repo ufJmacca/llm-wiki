@@ -67,6 +67,18 @@ type QuartzManifest = {
   excluded_paths: string[];
 };
 
+type ReviewFrontmatter = {
+  llm_wiki_review_panel?: boolean;
+  llm_wiki_review_profile?: string;
+  llm_wiki_review_generated_at?: string;
+  llm_wiki_review_counts?: Record<string, number>;
+  llm_wiki_review_links?: Array<{
+    label: string;
+    href: string;
+    count_key?: string;
+  }>;
+};
+
 type SourceCaptureData = {
   status: "added" | "duplicate";
   source: {
@@ -338,6 +350,13 @@ function expectGeneratedReviewFrontmatter(content: string, title: string, compon
   expect(content).toContain(`llm_wiki_component: ${component}`);
 }
 
+function parseGeneratedFrontmatter(content: string): ReviewFrontmatter {
+  const match = /^---\n([\s\S]*?)\n---\n/u.exec(content);
+  expect(match).not.toBeNull();
+
+  return parse(match?.[1] ?? "") as ReviewFrontmatter;
+}
+
 function parseReviewCategoryItems(content: string): unknown[] {
   const match = /```json\n([\s\S]*?)\n```/u.exec(content);
   expect(match).not.toBeNull();
@@ -606,6 +625,33 @@ describe("explore sync command", () => {
       const overviewFrontmatter = parseFrontmatter(overview);
       const sourceQueueFrontmatter = parseFrontmatter(sourceQueue);
       const statusFrontmatter = parseFrontmatter(status);
+      const expectedCounts = {
+        status: 4,
+        source_queue: 4,
+        recent_ingests: 1,
+        needs_review: 1,
+        contradictions: 2,
+        orphans: 1,
+        stale_pages: 1,
+        visibility_warnings: visibilityWarningItems.length,
+        profile_summary: 1,
+      };
+      const expectedLinks = [
+        { label: "Overview", href: "_llm-wiki/review/overview" },
+        { label: "Status", href: "_llm-wiki/review/status", count_key: "status" },
+        { label: "Source queue", href: "_llm-wiki/review/source-queue", count_key: "source_queue" },
+        { label: "Recent ingests", href: "_llm-wiki/review/recent-ingests", count_key: "recent_ingests" },
+        { label: "Needs review", href: "_llm-wiki/review/needs-review", count_key: "needs_review" },
+        { label: "Contradictions", href: "_llm-wiki/review/contradictions", count_key: "contradictions" },
+        { label: "Orphans", href: "_llm-wiki/review/orphans", count_key: "orphans" },
+        { label: "Stale pages", href: "_llm-wiki/review/stale-pages", count_key: "stale_pages" },
+        {
+          label: "Visibility warnings",
+          href: "_llm-wiki/review/visibility-warnings",
+          count_key: "visibility_warnings",
+        },
+        { label: "Profile summary", href: "_llm-wiki/review/profile-summary", count_key: "profile_summary" },
+      ];
 
       // Assert
       expect(result.exitCode).toBe(0);
@@ -613,6 +659,17 @@ describe("explore sync command", () => {
       expect(payload.data.generated_paths).toEqual(expectedLocalReviewGeneratedPaths());
       expect(manifest.generated_files.map((file) => file.content_path)).toEqual(expectedLocalReviewGeneratedPaths());
       expect([...reviewPages.keys()].sort()).toEqual(generatedReviewPagePaths());
+      const reviewPageFrontmatter = [...reviewPages.values()].map(parseGeneratedFrontmatter);
+      expect(reviewPageFrontmatter.every((frontmatter) => frontmatter.llm_wiki_review_panel === true)).toBe(true);
+      expect(reviewPageFrontmatter.every((frontmatter) => frontmatter.llm_wiki_review_profile === "review")).toBe(true);
+      expect(new Set(reviewPageFrontmatter.map((frontmatter) => frontmatter.llm_wiki_review_generated_at)).size).toBe(1);
+      expect(reviewPageFrontmatter[0]?.llm_wiki_review_generated_at).toMatch(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u,
+      );
+      for (const frontmatter of reviewPageFrontmatter) {
+        expect(frontmatter.llm_wiki_review_counts).toEqual(expectedCounts);
+        expect(frontmatter.llm_wiki_review_links).toEqual(expectedLinks);
+      }
       expectGeneratedReviewFrontmatter(overview, "Review Overview", "LlmWikiReviewPanel");
       expectGeneratedReviewFrontmatter(profileSummary, "Profile Summary", "LlmWikiReviewPanel");
       expectGeneratedReviewFrontmatter(sourceQueue, "Source Queue", "LlmWikiQueueDashboard");

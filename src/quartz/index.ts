@@ -815,6 +815,29 @@ type StaticMaterializedPage = StaticReviewPage & {
   source: RepoMarkdownFile;
 };
 
+type ReviewPanelLinkDefinition = {
+  label: string;
+  href: string;
+  countKey?: keyof ReturnType<typeof reviewPanelCounts>;
+};
+
+const REVIEW_PANEL_LINKS: readonly ReviewPanelLinkDefinition[] = [
+  { label: "Overview", href: "_llm-wiki/review/overview" },
+  { label: "Status", href: "_llm-wiki/review/status", countKey: "status" },
+  { label: "Source queue", href: "_llm-wiki/review/source-queue", countKey: "source_queue" },
+  { label: "Recent ingests", href: "_llm-wiki/review/recent-ingests", countKey: "recent_ingests" },
+  { label: "Needs review", href: "_llm-wiki/review/needs-review", countKey: "needs_review" },
+  { label: "Contradictions", href: "_llm-wiki/review/contradictions", countKey: "contradictions" },
+  { label: "Orphans", href: "_llm-wiki/review/orphans", countKey: "orphans" },
+  { label: "Stale pages", href: "_llm-wiki/review/stale-pages", countKey: "stale_pages" },
+  {
+    label: "Visibility warnings",
+    href: "_llm-wiki/review/visibility-warnings",
+    countKey: "visibility_warnings",
+  },
+  { label: "Profile summary", href: "_llm-wiki/review/profile-summary", countKey: "profile_summary" },
+];
+
 function localExplorerPageDefinitions(
   profile: WikiProfile,
   scan: RepoScan,
@@ -855,6 +878,7 @@ function localExplorerPageDefinitions(
       content: reviewCategoryContent({
         title: "Recent Ingests",
         component: "LlmWikiReviewPanel",
+        reviewData,
         category: reviewData.recent_ingests,
       }),
     },
@@ -864,6 +888,7 @@ function localExplorerPageDefinitions(
       content: reviewCategoryContent({
         title: "Needs Review",
         component: "LlmWikiReviewPanel",
+        reviewData,
         category: reviewData.needs_review,
       }),
     },
@@ -873,6 +898,7 @@ function localExplorerPageDefinitions(
       content: reviewCategoryContent({
         title: "Contradictions",
         component: "LlmWikiReviewPanel",
+        reviewData,
         category: reviewData.contradictions,
       }),
     },
@@ -882,6 +908,7 @@ function localExplorerPageDefinitions(
       content: reviewCategoryContent({
         title: "Orphans",
         component: "LlmWikiReviewPanel",
+        reviewData,
         category: reviewData.orphans,
       }),
     },
@@ -891,6 +918,7 @@ function localExplorerPageDefinitions(
       content: reviewCategoryContent({
         title: "Stale Pages",
         component: "LlmWikiReviewPanel",
+        reviewData,
         category: reviewData.stale_pages,
       }),
     },
@@ -900,6 +928,7 @@ function localExplorerPageDefinitions(
       content: reviewCategoryContent({
         title: "Visibility Warnings",
         component: "LlmWikiVisibilityWarning",
+        reviewData,
         category: reviewData.visibility_warnings,
       }),
     },
@@ -2143,7 +2172,8 @@ async function quartzRuntimeEntryMigrationContent(repoRoot: string, entry: Scaff
       return (
         content === componentPlaceholder("LlmWikiReviewPanel", "llm-wiki-review-panel") ||
         content === oldComponentPlaceholder("llm-wiki-review-panel") ||
-        content === reviewPanelComponentContentBeforeBaseAwareLinks()
+        content === reviewPanelComponentContentBeforeBaseAwareLinks() ||
+        content === reviewPanelComponentContentBeforeReviewMetadata()
       )
         ? entry.content
         : null;
@@ -2928,6 +2958,129 @@ function reviewPanelComponentContent(): string {
 import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
 import type { FullSlug } from "../quartz/util/path"
 
+type ReviewLink = {
+  href: FullSlug
+  label: string
+  count_key?: string
+}
+
+const fallbackReviewLinks: ReviewLink[] = [
+  { href: "_llm-wiki/review/overview" as FullSlug, label: "Overview" },
+  { href: "_llm-wiki/review/status" as FullSlug, label: "Status", count_key: "status" },
+  { href: "_llm-wiki/review/source-queue" as FullSlug, label: "Source queue", count_key: "source_queue" },
+  { href: "_llm-wiki/review/recent-ingests" as FullSlug, label: "Recent ingests", count_key: "recent_ingests" },
+  { href: "_llm-wiki/review/needs-review" as FullSlug, label: "Needs review", count_key: "needs_review" },
+  { href: "_llm-wiki/review/contradictions" as FullSlug, label: "Contradictions", count_key: "contradictions" },
+  { href: "_llm-wiki/review/orphans" as FullSlug, label: "Orphans", count_key: "orphans" },
+  { href: "_llm-wiki/review/stale-pages" as FullSlug, label: "Stale pages", count_key: "stale_pages" },
+  { href: "_llm-wiki/review/visibility-warnings" as FullSlug, label: "Visibility warnings", count_key: "visibility_warnings" },
+  { href: "_llm-wiki/review/profile-summary" as FullSlug, label: "Profile summary", count_key: "profile_summary" },
+]
+
+function stringFrontmatterValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null
+}
+
+function recordFrontmatterValue(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function reviewLinksFromFrontmatter(value: unknown): ReviewLink[] {
+  if (!Array.isArray(value)) {
+    return fallbackReviewLinks
+  }
+
+  const links = value.flatMap((entry): ReviewLink[] => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      return []
+    }
+
+    const record = entry as Record<string, unknown>
+    const href = stringFrontmatterValue(record.href)
+    const label = stringFrontmatterValue(record.label)
+    if (href === null || label === null) {
+      return []
+    }
+
+    const countKey = stringFrontmatterValue(record.count_key)
+    return [{
+      href: href as FullSlug,
+      label,
+      ...(countKey === null ? {} : { count_key: countKey }),
+    }]
+  })
+
+  return links.length === 0 ? fallbackReviewLinks : links
+}
+
+function countForLink(counts: Record<string, unknown>, link: ReviewLink): number | null {
+  if (typeof link.count_key !== "string") {
+    return null
+  }
+
+  const value = counts[link.count_key]
+  return typeof value === "number" && Number.isFinite(value) ? value : null
+}
+
+const LlmWikiReviewPanel: QuartzComponent = ({ fileData }) => {
+  const currentSlug = fileData.slug ?? ("index" as FullSlug)
+  const frontmatter = recordFrontmatterValue(fileData.frontmatter)
+  const profile = stringFrontmatterValue(frontmatter.llm_wiki_review_profile)
+  const generatedAt = stringFrontmatterValue(frontmatter.llm_wiki_review_generated_at)
+  const counts = recordFrontmatterValue(frontmatter.llm_wiki_review_counts)
+  const reviewLinks = reviewLinksFromFrontmatter(frontmatter.llm_wiki_review_links)
+  const hasMetadata = profile !== null || generatedAt !== null
+
+  return (
+    <nav class="llm-wiki-review-panel" data-llm-wiki-review-panel="true" aria-label="LLM Wiki review">
+      <h2>Review panel</h2>
+      {hasMetadata ? (
+        <dl>
+          {profile === null ? null : (
+            <div>
+              <dt>Active profile</dt>
+              <dd>{profile}</dd>
+            </div>
+          )}
+          {generatedAt === null ? null : (
+            <div>
+              <dt>Generated</dt>
+              <dd><time dateTime={generatedAt}>{generatedAt}</time></dd>
+            </div>
+          )}
+        </dl>
+      ) : null}
+      <ul>
+        {reviewLinks.map((link) => {
+          const count = countForLink(counts, link)
+
+          return (
+          <li>
+            <a class="internal" href={resolveRelative(currentSlug, link.href)}>
+              {link.label}
+              {count === null ? null : (
+                <span class="llm-wiki-review-panel__count" data-llm-wiki-review-count={link.count_key ?? ""}>
+                  {count}
+                </span>
+              )}
+            </a>
+          </li>
+          )
+        })}
+      </ul>
+    </nav>
+  )
+}
+
+export default (() => LlmWikiReviewPanel) satisfies QuartzComponentConstructor
+`;
+}
+
+function reviewPanelComponentContentBeforeReviewMetadata(): string {
+  return `import { resolveRelative } from "../quartz/util/path"
+import type { QuartzComponent, QuartzComponentConstructor } from "../quartz/components/types"
+import type { FullSlug } from "../quartz/util/path"
+
 const reviewLinks: Array<{ href: FullSlug; label: string }> = [
   { href: "_llm-wiki/review/overview" as FullSlug, label: "Overview" },
   { href: "_llm-wiki/review/source-queue" as FullSlug, label: "Source queue" },
@@ -3304,7 +3457,7 @@ function uploadPageContent(): string {
 }
 
 function reviewOverviewContent(reviewData: ReviewDataModel): string {
-  return `${generatedPageFrontmatter("Review Overview", "LlmWikiReviewPanel", queueDashboardFrontmatterFields(reviewData))}# Review Overview
+  return `${generatedReviewPageFrontmatter("Review Overview", "LlmWikiReviewPanel", reviewData, queueDashboardFrontmatterFields(reviewData))}# Review Overview
 
 ## Status
 
@@ -3333,7 +3486,7 @@ function reviewOverviewContent(reviewData: ReviewDataModel): string {
 }
 
 function reviewStatusContent(reviewData: ReviewDataModel): string {
-  return `${generatedPageFrontmatter("Review Status", "LlmWikiReviewPanel", queueDashboardFrontmatterFields(reviewData))}# Review Status
+  return `${generatedReviewPageFrontmatter("Review Status", "LlmWikiReviewPanel", reviewData, queueDashboardFrontmatterFields(reviewData))}# Review Status
 
 | Status | Count |
 |---|---:|
@@ -3349,7 +3502,7 @@ Generated at: ${reviewData.generated_at}
 function profileSummaryContent(reviewData: ReviewDataModel, scan: RepoScan): string {
   const profile = reviewData.profile;
 
-  return `${generatedPageFrontmatter("Profile Summary", "LlmWikiReviewPanel")}# Profile Summary
+  return `${generatedReviewPageFrontmatter("Profile Summary", "LlmWikiReviewPanel", reviewData)}# Profile Summary
 
 | Field | Value |
 |---|---|
@@ -3377,7 +3530,7 @@ function sourceQueueContent(reviewData: ReviewDataModel): string {
     ].map((value) => escapeTableCell(String(value))).join(" | "),
   );
 
-  return `${generatedPageFrontmatter("Source Queue", "LlmWikiQueueDashboard", queueDashboardFrontmatterFields(reviewData))}# Source Queue
+  return `${generatedReviewPageFrontmatter("Source Queue", "LlmWikiQueueDashboard", reviewData, queueDashboardFrontmatterFields(reviewData))}# Source Queue
 
 | Status | Count |
 |---|---:|
@@ -3419,9 +3572,10 @@ function queueDashboardFrontmatterFields(reviewData: ReviewDataModel): string[] 
 function reviewCategoryContent(options: {
   title: string;
   component: string;
+  reviewData: ReviewDataModel;
   category: ReviewCategory<unknown>;
 }): string {
-  return `${generatedPageFrontmatter(options.title, options.component)}# ${options.title}
+  return `${generatedReviewPageFrontmatter(options.title, options.component, options.reviewData)}# ${options.title}
 
 Count: ${options.category.count}
 
@@ -3456,6 +3610,57 @@ llm_wiki_component: ${component}
 ${extraFrontmatter}---
 
 `;
+}
+
+function generatedReviewPageFrontmatter(
+  title: string,
+  component: string,
+  reviewData: ReviewDataModel,
+  extraFields: readonly string[] = [],
+): string {
+  return generatedPageFrontmatter(title, component, [...reviewPanelFrontmatterFields(reviewData), ...extraFields]);
+}
+
+function reviewPanelFrontmatterFields(reviewData: ReviewDataModel): string[] {
+  const counts = reviewPanelCounts(reviewData);
+
+  return [
+    "llm_wiki_review_panel: true",
+    `llm_wiki_review_profile: ${JSON.stringify(reviewData.profile?.requested_name ?? "unknown")}`,
+    `llm_wiki_review_generated_at: ${JSON.stringify(reviewData.generated_at)}`,
+    "llm_wiki_review_counts:",
+    ...Object.entries(counts).map(([key, count]) => `  ${key}: ${count}`),
+    "llm_wiki_review_links:",
+    ...REVIEW_PANEL_LINKS.flatMap((link) => [
+      `  - label: ${JSON.stringify(link.label)}`,
+      `    href: ${JSON.stringify(link.href)}`,
+      ...(link.countKey === undefined ? [] : [`    count_key: ${JSON.stringify(link.countKey)}`]),
+    ]),
+  ];
+}
+
+function reviewPanelCounts(reviewData: ReviewDataModel): {
+  status: number;
+  source_queue: number;
+  recent_ingests: number;
+  needs_review: number;
+  contradictions: number;
+  orphans: number;
+  stale_pages: number;
+  visibility_warnings: number;
+  profile_summary: number;
+} {
+  return {
+    status: reviewData.queue.counts.total,
+    source_queue: reviewData.queue.counts.total,
+    recent_ingests: reviewData.recent_ingests.count,
+    needs_review: reviewData.needs_review.count,
+    contradictions: reviewData.contradictions.count,
+    orphans: reviewData.orphans.count,
+    stale_pages: reviewData.stale_pages.count,
+    visibility_warnings: reviewData.visibility_warnings.count,
+    profile_summary: reviewData.profile === null ? 0 : 1,
+  };
 }
 
 function llmWikiComponentGateField(component: string): string | null {

@@ -358,9 +358,20 @@ function parseGeneratedFrontmatter(content: string): ReviewFrontmatter {
 }
 
 function parseReviewCategoryItems(content: string): unknown[] {
-  const match = /```json\n([\s\S]*?)\n```/u.exec(content);
-  expect(match).not.toBeNull();
-  return JSON.parse(match?.[1] ?? "[]") as unknown[];
+  const blocks = parseReviewJsonItemBlocks(content);
+  expect(blocks.length).toBeGreaterThan(0);
+  return blocks[0] ?? [];
+}
+
+function parseReviewJsonItemBlocks(content: string): unknown[][] {
+  const matches = [...content.matchAll(/```json\n([\s\S]*?)\n```/gu)];
+  expect(matches.length).toBeGreaterThan(0);
+
+  return matches.map((match) => {
+    const value = JSON.parse(match[1] ?? "[]") as unknown;
+    expect(Array.isArray(value)).toBe(true);
+    return value as unknown[];
+  });
 }
 
 function parseFrontmatter(content: string): Record<string, unknown> {
@@ -728,6 +739,17 @@ describe("explore sync command", () => {
       expectGeneratedReviewFrontmatter(orphans, "Orphans", "LlmWikiReviewPanel");
       expectGeneratedReviewFrontmatter(stalePages, "Stale Pages", "LlmWikiReviewPanel");
       expectGeneratedReviewFrontmatter(visibilityWarnings, "Visibility Warnings", "LlmWikiVisibilityWarning");
+      for (const pageWithSourceRows of [
+        sourceQueue,
+        recentIngests,
+        needsReview,
+        contradictions,
+        orphans,
+        stalePages,
+        visibilityWarnings,
+      ]) {
+        expect(pageWithSourceRows).toContain("llm_wiki_source_badge: true");
+      }
       expect(overview).toContain("| Source queue | 4 |");
       expect(overview).toContain("| Recent ingests | 1 |");
       expect(overview).toContain("| Needs review | 1 |");
@@ -744,6 +766,21 @@ describe("explore sync command", () => {
       expect(profileSummary).toContain("| Raw source cards | 4 |");
       expect(sourceQueue).toContain("| Total | 4 |");
       expect(sourceQueue).toContain(`| ${blocked.sourceId} | Sync Blocked | blocked | url | public | ${blocked.sourceCardPath} | ${blocked.queuePath} | ${blocked.originalPath} |`);
+      expect(parseReviewJsonItemBlocks(sourceQueue)[0] ?? []).toContainEqual(
+        expect.objectContaining({
+          source_id: blocked.sourceId,
+          title: "Sync Blocked",
+          source: expect.objectContaining({
+            source_id: blocked.sourceId,
+            title: "Sync Blocked",
+            source_kind: "url",
+            queue_status: "blocked",
+            visibility: "public",
+            source_card_path: blocked.sourceCardPath,
+            page_path: blocked.sourceCardPath,
+          }),
+        }),
+      );
       expect(status).toContain("| Queued | 1 |");
       expect(status).toContain("| Ingesting | 1 |");
       expect(status).toContain("| Blocked | 1 |");
@@ -755,6 +792,14 @@ describe("explore sync command", () => {
           title: "Sync Ingested",
           source_card_path: ingested.sourceCardPath,
           queue_path: ingested.queuePath,
+          source: expect.objectContaining({
+            source_id: ingested.sourceId,
+            title: "Sync Ingested",
+            source_kind: "text",
+            queue_status: "ingested",
+            visibility: "private",
+            source_card_path: ingested.sourceCardPath,
+          }),
         }),
       ]);
       expect(needsReview).toContain("Count: 1");
@@ -764,6 +809,16 @@ describe("explore sync command", () => {
           title: "Sync Review Question",
           review_status: "needs-human-review",
           source_ids: [queued.sourceId],
+          sources: [
+            expect.objectContaining({
+              source_id: queued.sourceId,
+              title: "Sync Queued",
+              source_kind: "text",
+              queue_status: "queued",
+              visibility: "private",
+              source_card_path: queued.sourceCardPath,
+            }),
+          ],
         }),
       ]);
       expect(contradictions).toContain("Count: 2");
@@ -798,13 +853,36 @@ describe("explore sync command", () => {
           title: "Sync Stale",
           next_review: "2026-06-01",
           source_ids: [ingested.sourceId],
+          sources: [
+            expect.objectContaining({
+              source_id: ingested.sourceId,
+              title: "Sync Ingested",
+              source_kind: "text",
+              queue_status: "ingested",
+              visibility: "private",
+              source_card_path: ingested.sourceCardPath,
+            }),
+          ],
         }),
       ]);
       expect(visibilityWarnings).toContain(`Count: ${visibilityWarningItems.length}`);
+      expect(visibilityWarnings).toContain("| Severity | Reason | Affected path | Public impact | Recommended action |");
       expect(visibilityWarningItems).toEqual(expect.arrayContaining([
         expect.objectContaining({
           path: blocked.sourceCardPath,
           rule_id: "raw_sources_default_private",
+          severity: "error",
+          reason: expect.stringContaining("Raw source card"),
+          public_impact: expect.stringContaining("public output"),
+          recommended_action: "Keep raw source cards private and publish reviewed curated summaries instead.",
+          source: expect.objectContaining({
+            source_id: blocked.sourceId,
+            title: "Sync Blocked",
+            source_kind: "url",
+            queue_status: "blocked",
+            visibility: "public",
+            source_card_path: blocked.sourceCardPath,
+          }),
         }),
         expect.objectContaining({
           path: "curated/questions/sync-review.md",

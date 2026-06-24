@@ -65,6 +65,17 @@ describe("review data model", () => {
           original_path: source.originalPath,
           captured_at: "2026-06-23T08:00:00.000Z",
           updated_at: "2026-06-23T08:30:00.000Z",
+          source: {
+            source_id: source.sourceId,
+            title: "Card Title",
+            source_kind: "url",
+            queue_status: "blocked",
+            visibility: "private",
+            source_card_path: source.sourceCardPath,
+            queue_path: source.queuePath,
+            original_path: source.originalPath,
+            page_path: source.sourceCardPath,
+          },
         },
       ]);
     });

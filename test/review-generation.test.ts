@@ -389,6 +389,75 @@ describe("review data model", () => {
     });
   });
 
+  it("surfaces public raw original warnings even when the review profile excludes originals", async () => {
+    await withTempWorkspace("llm-wiki-review-public-raw-original-warning-", async (repoRoot) => {
+      // Arrange
+      const source = sourceFixture(
+        "src_2026_06_23_public_raw_777777",
+        "Public Raw Leak",
+        "queued",
+        "file",
+        "2026-06-23T09:00:00.000Z",
+      );
+      await writeSourceFixture(repoRoot, source);
+      await writeCuratedPage(
+        repoRoot,
+        "curated/index.md",
+        {
+          type: "index",
+          title: "Index",
+          visibility: "public",
+          source_ids: [],
+        },
+        "# Index\n",
+      );
+      await writeProfile(repoRoot, "public", {
+        name: "public",
+        mode: "deploy",
+        include: ["curated/**", "raw/inputs/**/original.*"],
+        exclude: [],
+        visibility: {
+          required_value: "public",
+        },
+      });
+      await writeProfile(repoRoot, "review", {
+        name: "review",
+        mode: "review",
+        include: ["curated/**", "raw/inputs/**", "raw/queue/**"],
+        exclude: ["raw/inputs/**/original.*"],
+        visibility: {
+          include_private: true,
+        },
+      });
+      const reviewProfile: WikiProfile = {
+        ...profileFixture("review"),
+        include: ["curated/**", "raw/inputs/**", "raw/queue/**"],
+        exclude: ["raw/inputs/**/original.*"],
+      };
+      const scan = await scanWikiRepository(repoRoot);
+
+      // Act
+      const reviewData = buildReviewDataModel(scan, {
+        generatedAt,
+        profile: reviewProfile,
+      });
+
+      // Assert
+      expect(reviewData.visibility_warnings.items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: source.originalPath,
+            rule_id: "public_raw_original_selected",
+            source: expect.objectContaining({
+              source_id: source.sourceId,
+              original_path: source.originalPath,
+            }),
+          }),
+        ]),
+      );
+    });
+  });
+
   it("represents empty review categories with explicit zero counts and item arrays", async () => {
     await withTempWorkspace("llm-wiki-review-data-empty-", async (repoRoot) => {
       // Arrange

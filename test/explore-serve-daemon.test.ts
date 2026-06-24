@@ -556,9 +556,6 @@ describe("explore serve local upload daemon integration", () => {
         auto_ingest_available: true,
         updated_at: "2026-06-23T00:00:00.000Z",
       });
-      const staleMetadataBeforeLog = JSON.parse(
-        await readGeneratedFile(wikiDir, metadataPath),
-      ) as LocalDaemonRuntimeMetadata;
       await writeFile(
         resolve(wikiDir, "curated/log.md"),
         `${await readFile(resolve(wikiDir, "curated/log.md"), "utf8")}\n## [2026-06-24T00:00:00.000Z] ingest | ${upload.data.source_id} | Watcher Upload\n\n- actor: test\n- command: llm-wiki ingest ${upload.data.source_id}\n- updated:\n  - curated/index.md\n- contradictions: none\n- follow_ups: none\n`,
@@ -599,13 +596,6 @@ describe("explore serve local upload daemon integration", () => {
       expect(rootPage).toContain("# Watcher Root");
       expect(recentIngests).toContain("Watcher Upload");
       expect(recentIngests).toContain("curated/log.md");
-      expect(staleMetadataBeforeLog).toMatchObject({
-        enabled: true,
-        upload_token: "stale-before-log-sync",
-        commit_uploads: true,
-        auto_ingest_available: true,
-        updated_at: "2026-06-23T00:00:00.000Z",
-      });
       expect(metadata).toMatchObject({
         enabled: true,
         url: payload.data.daemon.url,

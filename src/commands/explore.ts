@@ -12,6 +12,7 @@ import {
 import { buildQuartzExplorer } from "../quartz/build.js";
 import {
   initializeQuartzRuntime,
+  removeLocalDaemonRuntimeMetadata,
   QuartzOperationError,
   syncQuartzContent,
   writeDisabledLocalDaemonRuntimeMetadataIfCurrent,
@@ -193,6 +194,10 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
   let daemonMetadataWritten = false;
   const profile = typeof rawOptions.profile === "string" ? rawOptions.profile : "local";
   try {
+    if (isPublicLikeProfile(profile)) {
+      await removeLocalDaemonRuntimeMetadata(resolvedRepo.value.rootDir);
+    }
+
     if (rawOptions.withDaemon === true) {
       uploadDaemon = await startUploadDaemon({
         repoRoot: resolvedRepo.value.rootDir,
@@ -276,6 +281,10 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
 
 function isLocalReviewProfile(profile: string): boolean {
   return profile === "local" || profile === "review";
+}
+
+function isPublicLikeProfile(profile: string): boolean {
+  return profile === "public" || profile === "github-pages";
 }
 
 function toRuntimeCommandError(error: unknown, command: string): RuntimeCommandError {

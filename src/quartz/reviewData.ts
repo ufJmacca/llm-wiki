@@ -1,7 +1,7 @@
 import { collectLintIssues, type LintIssue, type LintResult } from "../lint/index.js";
+import { matchesFileProfile, selectMarkdownForProfile, type WikiProfile } from "../profiles/index.js";
 import type { RuntimeLogEntry } from "../scanner/index.js";
 import type { RepoMarkdownFile, RepoScan, SourceCard } from "../scanner/repo.js";
-import { matchesFileProfile, selectMarkdownForProfile, type WikiProfile } from "../profiles/index.js";
 
 export type ReviewDataModel = {
   generated_at: string;
@@ -170,13 +170,13 @@ export function buildReviewDataModel(
   const reviewScan = options.profile === undefined ? scan : filterReviewScanForProfile(scan, options.profile);
   const lintIssues = options.lintResult?.issues ?? collectLintIssues(reviewScan, lintOptionsForProfile(options.profile));
   const visibilityLintIssues = options.lintResult?.issues ?? visibilityLintIssuesForProfile(scan, options.profile, lintIssues);
-  const materializedMarkdownPaths = options.materializedMarkdownPaths ?? selectedMarkdownPaths(scan, options.profile);
+  const materializedMarkdownPaths = options.materializedMarkdownPaths ?? defaultMaterializedMarkdownPaths(options.profile);
   const sourceBadgesById = buildSourceBadgeIndex(reviewScan);
 
   return {
     generated_at: generatedAt.toISOString(),
     profile: options.profile === undefined ? null : toProfileMetadata(options.profile),
-    queue: buildQueueData(reviewScan, sourceBadgesById, materializedMarkdownPaths),
+    queue: buildQueueData(reviewScan, materializedMarkdownPaths, sourceBadgesById),
     recent_ingests: category(buildRecentIngestItems(reviewScan, sourceBadgesById)),
     needs_review: category(buildNeedsReviewItems(reviewScan, sourceBadgesById)),
     contradictions: category(buildContradictionItems(reviewScan, sourceBadgesById)),
@@ -208,12 +208,12 @@ export function filterReviewScanForProfile(scan: RepoScan, profile: WikiProfile)
   };
 }
 
-function selectedMarkdownPaths(scan: RepoScan, profile: WikiProfile | undefined): ReadonlySet<string> | undefined {
+function defaultMaterializedMarkdownPaths(profile: WikiProfile | undefined): ReadonlySet<string> | undefined {
   if (profile === undefined) {
     return undefined;
   }
 
-  return new Set(selectMarkdownForProfile(profile, scan.markdown, scan.rawOriginals).markdown.map((file) => file.path));
+  return new Set();
 }
 
 function lintOptionsForProfile(profile: WikiProfile | undefined): { profile?: string; strict?: boolean } {
@@ -255,8 +255,8 @@ function toProfileMetadata(profile: WikiProfile): ReviewProfileMetadata {
 
 function buildQueueData(
   scan: RepoScan,
-  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
   materializedMarkdownPaths: ReadonlySet<string> | undefined,
+  sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
 ): ReviewQueueData {
   const sourceCardsById = new Map(
     scan.sourceCards.flatMap((card) => (card.source_id === null ? [] : [[card.source_id, card] as const])),
@@ -505,7 +505,7 @@ function buildVisibilityWarningItems(
 
   return lintIssues
     .filter((issue) => isVisibilityWarningRule(issue.rule_id))
-    .filter((issue) => shouldIncludeVisibilityWarningItem(issue, profile))
+    .filter((issue) => shouldIncludeVisibilityWarningItem(issue, profile, sourceBadgesByPath))
     .map((issue) => ({
       ...toLintIssueItem(issue),
       reason: issue.message,
@@ -516,12 +516,16 @@ function buildVisibilityWarningItems(
     .sort((left, right) => left.path.localeCompare(right.path) || left.rule_id.localeCompare(right.rule_id));
 }
 
-function shouldIncludeVisibilityWarningItem(issue: LintIssue, profile: WikiProfile | undefined): boolean {
-  if (profile === undefined || issue.rule_id.startsWith("public_")) {
+function shouldIncludeVisibilityWarningItem(
+  issue: LintIssue,
+  profile: WikiProfile | undefined,
+  sourceBadgesByPath: ReadonlyMap<string, ReviewSourceBadgeData>,
+): boolean {
+  if (profile === undefined || matchesFileProfile(issue.path, profile)) {
     return true;
   }
 
-  return matchesFileProfile(issue.path, profile);
+  return issue.rule_id.startsWith("public_") && sourceBadgesByPath.has(issue.path);
 }
 
 function isVisibilityWarningRule(ruleId: string): boolean {

@@ -294,7 +294,7 @@ describe("review data model", () => {
           status: "blocked",
           visibility: "private",
           source_card_path: blocked.sourceCardPath,
-          source_card_materialized: true,
+          source_card_materialized: false,
           queue_path: blocked.queuePath,
           original_path: blocked.originalPath,
           captured_at: "2026-06-23T09:10:00.000Z",

@@ -4,12 +4,18 @@ import type { CliIo } from "../cli.js";
 import {
   DEFAULT_DAEMON_PORT,
   startUploadDaemon,
+  UPLOAD_TOKEN_HEADER,
   uploadDaemonReady,
   UploadDaemonError,
   type UploadDaemonReady,
 } from "../daemon/index.js";
 import { buildQuartzExplorer } from "../quartz/build.js";
-import { initializeQuartzRuntime, QuartzOperationError, syncQuartzContent } from "../quartz/index.js";
+import {
+  initializeQuartzRuntime,
+  QuartzOperationError,
+  syncQuartzContent,
+  writeLocalDaemonRuntimeMetadata,
+} from "../quartz/index.js";
 import {
   DEFAULT_EXPLORER_HOST,
   DEFAULT_EXPLORER_PORT,
@@ -183,6 +189,8 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
 
   let readyEmitted = false;
   let uploadDaemon: Awaited<ReturnType<typeof startUploadDaemon>> | undefined;
+  let daemonMetadataWritten = false;
+  const profile = typeof rawOptions.profile === "string" ? rawOptions.profile : "local";
   try {
     if (rawOptions.withDaemon === true) {
       uploadDaemon = await startUploadDaemon({
@@ -193,9 +201,25 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
     }
 
     await serveQuartzExplorer(resolvedRepo.value.rootDir, {
-      profile: typeof rawOptions.profile === "string" ? rawOptions.profile : "local",
+      profile,
       host: typeof rawOptions.host === "string" ? rawOptions.host : DEFAULT_EXPLORER_HOST,
       port: normalizePort(rawOptions.port),
+      onSynced: async () => {
+        if (uploadDaemon === undefined || !isLocalReviewProfile(profile)) {
+          return;
+        }
+
+        await writeLocalDaemonRuntimeMetadata(resolvedRepo.value.rootDir, {
+          enabled: true,
+          url: uploadDaemon.url,
+          upload_path: uploadDaemon.uploadPath,
+          token_header: UPLOAD_TOKEN_HEADER,
+          upload_token: uploadDaemon.uploadToken,
+          commit_uploads: uploadDaemon.commitUploads,
+          auto_ingest_available: false,
+        });
+        daemonMetadataWritten = true;
+      },
       onReady: (readyResult, warnings) => {
         readyEmitted = true;
         const data = withDaemonReady(readyResult, uploadDaemon);
@@ -232,7 +256,11 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
 
     throw new CommanderError(1, "llm-wiki.explore.serve", envelope.error.message);
   } finally {
-    await uploadDaemon?.close();
+    const daemon = uploadDaemon;
+    await daemon?.close();
+    if (daemon !== undefined && daemonMetadataWritten && isLocalReviewProfile(profile)) {
+      await writeLocalDaemonRuntimeMetadata(resolvedRepo.value.rootDir, { enabled: false }).catch(() => undefined);
+    }
   }
 
   if (readyEmitted) {
@@ -240,6 +268,10 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
   }
 
   throw new CommanderError(1, "llm-wiki.explore.serve", "Quartz Explorer did not report a startup URL.");
+}
+
+function isLocalReviewProfile(profile: string): boolean {
+  return profile === "local" || profile === "review";
 }
 
 function toRuntimeCommandError(error: unknown, command: string): RuntimeCommandError {

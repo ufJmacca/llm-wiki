@@ -93,10 +93,12 @@ export async function serveQuartzExplorer(
     host?: string;
     port?: number;
     onReady?: (result: QuartzServeReadyResult, warnings: string[]) => void;
+    onSynced?: (result: QuartzSyncResult) => Promise<void>;
   },
 ): Promise<{ data: QuartzServeResult; warnings: string[] }> {
   const syncResult = await syncQuartzContent(repoRoot, options.profile);
   await assertQuartzDependenciesInstalled(repoRoot);
+  await options.onSynced?.(syncResult.data);
 
   const host = options.host ?? DEFAULT_EXPLORER_HOST;
   const port = options.port ?? DEFAULT_EXPLORER_PORT;
@@ -105,7 +107,7 @@ export async function serveQuartzExplorer(
   const watchPaths = [...EXPLORER_WATCH_PATHS];
   const args = ["run", "serve", "--", "--port", String(port), "--wsPort", String(wsPort)];
   const env = quartzServeEnvironment(host);
-  const stopWatching = await startExplorerWatchers(repoRoot, syncResult.data.profile);
+  const stopWatching = await startExplorerWatchers(repoRoot, syncResult.data.profile, options.onSynced);
   let stateRecorded = false;
   let recordedState: ExplorerState | null = null;
   const exitCleanup = {
@@ -132,7 +134,7 @@ export async function serveQuartzExplorer(
       outputTailBytes: QUARTZ_SERVE_OUTPUT_TAIL_BYTES,
       requireReady: true,
       onShutdownSignal: () => {
-        stopWatching();
+        void stopWatching();
         cleanupRecordedStateSync();
       },
       onReady: async (signal) => {
@@ -193,7 +195,7 @@ export async function serveQuartzExplorer(
       },
     });
   } finally {
-    stopWatching();
+    await stopWatching();
     exitCleanup.remove?.();
     if (stateRecorded && recordedState !== null) {
       await removeExplorerStateIfCurrent(repoRoot, recordedState);
@@ -725,11 +727,17 @@ export function syncSummary(
   };
 }
 
-async function startExplorerWatchers(repoRoot: string, profile: QuartzSyncResult["profile"]): Promise<() => void> {
+async function startExplorerWatchers(
+  repoRoot: string,
+  profile: QuartzSyncResult["profile"],
+  onSynced?: (result: QuartzSyncResult) => Promise<void>,
+): Promise<() => Promise<void>> {
   const watchers = new Map<string, FSWatcher>();
   let timeout: NodeJS.Timeout | null = null;
   let syncInFlight = false;
   let closed = false;
+  let syncPromise: Promise<void> | null = null;
+  let stopPromise: Promise<void> | null = null;
 
   const refreshWatchTargets = async (): Promise<void> => {
     for (const path of await existingWatchTargets(repoRoot, profile)) {
@@ -766,22 +774,38 @@ async function startExplorerWatchers(repoRoot: string, profile: QuartzSyncResult
   };
 
   const scheduleSync = (): void => {
+    if (closed) {
+      return;
+    }
+
     if (timeout !== null) {
       clearTimeout(timeout);
     }
 
     timeout = setTimeout(() => {
       timeout = null;
+      if (closed) {
+        return;
+      }
+
       if (syncInFlight) {
         scheduleSync();
         return;
       }
 
       syncInFlight = true;
-      syncQuartzContent(repoRoot, profile, { preserveContentRoot: true })
+      syncPromise = syncQuartzContent(repoRoot, profile, { preserveContentRoot: true })
+        .then(async (syncResult) => {
+          if (closed) {
+            return;
+          }
+
+          await onSynced?.(syncResult.data);
+        })
         .catch(() => undefined)
         .finally(() => {
           syncInFlight = false;
+          syncPromise = null;
         });
     }, 100);
     timeout.unref();
@@ -789,16 +813,21 @@ async function startExplorerWatchers(repoRoot: string, profile: QuartzSyncResult
 
   await refreshWatchTargets();
 
-  return () => {
-    closed = true;
-    if (timeout !== null) {
-      clearTimeout(timeout);
-    }
+  return async () => {
+    stopPromise ??= (async () => {
+      closed = true;
+      if (timeout !== null) {
+        clearTimeout(timeout);
+        timeout = null;
+      }
 
-    for (const watcher of watchers.values()) {
-      watcher.close();
-    }
-    watchers.clear();
+      for (const watcher of watchers.values()) {
+        watcher.close();
+      }
+      watchers.clear();
+      await syncPromise;
+    })();
+    await stopPromise;
   };
 }
 

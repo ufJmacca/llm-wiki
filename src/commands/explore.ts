@@ -12,8 +12,10 @@ import {
 import { buildQuartzExplorer } from "../quartz/build.js";
 import {
   initializeQuartzRuntime,
+  removeLocalDaemonRuntimeMetadata,
   QuartzOperationError,
   syncQuartzContent,
+  writeDisabledLocalDaemonRuntimeMetadataIfCurrent,
   writeLocalDaemonRuntimeMetadata,
 } from "../quartz/index.js";
 import {
@@ -192,6 +194,10 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
   let daemonMetadataWritten = false;
   const profile = typeof rawOptions.profile === "string" ? rawOptions.profile : "local";
   try {
+    if (isPublicLikeProfile(profile)) {
+      await removeLocalDaemonRuntimeMetadata(resolvedRepo.value.rootDir);
+    }
+
     if (rawOptions.withDaemon === true) {
       uploadDaemon = await startUploadDaemon({
         repoRoot: resolvedRepo.value.rootDir,
@@ -259,7 +265,10 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
     const daemon = uploadDaemon;
     await daemon?.close();
     if (daemon !== undefined && daemonMetadataWritten && isLocalReviewProfile(profile)) {
-      await writeLocalDaemonRuntimeMetadata(resolvedRepo.value.rootDir, { enabled: false }).catch(() => undefined);
+      await writeDisabledLocalDaemonRuntimeMetadataIfCurrent(resolvedRepo.value.rootDir, {
+        url: daemon.url,
+        upload_token: daemon.uploadToken,
+      }).catch(() => undefined);
     }
   }
 
@@ -272,6 +281,10 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
 
 function isLocalReviewProfile(profile: string): boolean {
   return profile === "local" || profile === "review";
+}
+
+function isPublicLikeProfile(profile: string): boolean {
+  return profile === "public" || profile === "github-pages";
 }
 
 function toRuntimeCommandError(error: unknown, command: string): RuntimeCommandError {

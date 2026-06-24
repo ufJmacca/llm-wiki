@@ -139,34 +139,11 @@ export const GITHUB_PAGES_CNAME_CACHE_PATH = ".llm-wiki/cache/github-pages-CNAME
 const QUARTZ_BUILD_HOMEPAGE_SOURCE_PATH = "curated/index.md";
 const QUARTZ_BUILD_HOMEPAGE_CONTENT_PATH = "quartz/content/index.md";
 const QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH = "quartz/content/_llm-wiki/runtime/local-daemon.json";
+const QUARTZ_QUEUE_DASHBOARD_COMPONENT_PATH = "quartz/components/LlmWikiQueueDashboard.tsx";
+const QUARTZ_REVIEW_PANEL_COMPONENT_PATH = "quartz/components/LlmWikiReviewPanel.tsx";
+const QUARTZ_SOURCE_BADGE_COMPONENT_PATH = "quartz/components/LlmWikiSourceBadge.tsx";
 const QUARTZ_UPLOAD_FORM_COMPONENT_PATH = "quartz/components/LlmWikiUploadForm.tsx";
-const QUARTZ_LAYOUT_COMPONENTS = [
-  {
-    path: "quartz/components/LlmWikiQueueDashboard.tsx",
-    componentName: "LlmWikiQueueDashboard",
-    className: "llm-wiki-queue-dashboard",
-  },
-  {
-    path: "quartz/components/LlmWikiReviewPanel.tsx",
-    componentName: "LlmWikiReviewPanel",
-    className: "llm-wiki-review-panel",
-  },
-  {
-    path: "quartz/components/LlmWikiSourceBadge.tsx",
-    componentName: "LlmWikiSourceBadge",
-    className: "llm-wiki-source-badge",
-  },
-  {
-    path: QUARTZ_UPLOAD_FORM_COMPONENT_PATH,
-    componentName: "LlmWikiUploadForm",
-    className: "llm-wiki-upload-form",
-  },
-  {
-    path: "quartz/components/LlmWikiVisibilityWarning.tsx",
-    componentName: "LlmWikiVisibilityWarning",
-    className: "llm-wiki-visibility-warning",
-  },
-] as const;
+const QUARTZ_VISIBILITY_WARNING_COMPONENT_PATH = "quartz/components/LlmWikiVisibilityWarning.tsx";
 const QUARTZ_PARENT_GITIGNORE_PATH = "quartz/.gitignore";
 const QUARTZ_PARENT_CONTENT_IGNORE_RULE = "content/";
 const QUARTZ_RUNTIME_IGNORE_RULE = "quartz/quartz/";
@@ -425,6 +402,19 @@ export async function writeLocalDaemonRuntimeMetadata(
       message: "Failed to write local daemon runtime metadata.",
       path: QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH,
       hint: writeResult.error.hint,
+    });
+  }
+}
+
+export async function removeLocalDaemonRuntimeMetadata(repoRoot: string): Promise<void> {
+  try {
+    await rm(resolve(repoRoot, QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH), { force: true });
+  } catch (error) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to remove local daemon runtime metadata.",
+      path: QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH,
+      hint: error instanceof Error ? error.message : String(error),
     });
   }
 }
@@ -2106,77 +2096,73 @@ async function quartzRuntimeEntryMigrationContent(repoRoot: string, entry: Scaff
       )
         ? entry.content
         : null;
-    case "quartz/quartz.layout.ts": {
-      const componentsSupportDefaultLayoutImports = await llmWikiLayoutComponentsSupportDefaultImports(repoRoot);
-
-      if (content === OLD_PLACEHOLDER_QUARTZ_LAYOUT) {
-        return componentsSupportDefaultLayoutImports ? entry.content : quartzLayoutContentBeforeUploadForm();
-      }
-
-      if (
-        content === quartzLayoutContentBeforeReviewGates() ||
-        content === quartzLayoutContentBeforeSourceBadge()
-      ) {
-        return componentsSupportDefaultLayoutImports ? entry.content : null;
-      }
-
-      if (content === quartzLayoutContentBeforeUploadForm()) {
-        return componentsSupportDefaultLayoutImports ? entry.content : null;
-      }
-
-      return null;
-    }
-    case "quartz/components/LlmWikiQueueDashboard.tsx":
-      return (
-        content === componentPlaceholder("LlmWikiQueueDashboard", "llm-wiki-queue-dashboard") ||
-        content === oldComponentPlaceholder("llm-wiki-queue-dashboard")
-      )
-        ? entry.content
-        : null;
-    case "quartz/components/LlmWikiReviewPanel.tsx":
-      return (
-        content === componentPlaceholder("LlmWikiReviewPanel", "llm-wiki-review-panel") ||
-        content === oldComponentPlaceholder("llm-wiki-review-panel") ||
-        content === reviewPanelComponentContentBeforeBaseAwareLinks()
-      )
-        ? entry.content
-        : null;
-    case "quartz/components/LlmWikiSourceBadge.tsx":
-      return (
-        content === componentPlaceholder("LlmWikiSourceBadge", "llm-wiki-source-badge") ||
-        content === oldComponentPlaceholder("llm-wiki-source-badge")
-      )
-        ? entry.content
-        : null;
+    case "quartz/quartz.layout.ts":
+      return await quartzLayoutMigrationContent(repoRoot, content);
+    case QUARTZ_QUEUE_DASHBOARD_COMPONENT_PATH:
+      return isMigratableQueueDashboardComponent(content) ? entry.content : null;
+    case QUARTZ_REVIEW_PANEL_COMPONENT_PATH:
+      return isMigratableReviewPanelComponent(content) ? entry.content : null;
+    case QUARTZ_SOURCE_BADGE_COMPONENT_PATH:
+      return isMigratableSourceBadgeComponent(content) ? entry.content : null;
     case QUARTZ_UPLOAD_FORM_COMPONENT_PATH:
       return isMigratableUploadFormComponent(content) ? entry.content : null;
-    case "quartz/components/LlmWikiVisibilityWarning.tsx":
-      return (
-        content === componentPlaceholder("LlmWikiVisibilityWarning", "llm-wiki-visibility-warning") ||
-        content === oldComponentPlaceholder("llm-wiki-visibility-warning")
-      )
-        ? entry.content
-        : null;
+    case QUARTZ_VISIBILITY_WARNING_COMPONENT_PATH:
+      return isMigratableVisibilityWarningComponent(content) ? entry.content : null;
     default:
       return null;
   }
 }
 
-async function llmWikiLayoutComponentsSupportDefaultImports(repoRoot: string): Promise<boolean> {
-  const componentSupport = await Promise.all(
-    QUARTZ_LAYOUT_COMPONENTS.map((component) => llmWikiLayoutComponentSupportsDefaultImport(repoRoot, component)),
-  );
+async function quartzLayoutMigrationContent(repoRoot: string, content: string): Promise<string | null> {
+  const migratable =
+    content === OLD_PLACEHOLDER_QUARTZ_LAYOUT ||
+    content === quartzLayoutContentWithoutGeneratedComponents() ||
+    content === quartzLayoutContentBeforeUploadForm() ||
+    content === quartzLayoutContentBeforeReviewGates() ||
+    content === quartzLayoutContentBeforeSourceBadge();
+  if (!migratable) {
+    return null;
+  }
 
-  return componentSupport.every(Boolean);
+  const migrationContent = quartzLayoutContent({
+    includeQueueDashboard: await componentSupportsDefaultLayoutImport(
+      repoRoot,
+      QUARTZ_QUEUE_DASHBOARD_COMPONENT_PATH,
+      isMigratableQueueDashboardComponent,
+    ),
+    includeReviewPanel: await componentSupportsDefaultLayoutImport(
+      repoRoot,
+      QUARTZ_REVIEW_PANEL_COMPONENT_PATH,
+      isMigratableReviewPanelComponent,
+    ),
+    includeSourceBadge: await componentSupportsDefaultLayoutImport(
+      repoRoot,
+      QUARTZ_SOURCE_BADGE_COMPONENT_PATH,
+      isMigratableSourceBadgeComponent,
+    ),
+    includeUploadForm: await componentSupportsDefaultLayoutImport(
+      repoRoot,
+      QUARTZ_UPLOAD_FORM_COMPONENT_PATH,
+      isMigratableUploadFormComponent,
+    ),
+    includeVisibilityWarning: await componentSupportsDefaultLayoutImport(
+      repoRoot,
+      QUARTZ_VISIBILITY_WARNING_COMPONENT_PATH,
+      isMigratableVisibilityWarningComponent,
+    ),
+  });
+
+  return migrationContent === content ? null : migrationContent;
 }
 
-async function llmWikiLayoutComponentSupportsDefaultImport(
+async function componentSupportsDefaultLayoutImport(
   repoRoot: string,
-  component: (typeof QUARTZ_LAYOUT_COMPONENTS)[number],
+  path: string,
+  isMigratableComponent: (content: string) => boolean,
 ): Promise<boolean> {
   let content: string;
   try {
-    content = await readFile(resolve(repoRoot, component.path), "utf8");
+    content = await readFile(resolve(repoRoot, path), "utf8");
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
       return true;
@@ -2184,31 +2170,40 @@ async function llmWikiLayoutComponentSupportsDefaultImport(
 
     throw new QuartzOperationError({
       code: "QUARTZ_WRITE_FAILED",
-      message: `Failed to inspect Quartz runtime file: ${component.path}.`,
-      path: component.path,
+      message: `Failed to inspect Quartz runtime file: ${path}.`,
+      path,
       hint: error instanceof Error ? error.message : String(error),
     });
   }
 
-  return isMigratableLayoutComponent(content, component) || hasDefaultExport(content);
+  return isMigratableComponent(content) || hasDefaultExport(content);
+}
+
+function isMigratableQueueDashboardComponent(content: string): boolean {
+  return isMigratableGeneratedComponent(content, "LlmWikiQueueDashboard", "llm-wiki-queue-dashboard");
+}
+
+function isMigratableReviewPanelComponent(content: string): boolean {
+  return (
+    isMigratableGeneratedComponent(content, "LlmWikiReviewPanel", "llm-wiki-review-panel") ||
+    content === reviewPanelComponentContentBeforeBaseAwareLinks()
+  );
+}
+
+function isMigratableSourceBadgeComponent(content: string): boolean {
+  return isMigratableGeneratedComponent(content, "LlmWikiSourceBadge", "llm-wiki-source-badge");
 }
 
 function isMigratableUploadFormComponent(content: string): boolean {
-  const uploadFormComponent = QUARTZ_LAYOUT_COMPONENTS.find(
-    (component) => component.path === QUARTZ_UPLOAD_FORM_COMPONENT_PATH,
-  );
-  return uploadFormComponent !== undefined && isMigratableLayoutComponent(content, uploadFormComponent);
+  return isMigratableGeneratedComponent(content, "LlmWikiUploadForm", "llm-wiki-upload-form");
 }
 
-function isMigratableLayoutComponent(
-  content: string,
-  component: (typeof QUARTZ_LAYOUT_COMPONENTS)[number],
-): boolean {
-  return (
-    content === componentPlaceholder(component.componentName, component.className) ||
-    content === oldComponentPlaceholder(component.className) ||
-    (component.componentName === "LlmWikiReviewPanel" && content === reviewPanelComponentContentBeforeBaseAwareLinks())
-  );
+function isMigratableVisibilityWarningComponent(content: string): boolean {
+  return isMigratableGeneratedComponent(content, "LlmWikiVisibilityWarning", "llm-wiki-visibility-warning");
+}
+
+function isMigratableGeneratedComponent(content: string, componentName: string, className: string): boolean {
+  return content === componentPlaceholder(componentName, className) || content === oldComponentPlaceholder(className);
 }
 
 function hasDefaultExport(content: string): boolean {
@@ -2417,15 +2412,76 @@ export default config
 `;
 }
 
-function quartzLayoutContent(options: { includeSourceBadge?: boolean } = {}): string {
+function quartzLayoutContent(options: {
+  includeQueueDashboard?: boolean;
+  includeReviewPanel?: boolean;
+  includeSourceBadge?: boolean;
+  includeUploadForm?: boolean;
+  includeVisibilityWarning?: boolean;
+} = {}): string {
+  const includeQueueDashboard = options.includeQueueDashboard !== false;
+  const includeReviewPanel = options.includeReviewPanel !== false;
   const includeSourceBadge = options.includeSourceBadge !== false;
+  const includeUploadForm = options.includeUploadForm !== false;
+  const includeVisibilityWarning = options.includeVisibilityWarning !== false;
+  const imports = [
+    includeQueueDashboard ? 'import LlmWikiQueueDashboard from "./components/LlmWikiQueueDashboard"\n' : "",
+    includeReviewPanel ? 'import LlmWikiReviewPanel from "./components/LlmWikiReviewPanel"\n' : "",
+    includeSourceBadge ? 'import LlmWikiSourceBadge from "./components/LlmWikiSourceBadge"\n' : "",
+    includeUploadForm ? 'import LlmWikiUploadForm from "./components/LlmWikiUploadForm"\n' : "",
+    includeVisibilityWarning ? 'import LlmWikiVisibilityWarning from "./components/LlmWikiVisibilityWarning"\n' : "",
+  ].join("");
+  const visibilityWarningBlock = includeVisibilityWarning
+    ? `    Component.ConditionalRender({
+      component: LlmWikiVisibilityWarning(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_visibility_warning === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiVisibilityWarning",
+    }),
+`
+    : "";
+  const sourceBadgeBlock = includeSourceBadge
+    ? `    Component.ConditionalRender({
+      component: LlmWikiSourceBadge(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_source_badge === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiSourceBadge" ||
+        typeof page.fileData.frontmatter?.source_id === "string" ||
+        typeof page.fileData.frontmatter?.source_card_path === "string",
+    }),
+`
+    : "";
+  const uploadFormBlock = includeUploadForm
+    ? `    Component.ConditionalRender({
+      component: LlmWikiUploadForm(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_upload === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiUploadForm",
+    }),
+`
+    : "";
+  const queueDashboardBlock = includeQueueDashboard
+    ? `    Component.ConditionalRender({
+      component: LlmWikiQueueDashboard(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_queue_dashboard === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiQueueDashboard",
+    }),
+`
+    : "";
+  const reviewPanelBlock = includeReviewPanel
+    ? `    Component.ConditionalRender({
+      component: LlmWikiReviewPanel(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_review_panel === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiReviewPanel",
+    }),
+`
+    : "";
 
   return `import { PageLayout, SharedLayout } from "./quartz/cfg"
 import * as Component from "./quartz/components"
-import LlmWikiQueueDashboard from "./components/LlmWikiQueueDashboard"
-import LlmWikiReviewPanel from "./components/LlmWikiReviewPanel"
-${includeSourceBadge ? 'import LlmWikiSourceBadge from "./components/LlmWikiSourceBadge"\n' : ""}import LlmWikiUploadForm from "./components/LlmWikiUploadForm"
-import LlmWikiVisibilityWarning from "./components/LlmWikiVisibilityWarning"
+${imports}
 
 export const sharedPageComponents: SharedLayout = {
   head: Component.Head(),
@@ -2445,39 +2501,7 @@ export const defaultContentPageLayout = {
     Component.ArticleTitle(),
     Component.ContentMeta(),
     Component.TagList(),
-    Component.ConditionalRender({
-      component: LlmWikiVisibilityWarning(),
-      condition: (page) =>
-        page.fileData.frontmatter?.llm_wiki_visibility_warning === true ||
-        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiVisibilityWarning",
-    }),
-${includeSourceBadge ? `    Component.ConditionalRender({
-      component: LlmWikiSourceBadge(),
-      condition: (page) =>
-        page.fileData.frontmatter?.llm_wiki_source_badge === true ||
-        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiSourceBadge" ||
-        typeof page.fileData.frontmatter?.source_id === "string" ||
-        typeof page.fileData.frontmatter?.source_card_path === "string",
-    }),
-` : ""}    Component.ConditionalRender({
-      component: LlmWikiUploadForm(),
-      condition: (page) =>
-        page.fileData.frontmatter?.llm_wiki_upload === true ||
-        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiUploadForm",
-    }),
-    Component.ConditionalRender({
-      component: LlmWikiQueueDashboard(),
-      condition: (page) =>
-        page.fileData.frontmatter?.llm_wiki_queue_dashboard === true ||
-        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiQueueDashboard",
-    }),
-    Component.ConditionalRender({
-      component: LlmWikiReviewPanel(),
-      condition: (page) =>
-        page.fileData.frontmatter?.llm_wiki_review_panel === true ||
-        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiReviewPanel",
-    }),
-  ],
+${visibilityWarningBlock}${sourceBadgeBlock}${uploadFormBlock}${queueDashboardBlock}${reviewPanelBlock}  ],
   left: [
     Component.PageTitle(),
     Component.MobileOnly(Component.Spacer()),
@@ -2523,6 +2547,16 @@ export const defaultListPageLayout: PageLayout = {
 
 function quartzLayoutContentBeforeSourceBadge(): string {
   return quartzLayoutContent({ includeSourceBadge: false });
+}
+
+function quartzLayoutContentWithoutGeneratedComponents(): string {
+  return quartzLayoutContent({
+    includeQueueDashboard: false,
+    includeReviewPanel: false,
+    includeSourceBadge: false,
+    includeUploadForm: false,
+    includeVisibilityWarning: false,
+  });
 }
 
 function quartzLayoutContentBeforeUploadForm(): string {

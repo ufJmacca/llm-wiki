@@ -663,7 +663,7 @@ export default (() => LlmWikiReviewPanel) satisfies QuartzComponentConstructor
     });
   });
 
-  it("does not migrate the prior generated layout when a customized non-upload component lacks a default export", async () => {
+  it("migrates the prior generated layout without importing a customized non-upload component", async () => {
     await withTempWorkspace("llm-wiki-explore-init-custom-queue-named-export-", async (workspaceDir) => {
       // Arrange
       execFileMock.mockReset();
@@ -724,9 +724,13 @@ export default (() => LlmWikiReviewPanel) satisfies QuartzComponentConstructor
       const updatedWarning = payload.warnings.find((warning) =>
         warning.startsWith("Updated generated Quartz runtime files:"),
       );
-      expect(updatedWarning).not.toEqual(expect.stringContaining("quartz/quartz.layout.ts"));
+      expect(updatedWarning).toEqual(expect.stringContaining("quartz/quartz.layout.ts"));
       expect(updatedWarning).not.toEqual(expect.stringContaining("quartz/components/LlmWikiQueueDashboard.tsx"));
-      expect(layout).toBe(priorGeneratedLayout);
+      expect(layout).not.toBe(priorGeneratedLayout);
+      expect(layout).toContain('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"');
+      expect(layout).toContain('import LlmWikiReviewPanel from "./components/LlmWikiReviewPanel"');
+      expect(layout).toContain('import LlmWikiSourceBadge from "./components/LlmWikiSourceBadge"');
+      expect(layout).toContain('import LlmWikiVisibilityWarning from "./components/LlmWikiVisibilityWarning"');
       expect(layout).not.toContain('import LlmWikiQueueDashboard from "./components/LlmWikiQueueDashboard"');
       expect(layout).not.toContain("LlmWikiQueueDashboard()");
       expect(queueDashboardComponent).toBe(customizedQueueDashboard);

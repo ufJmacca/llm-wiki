@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { execFile, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { promisify } from "node:util";
@@ -270,6 +270,128 @@ describe("explore build command", () => {
         },
       });
       await expect(readFile(resolve(wikiDir, "quartz/content/index.md"), "utf8")).resolves.toContain("# Index");
+    });
+  });
+
+  it("rejects generated runtime metadata before public Quartz build", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-generated-runtime-leak-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/content/_llm-wiki/runtime"), { recursive: true });
+      await writeFile(
+        resolve(wikiDir, "quartz/content/_llm-wiki/runtime/local-daemon.json"),
+        '{"enabled":true,"token_header":"x-llm-wiki-upload-token","upload_token":"redacted"}\n',
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"]);
+      const payload = parseExploreBuildFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(payload.error).toEqual({
+        code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+        message: "Public profile leak check failed: public_quartz_runtime_metadata_leak.",
+        hint: "Remove generated local daemon metadata from quartz/content before syncing or building public Quartz output.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+          path: "quartz/content/_llm-wiki/runtime/local-daemon.json",
+        }),
+      ]);
+    });
+  });
+
+  it.each([
+    {
+      name: "missing",
+      prepareIndex: async (wikiDir: string) => {
+        await rm(resolve(wikiDir, "curated/index.md"));
+      },
+    },
+    {
+      name: "non-public",
+      prepareIndex: async (wikiDir: string) => {
+        const index = await readFile(resolve(wikiDir, "curated/index.md"), "utf8");
+        await writeFile(resolve(wikiDir, "curated/index.md"), index.replace(/^visibility: public$/m, "visibility: private"), "utf8");
+      },
+    },
+  ])("does not generate a private local home page when curated/index.md is $name for public build", async ({ prepareIndex }) => {
+    await withTempWorkspace("llm-wiki-explore-build-public-index-required-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await prepareIndex(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"]);
+      const payload = parseExploreBuildFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(["PUBLIC_LINT_FAILED", "QUARTZ_CONTENT_UNSAFE"]).toContain(payload.error.code);
+      expect(existsSync(resolve(wikiDir, "quartz/content/index.md"))).toBe(false);
+    });
+  });
+
+  it.each([
+    {
+      name: "missing",
+      prepareIndex: async (wikiDir: string) => {
+        await rm(resolve(wikiDir, "curated/index.md"));
+      },
+    },
+    {
+      name: "non-public",
+      prepareIndex: async (wikiDir: string) => {
+        const index = await readFile(resolve(wikiDir, "curated/index.md"), "utf8");
+        await writeFile(resolve(wikiDir, "curated/index.md"), index.replace(/^visibility: public$/m, "visibility: private"), "utf8");
+      },
+    },
+  ])("does not generate a private local home page when curated/index.md is $name for github-pages build", async ({ prepareIndex }) => {
+    await withTempWorkspace("llm-wiki-explore-build-github-pages-index-required-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      const publicProfile = await readFile(resolve(wikiDir, ".llm-wiki/profiles/public.yml"), "utf8");
+      await writeFile(
+        resolve(wikiDir, ".llm-wiki/profiles/github-pages.yml"),
+        publicProfile.replace(
+          /^name: public\nmode: deploy\n/u,
+          "name: github-pages\nmode: deploy\nbase_url: https://docs.example.com\n",
+        ),
+        "utf8",
+      );
+      await prepareIndex(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "github-pages", "--json"]);
+      const payload = parseExploreBuildFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(["PUBLIC_LINT_FAILED", "QUARTZ_CONTENT_UNSAFE"]).toContain(payload.error.code);
+      expect(existsSync(resolve(wikiDir, "quartz/content/index.md"))).toBe(false);
     });
   });
 

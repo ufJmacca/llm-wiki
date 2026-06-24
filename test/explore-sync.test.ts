@@ -1604,6 +1604,51 @@ visibility:
     },
   );
 
+  it.each(["public", "github-pages"] as const)(
+    "rejects generated local Explorer leaks before %s sync output",
+    async (profile) => {
+      await withTempWorkspace(`llm-wiki-explore-sync-${profile}-generated-leak-`, async (workspaceDir) => {
+        // Arrange
+        const wikiDir = resolve(workspaceDir, "wiki");
+        await initializeWiki(wikiDir);
+        await makeDefaultCuratedPagesPublic(wikiDir);
+        if (profile === "github-pages") {
+          await prepareGitHubPagesSyncProfile(wikiDir);
+        }
+        const leakedUploadPath = "quartz/content/_llm-wiki/upload.md";
+        await mkdir(resolve(wikiDir, "quartz/content/_llm-wiki"), { recursive: true });
+        await writeFile(
+          resolve(wikiDir, leakedUploadPath),
+          "---\ntype: dashboard\ntitle: Upload\nvisibility: private\nllm_wiki_upload: true\n---\n\n# Upload\n",
+          "utf8",
+        );
+
+        // Act
+        const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", profile, "--json"]);
+        const payload = parseExploreSyncFailure(result.stdout);
+
+        // Assert
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toEqual([]);
+        expect(payload.error).toEqual({
+          code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+          message: "Public profile leak check failed: public_quartz_upload_page_leak.",
+          hint: "Remove generated upload pages from quartz/content before syncing or building public Quartz output.",
+        });
+        expect(payload.issues).toEqual([
+          expect.objectContaining({
+            severity: "error",
+            code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+            path: leakedUploadPath,
+            hint: "Remove generated upload pages from quartz/content before syncing or building public Quartz output.",
+          }),
+        ]);
+        expect(await pathExists(resolve(wikiDir, leakedUploadPath))).toBe(true);
+        expect(await pathExists(resolve(wikiDir, `.llm-wiki/cache/quartz-manifest.${profile}.json`))).toBe(false);
+      });
+    },
+  );
+
   it("materializes public and github-pages profiles without private pages, raw cards, or raw originals", async () => {
     await withTempWorkspace("llm-wiki-explore-sync-public-", async (workspaceDir) => {
       // Arrange

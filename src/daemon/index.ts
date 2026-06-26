@@ -27,8 +27,12 @@ export const RAW_UPLOAD_PATH = "/api/raw-upload" as const;
 export const UPLOAD_TOKEN_HEADER = "x-llm-wiki-upload-token" as const;
 
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
-const MAX_UPLOAD_FIELD_BYTES = MAX_UPLOAD_BYTES;
+const MAX_UPLOAD_FIELD_BYTES = 1024 * 1024;
 const MAX_UPLOAD_FIELDS = 20;
+const ALLOWED_FILE_EXTENSIONS = new Set([".md", ".markdown", ".txt", ".pdf"]);
+const ALLOWED_FILE_MIME_TYPES = new Set(["text/markdown", "text/plain", "application/pdf"]);
+const MARKDOWN_FILE_EXTENSIONS = new Set([".md", ".markdown"]);
+const DEFAULT_BROWSER_FILE_MIME_TYPES = new Set(["", "application/octet-stream"]);
 const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const CORS_ALLOWED_METHODS = "POST, OPTIONS";
 const CORS_ALLOWED_HEADERS = `${UPLOAD_TOKEN_HEADER}, content-type`;
@@ -82,15 +86,16 @@ export type UploadDaemonErrorCode =
   | "DAEMON_HOST_NOT_LOCAL"
   | "DAEMON_LISTEN_FAILED"
   | "DAEMON_PORT_INVALID"
+  | "UPLOAD_AUTH_FAILED"
   | "UPLOAD_COMMIT_FAILED"
   | "UPLOAD_CONTENT_TYPE_UNSUPPORTED"
-  | "UPLOAD_CSRF_TOKEN_INVALID"
   | "UPLOAD_METHOD_NOT_ALLOWED"
   | "UPLOAD_MULTIPART_INVALID"
   | "UPLOAD_NOT_FOUND"
   | "UPLOAD_ORIGIN_NOT_ALLOWED"
   | "UPLOAD_PAYLOAD_INVALID"
   | "UPLOAD_TOO_LARGE"
+  | "UPLOAD_TYPE_UNSUPPORTED"
   | SourceCaptureError["code"];
 
 export class UploadDaemonError extends Error {
@@ -148,6 +153,7 @@ type UploadApiData = {
   source_card_path: string;
   original_path: string;
   created_paths: string[];
+  message: string;
   commit: UploadCommitResult;
 };
 
@@ -175,6 +181,7 @@ type PreparedUploadPayload =
 
 type UploadedFile = {
   fileName: string;
+  mimeType: string;
   content: Buffer;
   tooLarge: boolean;
 };
@@ -528,6 +535,11 @@ async function prepareUploadPayload(
       }));
     }
 
+    const fileType = validateUploadedFileType(upload.value.file);
+    if (!fileType.ok) {
+      return fileType;
+    }
+
     return ok({
       kind: "file",
       title,
@@ -537,6 +549,25 @@ async function prepareUploadPayload(
   }
 
   if (text !== undefined) {
+    if (title === undefined || title.trim() === "") {
+      return err(new UploadDaemonError({
+        code: "UPLOAD_PAYLOAD_INVALID",
+        message: "Text uploads require a title.",
+        path: "title",
+        hint: "Include a non-empty title field with pasted text uploads.",
+        statusCode: 400,
+      }));
+    }
+    if (text.length === 0) {
+      return err(new UploadDaemonError({
+        code: "UPLOAD_PAYLOAD_INVALID",
+        message: "Text uploads require a non-empty text field.",
+        path: "text",
+        hint: "Include pasted text content before uploading.",
+        statusCode: 400,
+      }));
+    }
+
     return ok({
       kind: "text",
       title: title ?? "",
@@ -622,8 +653,8 @@ async function parseMultipartUpload(request: IncomingMessage): Promise<Result<Mu
     const busboy = Busboy({
       headers: request.headers,
       limits: {
-        fileSize: MAX_UPLOAD_BYTES,
-        fieldSize: MAX_UPLOAD_FIELD_BYTES,
+        fileSize: MAX_UPLOAD_BYTES + 1,
+        fieldSize: MAX_UPLOAD_FIELD_BYTES + 1,
         files: 1,
         fields: MAX_UPLOAD_FIELDS,
       },
@@ -686,6 +717,10 @@ async function parseMultipartUpload(request: IncomingMessage): Promise<Result<Mu
         settle(err(truncatedFieldError(name, info)));
         return;
       }
+      if (Buffer.byteLength(value, "utf8") > MAX_UPLOAD_FIELD_BYTES) {
+        settle(err(oversizedFieldError(name)));
+        return;
+      }
 
       const existing = fields.get(name) ?? [];
       existing.push(value);
@@ -713,10 +748,12 @@ async function parseMultipartUpload(request: IncomingMessage): Promise<Result<Mu
         tooLarge = true;
       });
       stream.on("end", () => {
+        const content = Buffer.concat(chunks);
         file = {
           fileName: info.filename || "upload.bin",
-          content: Buffer.concat(chunks),
-          tooLarge,
+          mimeType: normalizeMimeType(info.mimeType),
+          content,
+          tooLarge: tooLarge || content.byteLength > MAX_UPLOAD_BYTES,
         };
       });
     });
@@ -752,15 +789,55 @@ function validateUploadToken(request: IncomingMessage, expectedToken: string): R
   const actualToken = request.headers[UPLOAD_TOKEN_HEADER];
   if (typeof actualToken !== "string" || !constantTimeEquals(actualToken, expectedToken)) {
     return err(new UploadDaemonError({
-      code: "UPLOAD_CSRF_TOKEN_INVALID",
-      message: "Raw upload requests must include a valid upload token.",
+      code: "UPLOAD_AUTH_FAILED",
+      message: "Upload authentication failed.",
       path: UPLOAD_TOKEN_HEADER,
-      hint: `Set the ${UPLOAD_TOKEN_HEADER} header to the daemon upload_token value from readiness output.`,
+      hint: "Refresh the local Explorer session and retry the upload.",
       statusCode: 403,
     }));
   }
 
   return ok(undefined);
+}
+
+function validateUploadedFileType(file: UploadedFile): Result<void, UploadDaemonError> {
+  const extension = uploadedFileExtension(file.fileName);
+  if (!ALLOWED_FILE_EXTENSIONS.has(extension)) {
+    return err(new UploadDaemonError({
+      code: "UPLOAD_TYPE_UNSUPPORTED",
+      message: "File uploads must use .md, .markdown, .txt, or .pdf extensions.",
+      path: "file",
+      hint: "Upload Markdown, plain text, or PDF files.",
+      statusCode: 415,
+    }));
+  }
+
+  if (!isAllowedUploadedFileMimeType(extension, file.mimeType)) {
+    return err(new UploadDaemonError({
+      code: "UPLOAD_TYPE_UNSUPPORTED",
+      message: "File uploads must use text/markdown, text/plain, or application/pdf MIME types.",
+      path: "file",
+      hint: "Upload Markdown, plain text, or PDF files with a supported content type.",
+      statusCode: 415,
+    }));
+  }
+
+  return ok(undefined);
+}
+
+function isAllowedUploadedFileMimeType(extension: string, mimeType: string): boolean {
+  return ALLOWED_FILE_MIME_TYPES.has(mimeType) ||
+    (MARKDOWN_FILE_EXTENSIONS.has(extension) && DEFAULT_BROWSER_FILE_MIME_TYPES.has(mimeType));
+}
+
+function uploadedFileExtension(fileName: string): string {
+  const safeFileName = basename(fileName.trim() || "upload.bin").toLowerCase();
+  const dotIndex = safeFileName.lastIndexOf(".");
+  return dotIndex >= 0 ? safeFileName.slice(dotIndex) : "";
+}
+
+function normalizeMimeType(mimeType: string): string {
+  return mimeType.split(";")[0]?.trim().toLowerCase() ?? "";
 }
 
 function constantTimeEquals(actual: string, expected: string): boolean {
@@ -781,6 +858,16 @@ function truncatedFieldError(name: string, info: FieldInfo): UploadDaemonError {
       ? "Multipart field name exceeds the upload limit."
       : `Multipart field "${name}" exceeds the ${MAX_UPLOAD_FIELD_BYTES} byte limit.`,
     path,
+    hint: "Upload a smaller text, URL, or title value, or capture it locally with llm-wiki add-text.",
+    statusCode: 413,
+  });
+}
+
+function oversizedFieldError(name: string): UploadDaemonError {
+  return new UploadDaemonError({
+    code: "UPLOAD_TOO_LARGE",
+    message: `Multipart field "${name}" exceeds the ${MAX_UPLOAD_FIELD_BYTES} byte limit.`,
+    path: name,
     hint: "Upload a smaller text, URL, or title value, or capture it locally with llm-wiki add-text.",
     statusCode: 413,
   });
@@ -890,6 +977,9 @@ function toUploadApiData(capture: SourceCaptureSuccess, commit: UploadCommitResu
     source_card_path: capture.source.source_card_path,
     original_path: capture.source.original_path,
     created_paths: capture.created_paths,
+    message: capture.status === "added"
+      ? "Raw source uploaded and queued for ingest."
+      : "Raw source was already captured; no new artifacts were created.",
     commit,
   };
 }

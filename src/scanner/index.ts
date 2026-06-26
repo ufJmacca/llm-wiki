@@ -93,6 +93,9 @@ export type QueueItem = {
   title: string;
   kind: string;
   source_kind?: string;
+  uploader?: string;
+  upload_session_id?: string;
+  uploaded_via?: string;
   status: "queued" | "ingesting" | "ingested" | "blocked";
   path: string;
   original_path: string;

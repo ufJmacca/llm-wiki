@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import Busboy, { type FieldInfo, type FileInfo } from "busboy";
@@ -14,6 +14,7 @@ import {
   type PreparedUrlSource,
   type SourceCaptureError,
   type SourceCaptureSuccess,
+  type SourceCaptureUploadProvenance,
 } from "../sourceCapture/index.js";
 import { gitCommandEnv } from "../utils/git.js";
 import { err, ok, type Result } from "../utils/result.js";
@@ -39,6 +40,7 @@ export type UploadDaemon = {
   url: string;
   uploadPath: typeof RAW_UPLOAD_PATH;
   uploadToken: string;
+  uploadSessionId: string;
   commitUploads: boolean;
   close: () => Promise<void>;
 };
@@ -49,6 +51,7 @@ export type UploadDaemonReady = {
   url: string;
   upload_path: typeof RAW_UPLOAD_PATH;
   upload_token: string;
+  upload_session_id: string;
   commit_uploads: boolean;
 };
 
@@ -183,6 +186,7 @@ type UploadRequestOptions = {
   commitUploads: boolean;
   commitUpload: UploadCommitter;
   uploadToken: string;
+  uploadSessionId: string;
   pendingUploadCommits: PendingUploadCommits;
 };
 
@@ -222,6 +226,7 @@ export async function startUploadDaemon(options: UploadDaemonOptions): Promise<U
   const commitUpload = options.commitUpload ?? commitUploadWithGit;
   const pendingUploadCommits: PendingUploadCommits = new Map();
   const uploadToken = randomBytes(32).toString("hex");
+  const uploadSessionId = `upl_${randomBytes(8).toString("hex")}`;
   const server = createServer((request, response) => {
     void handleDaemonRequest(
       {
@@ -229,6 +234,7 @@ export async function startUploadDaemon(options: UploadDaemonOptions): Promise<U
         commitUploads,
         commitUpload,
         uploadToken,
+        uploadSessionId,
         pendingUploadCommits,
       },
       request,
@@ -257,6 +263,7 @@ export async function startUploadDaemon(options: UploadDaemonOptions): Promise<U
     url: daemonUrl(address.address, actualPort),
     uploadPath: RAW_UPLOAD_PATH,
     uploadToken,
+    uploadSessionId,
     commitUploads,
     close: async () => {
       if (closed) {
@@ -270,7 +277,7 @@ export async function startUploadDaemon(options: UploadDaemonOptions): Promise<U
 }
 
 export function uploadDaemonReady(
-  daemon: Pick<UploadDaemon, "host" | "port" | "url" | "uploadToken" | "commitUploads">,
+  daemon: Pick<UploadDaemon, "host" | "port" | "url" | "uploadToken" | "uploadSessionId" | "commitUploads">,
 ): UploadDaemonReady {
   return {
     host: daemon.host,
@@ -278,6 +285,7 @@ export function uploadDaemonReady(
     url: daemon.url,
     upload_path: RAW_UPLOAD_PATH,
     upload_token: daemon.uploadToken,
+    upload_session_id: daemon.uploadSessionId,
     commit_uploads: daemon.commitUploads,
   };
 }
@@ -454,7 +462,7 @@ async function captureAndCommitUpload(
   options: UploadRequestOptions,
   payload: PreparedUploadPayload,
 ): Promise<Result<UploadWorkSuccess, UploadDaemonError>> {
-  const capture = await capturePreparedUpload(options.repoRoot, payload);
+  const capture = await capturePreparedUpload(options, payload);
   if (!capture.ok) {
     return err(capture.error);
   }
@@ -561,33 +569,49 @@ async function prepareUploadPayload(
 }
 
 async function capturePreparedUpload(
-  repoRoot: string,
+  options: Pick<UploadRequestOptions, "repoRoot" | "uploadSessionId">,
   payload: PreparedUploadPayload,
 ): Promise<Result<SourceCaptureSuccess, UploadDaemonError>> {
   if (payload.kind === "file") {
     return mapCaptureResult(await captureUploadedFileSource({
-      repoRoot,
+      repoRoot: options.repoRoot,
       title: payload.title,
       fileName: payload.fileName,
       content: payload.content,
       command: "llm-wiki explore serve --with-daemon upload file",
+      uploadProvenance: localUploadProvenance(options.uploadSessionId, safeUploadOrigin(payload.fileName)),
     }));
   }
 
   if (payload.kind === "text") {
     return mapCaptureResult(await captureTextSource({
-      repoRoot,
+      repoRoot: options.repoRoot,
       title: payload.title,
       text: payload.text,
       command: "llm-wiki explore serve --with-daemon upload text",
+      uploadProvenance: localUploadProvenance(options.uploadSessionId, "text"),
     }));
   }
 
   return mapCaptureResult(await capturePreparedUrlSource({
-    repoRoot,
+    repoRoot: options.repoRoot,
     source: payload.source,
     command: "llm-wiki explore serve --with-daemon upload url",
+    uploadProvenance: localUploadProvenance(options.uploadSessionId, "url"),
   }));
+}
+
+function localUploadProvenance(uploadSessionId: string, originKind: string): SourceCaptureUploadProvenance {
+  return {
+    origin: `local-upload:${originKind}`,
+    uploader: "local",
+    upload_session_id: uploadSessionId,
+    uploaded_via: "local-explorer",
+  };
+}
+
+function safeUploadOrigin(fileName: string): string {
+  return basename(fileName.trim() || "upload.bin");
 }
 
 async function parseMultipartUpload(request: IncomingMessage): Promise<Result<MultipartUpload, UploadDaemonError>> {

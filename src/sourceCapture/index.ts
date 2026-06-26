@@ -23,6 +23,9 @@ export type CapturedSource = {
   source_kind: SourceKind;
   origin: string;
   origin_url?: string;
+  uploader?: string;
+  upload_session_id?: string;
+  uploaded_via?: string;
   captured_at: string;
   content_hash: string;
   visibility: "private";
@@ -60,6 +63,13 @@ export type SourceCaptureError = {
   hint: string;
 };
 
+export type SourceCaptureUploadProvenance = {
+  origin?: string;
+  uploader: string;
+  upload_session_id: string;
+  uploaded_via: string;
+};
+
 export type CaptureFileSourceOptions = {
   repoRoot: string;
   sourcePath: string;
@@ -74,6 +84,7 @@ export type CaptureTextSourceOptions = {
   title: string;
   now?: Date;
   command?: string;
+  uploadProvenance?: SourceCaptureUploadProvenance;
 };
 
 export type CaptureUploadedFileSourceOptions = {
@@ -83,6 +94,7 @@ export type CaptureUploadedFileSourceOptions = {
   title?: string;
   now?: Date;
   command?: string;
+  uploadProvenance?: SourceCaptureUploadProvenance;
 };
 
 export type CaptureUrlSourceOptions = {
@@ -91,6 +103,7 @@ export type CaptureUrlSourceOptions = {
   title?: string;
   now?: Date;
   command?: string;
+  uploadProvenance?: SourceCaptureUploadProvenance;
 };
 
 export type PreparedUrlSource = {
@@ -104,6 +117,7 @@ export type CapturePreparedUrlSourceOptions = {
   source: PreparedUrlSource;
   now?: Date;
   command?: string;
+  uploadProvenance?: SourceCaptureUploadProvenance;
 };
 
 type CaptureInput = {
@@ -112,6 +126,9 @@ type CaptureInput = {
   sourceKind: SourceKind;
   origin: string;
   originUrl?: string;
+  uploader?: string;
+  upload_session_id?: string;
+  uploaded_via?: string;
   originalExtension: string;
   content: Buffer;
   now: Date;
@@ -123,6 +140,20 @@ type FetchedUrlText = {
   text: string;
 };
 
+function uploadProvenanceFields(
+  uploadProvenance: SourceCaptureUploadProvenance | undefined,
+): Pick<CaptureInput, "uploader" | "upload_session_id" | "uploaded_via"> {
+  if (uploadProvenance === undefined) {
+    return {};
+  }
+
+  return {
+    uploader: uploadProvenance.uploader,
+    upload_session_id: uploadProvenance.upload_session_id,
+    uploaded_via: uploadProvenance.uploaded_via,
+  };
+}
+
 type QueueJson = {
   kind: SourceKind;
   source_id: string;
@@ -130,6 +161,9 @@ type QueueJson = {
   source_kind: SourceKind;
   origin: string;
   origin_url?: string;
+  uploader?: string;
+  upload_session_id?: string;
+  uploaded_via?: string;
   captured_at: string;
   content_hash: string;
   status: QueueStatus;
@@ -144,6 +178,9 @@ type SourceCardDuplicateMetadata = {
   source_kind: SourceKind;
   origin: string;
   origin_url?: string | null;
+  uploader?: string;
+  upload_session_id?: string;
+  uploaded_via?: string;
   captured_at: string;
   content_hash: string;
   status: QueueStatus;
@@ -202,7 +239,8 @@ export async function captureTextSource(
     repoRoot: options.repoRoot,
     title: title.value,
     sourceKind: "text",
-    origin: "pasted_text",
+    origin: options.uploadProvenance?.origin ?? "pasted_text",
+    ...uploadProvenanceFields(options.uploadProvenance),
     originalExtension: "md",
     content: Buffer.from(options.text, "utf8"),
     now: options.now ?? new Date(),
@@ -223,7 +261,8 @@ export async function captureUploadedFileSource(
     repoRoot: options.repoRoot,
     title: title.value,
     sourceKind: "file",
-    origin: `upload:${safeFileName}`,
+    origin: options.uploadProvenance?.origin ?? `local-upload:${safeFileName}`,
+    ...uploadProvenanceFields(options.uploadProvenance),
     originalExtension: normalizeOriginalExtension(extname(safeFileName), "bin"),
     content: options.content,
     now: options.now ?? new Date(),
@@ -244,6 +283,7 @@ export async function captureUrlSource(
     source: prepared.value,
     now: options.now,
     command: options.command ?? `llm-wiki add-url ${prepared.value.url}`,
+    uploadProvenance: options.uploadProvenance,
   });
 }
 
@@ -279,8 +319,9 @@ export async function capturePreparedUrlSource(
     repoRoot: options.repoRoot,
     title: options.source.title,
     sourceKind: "url",
-    origin: "url",
+    origin: options.uploadProvenance?.origin ?? "url",
     originUrl: options.source.url,
+    ...uploadProvenanceFields(options.uploadProvenance),
     originalExtension: "md",
     content: Buffer.from(options.source.text, "utf8"),
     now: options.now ?? new Date(),
@@ -317,6 +358,9 @@ async function captureSource(input: CaptureInput): Promise<Result<SourceCaptureS
     source_kind: input.sourceKind,
     origin: input.origin,
     ...(input.originUrl === undefined ? {} : { origin_url: input.originUrl }),
+    ...(input.uploader === undefined ? {} : { uploader: input.uploader }),
+    ...(input.upload_session_id === undefined ? {} : { upload_session_id: input.upload_session_id }),
+    ...(input.uploaded_via === undefined ? {} : { uploaded_via: input.uploaded_via }),
     captured_at: capturedAt,
     content_hash: contentHash,
     visibility: "private",
@@ -618,6 +662,9 @@ async function validateQueueDuplicate(
     source_kind: queueItem.source_kind,
     origin: queueItem.origin,
     ...(typeof queueItem.origin_url === "string" ? { origin_url: queueItem.origin_url } : {}),
+    ...(typeof queueItem.uploader === "string" ? { uploader: queueItem.uploader } : {}),
+    ...(typeof queueItem.upload_session_id === "string" ? { upload_session_id: queueItem.upload_session_id } : {}),
+    ...(typeof queueItem.uploaded_via === "string" ? { uploaded_via: queueItem.uploaded_via } : {}),
     captured_at: queueItem.captured_at,
     content_hash: contentHash,
     visibility: "private",
@@ -652,6 +699,9 @@ function queueDuplicateMatchesSourceCard(queueItem: QueueJson, sourceCard: Sourc
     queueItem.source_kind === sourceCard.source_kind &&
     queueItem.origin === sourceCard.origin &&
     queueOriginUrl === sourceCardOriginUrl &&
+    comparableOptionalString(queueItem.uploader) === comparableOptionalString(sourceCard.uploader) &&
+    comparableOptionalString(queueItem.upload_session_id) === comparableOptionalString(sourceCard.upload_session_id) &&
+    comparableOptionalString(queueItem.uploaded_via) === comparableOptionalString(sourceCard.uploaded_via) &&
     queueItem.captured_at === sourceCard.captured_at &&
     queueItem.status === sourceCard.status &&
     queueItem.visibility === sourceCard.visibility
@@ -746,6 +796,9 @@ async function findDuplicateSourceCard(
       source_kind: sourceCard.source_kind,
       origin: sourceCard.origin,
       ...(typeof sourceCard.origin_url === "string" ? { origin_url: sourceCard.origin_url } : {}),
+      ...(typeof sourceCard.uploader === "string" ? { uploader: sourceCard.uploader } : {}),
+      ...(typeof sourceCard.upload_session_id === "string" ? { upload_session_id: sourceCard.upload_session_id } : {}),
+      ...(typeof sourceCard.uploaded_via === "string" ? { uploaded_via: sourceCard.uploaded_via } : {}),
       captured_at: sourceCard.captured_at,
       content_hash: contentHash,
       visibility: "private",
@@ -950,6 +1003,9 @@ function isValidDuplicateQueueItem(value: unknown, contentHash: string): value i
     value.kind === value.source_kind &&
     isNonEmptyString(value.origin) &&
     (value.source_kind !== "url" || isNonEmptyString(value.origin_url)) &&
+    isOptionalString(value.uploader) &&
+    isOptionalString(value.upload_session_id) &&
+    isOptionalString(value.uploaded_via) &&
     isNonEmptyString(value.captured_at) &&
     isQueueStatus(value.status) &&
     value.visibility === "private" &&
@@ -992,6 +1048,9 @@ function isValidDuplicateSourceCard(
     isNonEmptyString(value.origin) &&
     (value.source_kind !== "url" || isNonEmptyString(value.origin_url)) &&
     (value.source_kind === "url" || value.origin_url === undefined || typeof value.origin_url === "string" || value.origin_url === null) &&
+    isOptionalString(value.uploader) &&
+    isOptionalString(value.upload_session_id) &&
+    isOptionalString(value.uploaded_via) &&
     isNonEmptyString(value.captured_at) &&
     isQueueStatus(value.status) &&
     value.visibility === "private"
@@ -1004,6 +1063,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim() !== "";
+}
+
+function isOptionalString(value: unknown): value is string | undefined {
+  return value === undefined || typeof value === "string";
+}
+
+function comparableOptionalString(value: string | undefined): string {
+  return value ?? "";
 }
 
 function isSourceKind(value: unknown): value is SourceKind {
@@ -1057,6 +1124,15 @@ function toQueueJson(source: CapturedSource): QueueJson {
   if (source.origin_url !== undefined) {
     queueJson.origin_url = source.origin_url;
   }
+  if (source.uploader !== undefined) {
+    queueJson.uploader = source.uploader;
+  }
+  if (source.upload_session_id !== undefined) {
+    queueJson.upload_session_id = source.upload_session_id;
+  }
+  if (source.uploaded_via !== undefined) {
+    queueJson.uploaded_via = source.uploaded_via;
+  }
 
   return queueJson;
 }
@@ -1069,6 +1145,9 @@ function formatSourceCard(source: CapturedSource): string {
     source_kind: source.source_kind,
     origin: source.origin,
     origin_url: source.origin_url ?? null,
+    ...(source.uploader === undefined ? {} : { uploader: source.uploader }),
+    ...(source.upload_session_id === undefined ? {} : { upload_session_id: source.upload_session_id }),
+    ...(source.uploaded_via === undefined ? {} : { uploaded_via: source.uploaded_via }),
     captured_at: source.captured_at,
     content_hash: source.content_hash,
     status: source.queue_status,

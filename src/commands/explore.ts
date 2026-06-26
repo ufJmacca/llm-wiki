@@ -231,6 +231,7 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
           upload_path: uploadDaemon.uploadPath,
           token_header: UPLOAD_TOKEN_HEADER,
           upload_token: uploadDaemon.uploadToken,
+          upload_session_id: uploadDaemon.uploadSessionId,
           commit_uploads: uploadDaemon.commitUploads,
           auto_ingest_available: false,
         });
@@ -420,6 +421,7 @@ function formatHumanExploreServeReady(result: QuartzServeReadyResult | (QuartzSe
 
   if ("daemon" in result) {
     lines.push(`Upload endpoint: ${result.daemon.url}${result.daemon.upload_path}`);
+    lines.push(`Upload session ID: ${result.daemon.upload_session_id}`);
     lines.push(`Upload token header: x-llm-wiki-upload-token: ${result.daemon.upload_token}`);
     lines.push(`Commit uploads: ${result.daemon.commit_uploads ? "enabled" : "disabled"}`);
   }

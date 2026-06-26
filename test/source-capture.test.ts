@@ -6,7 +6,7 @@ import { parse } from "yaml";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parseLogEntries } from "../src/scanner/index.js";
-import { captureFileSource, captureTextSource } from "../src/sourceCapture/index.js";
+import { captureFileSource, captureTextSource, captureUploadedFileSource } from "../src/sourceCapture/index.js";
 import { writeBinaryFileNoOverwriteInsideRoot } from "../src/utils/fs.js";
 import {
   parseInitJson,
@@ -178,6 +178,9 @@ describe("source capture core", () => {
         content_hash: string;
         status: string;
         visibility: string;
+        uploader?: unknown;
+        upload_session_id?: unknown;
+        uploaded_via?: unknown;
       }>(await readGeneratedFile(wikiDir, `${sourceDir}/_source.md`));
       expect(sourceCard).toMatchObject({
         type: "raw_source",
@@ -190,6 +193,9 @@ describe("source capture core", () => {
         status: "queued",
         visibility: "private",
       });
+      expect(sourceCard).not.toHaveProperty("uploader");
+      expect(sourceCard).not.toHaveProperty("upload_session_id");
+      expect(sourceCard).not.toHaveProperty("uploaded_via");
       const queueItem = JSON.parse(await readGeneratedFile(wikiDir, `raw/queue/${sourceId}.json`)) as {
         kind: string;
         source_id: string;
@@ -199,6 +205,9 @@ describe("source capture core", () => {
         path: string;
         original_path: string;
         content_hash: string;
+        uploader?: unknown;
+        upload_session_id?: unknown;
+        uploaded_via?: unknown;
       };
       expect(queueItem).toMatchObject({
         kind: "file",
@@ -210,6 +219,9 @@ describe("source capture core", () => {
         original_path: `${sourceDir}/original.md`,
         content_hash: `sha256:${hash}`,
       });
+      expect(queueItem).not.toHaveProperty("uploader");
+      expect(queueItem).not.toHaveProperty("upload_session_id");
+      expect(queueItem).not.toHaveProperty("uploaded_via");
 
       const log = await readGeneratedFile(wikiDir, "curated/log.md");
       const parsedLog = parseLogEntries({ path: "curated/log.md", content: log });
@@ -270,6 +282,7 @@ describe("source capture core", () => {
       vi.setSystemTime(new Date(capturedAt));
       const wikiDir = resolve(workspaceDir, "wiki");
       const text = "A pasted note about local-first capture.\n";
+      const hash = sha256Hex(text);
       const sourceId = expectedSourceId("Pasted Capture", text);
       const sourceDir = `raw/inputs/2026/06/${sourceId}`;
       await initializeWiki(wikiDir);
@@ -290,37 +303,218 @@ describe("source capture core", () => {
       // Assert
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toEqual([]);
-      expect(payload.data.source).toMatchObject({
-        source_id: sourceId,
-        source_kind: "text",
-        origin: "pasted_text",
-        visibility: "private",
-        queue_status: "queued",
-        original_path: `${sourceDir}/original.md`,
-        source_card_path: `${sourceDir}/_source.md`,
-        queue_path: `raw/queue/${sourceId}.json`,
+      expect(payload).toEqual({
+        ok: true,
+        command: "add-text",
+        repo: wikiDir,
+        data: {
+          status: "added",
+          source: {
+            source_id: sourceId,
+            title: "Pasted Capture",
+            source_kind: "text",
+            origin: "pasted_text",
+            captured_at: capturedAt,
+            content_hash: `sha256:${hash}`,
+            visibility: "private",
+            queue_status: "queued",
+            original_path: `${sourceDir}/original.md`,
+            source_card_path: `${sourceDir}/_source.md`,
+            queue_path: `raw/queue/${sourceId}.json`,
+          },
+          created_paths: [
+            `${sourceDir}/original.md`,
+            `${sourceDir}/_source.md`,
+            `raw/queue/${sourceId}.json`,
+          ],
+        },
+        warnings: [],
       });
       expect(await readGeneratedFile(wikiDir, `${sourceDir}/original.md`)).toBe(text);
       const sourceCard = parseSourceCardFrontmatter<{
+        type: string;
+        source_id: string;
+        title: string;
         source_kind: string;
         origin: string;
+        origin_url: null;
+        captured_at: string;
+        content_hash: string;
         status: string;
         visibility: string;
+        tags: [];
+        curated_summary: null;
+        ingested_at: null;
+        supersedes: null;
+        superseded_by: null;
       }>(await readGeneratedFile(wikiDir, `${sourceDir}/_source.md`));
-      expect(sourceCard).toMatchObject({
+      expect(sourceCard).toEqual({
+        type: "raw_source",
+        source_id: sourceId,
+        title: "Pasted Capture",
         source_kind: "text",
         origin: "pasted_text",
+        origin_url: null,
+        captured_at: capturedAt,
+        content_hash: `sha256:${hash}`,
         status: "queued",
         visibility: "private",
+        tags: [],
+        curated_summary: null,
+        ingested_at: null,
+        supersedes: null,
+        superseded_by: null,
       });
       const queueItem = JSON.parse(await readGeneratedFile(wikiDir, `raw/queue/${sourceId}.json`)) as {
         kind: string;
+        source_id: string;
+        title: string;
         source_kind: string;
+        origin: string;
+        captured_at: string;
+        content_hash: string;
+        status: string;
+        visibility: string;
+        path: string;
+        original_path: string;
+      };
+      expect(queueItem).toEqual({
+        kind: "text",
+        source_id: sourceId,
+        title: "Pasted Capture",
+        source_kind: "text",
+        origin: "pasted_text",
+        captured_at: capturedAt,
+        content_hash: `sha256:${hash}`,
+        status: "queued",
+        visibility: "private",
+        path: `${sourceDir}/_source.md`,
+        original_path: `${sourceDir}/original.md`,
+      });
+    });
+  });
+
+  it("records local Explorer upload provenance in uploaded source cards and queue JSON", async () => {
+    await withTempWorkspace("llm-wiki-upload-provenance-", async (workspaceDir) => {
+      // Arrange
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(capturedAt));
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const content = "# Uploaded Session Note\n\nPrivate upload provenance.\n";
+      const hash = sha256Hex(content);
+      const sourceId = expectedSourceId("Uploaded Session Note", content);
+      const sourceDir = `raw/inputs/2026/06/${sourceId}`;
+      const uploadProvenance = {
+        origin: "local-upload:Session Note.md",
+        uploader: "local",
+        upload_session_id: "upl_0123456789abcdef",
+        uploaded_via: "local-explorer",
+      };
+      await initializeWiki(wikiDir);
+
+      // Act
+      const capture = await captureUploadedFileSource({
+        repoRoot: wikiDir,
+        fileName: "Session Note.md",
+        title: "Uploaded Session Note",
+        content: Buffer.from(content, "utf8"),
+        now: new Date(capturedAt),
+        uploadProvenance,
+      });
+      if (!capture.ok) {
+        throw new Error(capture.error.message);
+      }
+      const beforeDuplicate = await readTreeSnapshot(wikiDir);
+      const duplicate = await captureUploadedFileSource({
+        repoRoot: wikiDir,
+        fileName: "Session Note Copy.md",
+        title: "Uploaded Session Note Copy",
+        content: Buffer.from(content, "utf8"),
+        now: new Date(capturedAt),
+        uploadProvenance: {
+          ...uploadProvenance,
+          origin: "local-upload:Session Note Copy.md",
+          upload_session_id: "upl_fedcba9876543210",
+        },
+      });
+      const afterDuplicate = await readTreeSnapshot(wikiDir);
+
+      // Assert
+      expect(capture.value).toMatchObject({
+        status: "added",
+        source: {
+          source_id: sourceId,
+          title: "Uploaded Session Note",
+          source_kind: "file",
+          origin: "local-upload:Session Note.md",
+          content_hash: `sha256:${hash}`,
+          visibility: "private",
+          queue_status: "queued",
+          original_path: `${sourceDir}/original.md`,
+          source_card_path: `${sourceDir}/_source.md`,
+          queue_path: `raw/queue/${sourceId}.json`,
+          uploader: "local",
+          upload_session_id: "upl_0123456789abcdef",
+          uploaded_via: "local-explorer",
+        },
+        created_paths: [
+          `${sourceDir}/original.md`,
+          `${sourceDir}/_source.md`,
+          `raw/queue/${sourceId}.json`,
+        ],
+      });
+      const sourceCard = parseSourceCardFrontmatter<{
+        origin: string;
+        uploader: string;
+        upload_session_id: string;
+        uploaded_via: string;
+        status: string;
+        visibility: string;
+        content_hash: string;
+      }>(await readGeneratedFile(wikiDir, `${sourceDir}/_source.md`));
+      expect(sourceCard).toMatchObject({
+        origin: "local-upload:Session Note.md",
+        uploader: "local",
+        upload_session_id: "upl_0123456789abcdef",
+        uploaded_via: "local-explorer",
+        status: "queued",
+        visibility: "private",
+        content_hash: `sha256:${hash}`,
+      });
+      const queueItem = JSON.parse(await readGeneratedFile(wikiDir, `raw/queue/${sourceId}.json`)) as {
+        origin: string;
+        uploader: string;
+        upload_session_id: string;
+        uploaded_via: string;
+        status: string;
+        visibility: string;
+        content_hash: string;
       };
       expect(queueItem).toMatchObject({
-        kind: "text",
-        source_kind: "text",
+        origin: "local-upload:Session Note.md",
+        uploader: "local",
+        upload_session_id: "upl_0123456789abcdef",
+        uploaded_via: "local-explorer",
+        status: "queued",
+        visibility: "private",
+        content_hash: `sha256:${hash}`,
       });
+      expect(duplicate).toEqual({
+        ok: true,
+        value: {
+          status: "duplicate",
+          source: expect.objectContaining({
+            source_id: sourceId,
+            title: "Uploaded Session Note",
+            origin: "local-upload:Session Note.md",
+            uploader: "local",
+            upload_session_id: "upl_0123456789abcdef",
+            uploaded_via: "local-explorer",
+          }),
+          created_paths: [],
+        },
+      });
+      expect(afterDuplicate).toEqual(beforeDuplicate);
     });
   });
 

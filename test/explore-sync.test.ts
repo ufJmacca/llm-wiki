@@ -1475,6 +1475,63 @@ visibility:
     },
   );
 
+  it.each(["public", "github-pages"] as const)(
+    "replaces previous local Explorer output with public-safe %s content",
+    async (profile) => {
+      await withTempWorkspace(`llm-wiki-explore-sync-${profile}-cleans-local-output-`, async (workspaceDir) => {
+        // Arrange
+        const wikiDir = resolve(workspaceDir, "wiki");
+        await initializeWiki(wikiDir);
+        await makeDefaultCuratedPagesPublic(wikiDir);
+        if (profile === "github-pages") {
+          await prepareGitHubPagesSyncProfile(wikiDir);
+        }
+        const addResult = await runCliBuffered([
+          "add-text",
+          "--repo",
+          wikiDir,
+          "--title",
+          "Private Local Upload",
+          "--text",
+          "Private local upload body that must not reach public Quartz output.",
+          "--json",
+        ]);
+        expect(addResult.exitCode).toBe(0);
+        const capture = parseSourceCapture(addResult.stdout);
+        const localResult = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "local", "--json"]);
+        expect(localResult.exitCode).toBe(0);
+        expect(await pathExists(resolve(wikiDir, "quartz/content/_llm-wiki/review/source-queue.md"))).toBe(true);
+        expect(await pathExists(resolve(wikiDir, `quartz/content/${capture.source.source_card_path}`))).toBe(true);
+        await mkdir(resolve(wikiDir, "quartz/public/assets"), { recursive: true });
+        await writeFile(resolve(wikiDir, "quartz/public/assets/upload.js"), "LlmWikiUploadForm\n", "utf8");
+
+        // Act
+        const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", profile, "--json"]);
+
+        // Assert
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toEqual([]);
+        const payload = parseExploreSync(result.stdout);
+        const manifest = await readManifest(wikiDir, profile);
+        const syncedPaths = await listTree(wikiDir, "quartz/content");
+        const syncedContent = await Promise.all(
+          syncedPaths.map(async (path) => readFile(resolve(wikiDir, path), "utf8")),
+        );
+        expect(payload.data.materialized_paths).toContain("quartz/content/curated/index.md");
+        expect(manifest.files.map((file) => file.source_path)).toContain("curated/index.md");
+        expect(syncedPaths.some((path) => path.startsWith("quartz/content/_llm-wiki/review/"))).toBe(false);
+        expect(syncedPaths.some((path) => path.startsWith("quartz/content/_llm-wiki/upload"))).toBe(false);
+        expect(syncedPaths.some((path) => path.startsWith("quartz/content/_llm-wiki/runtime/"))).toBe(false);
+        expect(syncedPaths).not.toContain(`quartz/content/${capture.source.source_card_path}`);
+        expect(syncedPaths).not.toContain(`quartz/content/${capture.source.original_path}`);
+        expect(syncedPaths).not.toContain(`quartz/content/${capture.source.queue_path}`);
+        expect(syncedContent.join("\n")).not.toContain("Private local upload body");
+        expect(JSON.stringify(manifest)).not.toContain(capture.source.source_id);
+        expect(await pathExists(resolve(wikiDir, "quartz/public/assets/upload.js"))).toBe(true);
+      });
+    },
+  );
+
   it("materializes review profile content with root and review pages, no inactive upload entrypoint, and no raw originals", async () => {
     await withTempWorkspace("llm-wiki-explore-sync-review-", async (workspaceDir) => {
       // Arrange

@@ -104,12 +104,13 @@ function parseExploreBuildFailure(stdout: string[]): ExploreBuildFailureEnvelope
   return JSON.parse(stdout[0]) as ExploreBuildFailureEnvelope;
 }
 
-function mockSuccessfulSpawn(): {
+function mockSuccessfulSpawn(options: { profile?: "public" | "github-pages" } = {}): {
   syncedBeforeBuild: () => boolean;
   rootIndexMaterializedBeforeBuild: () => boolean;
   contentGitignoreAbsentBeforeBuild: () => boolean;
   uploadRuntimeAbsentBeforeBuild: () => boolean;
 } {
+  const expectedProfile = options.profile ?? "public";
   let syncedBeforeBuild = false;
   let rootIndexMaterializedBeforeBuild = false;
   let contentGitignoreAbsentBeforeBuild = false;
@@ -119,7 +120,7 @@ function mockSuccessfulSpawn(): {
     const wikiDir = resolve(cwd, "..");
     const layout = readFileSync(resolve(wikiDir, "quartz/quartz.layout.ts"), "utf8");
     syncedBeforeBuild =
-      existsSync(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.public.json")) &&
+      existsSync(resolve(wikiDir, `.llm-wiki/cache/quartz-manifest.${expectedProfile}.json`)) &&
       existsSync(resolve(wikiDir, "quartz/content/curated/home.md"));
     rootIndexMaterializedBeforeBuild = existsSync(resolve(wikiDir, "quartz/content/index.md"));
     contentGitignoreAbsentBeforeBuild = !existsSync(resolve(wikiDir, "quartz/content/.gitignore"));
@@ -202,6 +203,19 @@ async function makePublicProfileValidAsGitHubPagesFallback(wikiDir: string): Pro
   );
   await rm(resolve(wikiDir, ".llm-wiki/profiles/github-pages.yml"), { force: true });
   await rm(resolve(wikiDir, ".llm-wiki/profiles/github-pages.yaml"), { force: true });
+}
+
+async function writeGitHubPagesProfile(wikiDir: string, customDomain?: string): Promise<void> {
+  const publicProfile = await readFile(resolve(wikiDir, ".llm-wiki/profiles/public.yml"), "utf8");
+  const deployHeader =
+    customDomain === undefined
+      ? "name: github-pages\nmode: deploy\nbase_url: https://docs.example.com\n"
+      : `name: github-pages\nmode: deploy\nbase_url: https://${customDomain}\ncustom_domain: ${customDomain}\n`;
+  await writeFile(
+    resolve(wikiDir, ".llm-wiki/profiles/github-pages.yml"),
+    publicProfile.replace(/^name: public\nmode: deploy\n/u, deployHeader),
+    "utf8",
+  );
 }
 
 async function withProcessPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T>): Promise<T> {
@@ -306,6 +320,67 @@ describe("explore build command", () => {
     });
   });
 
+  it("runs github-pages sync, strict lint, Quartz build, and materializes a custom-domain CNAME", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-github-pages-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const spawnObservation = mockSuccessfulSpawn({ profile: "github-pages" });
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await writeGitHubPagesProfile(wikiDir, "docs.example.com");
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "github-pages", "--json"]);
+      const payload = parseExploreBuild(result.stdout);
+      const manifest = JSON.parse(await readFile(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.github-pages.json"), "utf8")) as {
+        profile: string;
+        source_profile: string;
+      };
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(spawnObservation.syncedBeforeBuild()).toBe(true);
+      expect(spawnObservation.rootIndexMaterializedBeforeBuild()).toBe(true);
+      expect(spawnObservation.uploadRuntimeAbsentBeforeBuild()).toBe(true);
+      expect(spawnMock).toHaveBeenCalledWith(
+        "npm",
+        ["run", "build"],
+        expect.objectContaining({ cwd: resolve(wikiDir, "quartz"), stdio: ["ignore", "pipe", "pipe"] }),
+      );
+      expect(payload.data).toMatchObject({
+        profile: "github-pages",
+        output_path: "quartz/public",
+        sync: {
+          manifest_path: ".llm-wiki/cache/quartz-manifest.github-pages.json",
+        },
+        lint: {
+          counts: {
+            error: 0,
+          },
+        },
+        quartz: {
+          command: "npm",
+          args: ["run", "build"],
+          cwd: resolve(wikiDir, "quartz"),
+          exit_code: 0,
+        },
+      });
+      expect(manifest).toMatchObject({
+        profile: "github-pages",
+        source_profile: "github-pages",
+      });
+      await expect(readFile(resolve(wikiDir, ".llm-wiki/cache/github-pages-CNAME"), "utf8")).resolves.toBe(
+        "docs.example.com\n",
+      );
+      await expect(readFile(resolve(wikiDir, "quartz/public/CNAME"), "utf8")).resolves.toBe("docs.example.com\n");
+      expect(existsSync(resolve(wikiDir, "quartz/public/postscript.js"))).toBe(false);
+    });
+  });
+
   it("fails when Quartz exits successfully without producing the Pages output directory", async () => {
     await withTempWorkspace("llm-wiki-explore-build-missing-public-output-", async (workspaceDir) => {
       // Arrange
@@ -376,6 +451,69 @@ describe("explore build command", () => {
       expect(spawnObservation.syncedBeforeBuild()).toBe(true);
       expect(payload.data.lint.counts.error).toBe(0);
       expect(existsSync(resolve(wikiDir, "quartz/public/assets/upload.js"))).toBe(false);
+    });
+  });
+
+  it("fails github-pages builds when Quartz writes raw upload leaks to the public artifact", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-github-pages-post-build-leak-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      let spawnedAfterSync = false;
+      spawnMock.mockImplementation((_command: string, _args: string[], options: SpawnOptionsWithoutStdio) => {
+        const cwd = typeof options.cwd === "string" ? options.cwd : "";
+        const wikiDir = resolve(cwd, "..");
+        spawnedAfterSync =
+          existsSync(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.github-pages.json")) &&
+          existsSync(resolve(wikiDir, "quartz/content/curated/home.md"));
+        rmSync(resolve(wikiDir, "quartz/public"), { recursive: true, force: true });
+        mkdirSync(resolve(wikiDir, "quartz/public/raw/inputs/2026/06/src_upload"), { recursive: true });
+        writeFileSync(
+          resolve(wikiDir, "quartz/public/raw/inputs/2026/06/src_upload/original.md"),
+          "# Raw Upload\n",
+          "utf8",
+        );
+
+        const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        child.stdin = new PassThrough();
+        child.kill = vi.fn();
+        queueMicrotask(() => child.emit("close", 0, null));
+
+        return child;
+      });
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await writeGitHubPagesProfile(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "github-pages", "--json"]);
+      const payload = parseExploreBuildFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(spawnMock).toHaveBeenCalledWith(
+        "npm",
+        ["run", "build"],
+        expect.objectContaining({ cwd: resolve(wikiDir, "quartz"), stdio: ["ignore", "pipe", "pipe"] }),
+      );
+      expect(spawnedAfterSync).toBe(true);
+      expect(payload.error).toEqual({
+        code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+        message: "Public profile leak check failed after Quartz build: public_static_raw_inputs_leak.",
+        hint: "Remove upload, runtime, review, queue, raw, and secret data from committed GitHub Pages static output.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+          path: "quartz/public/raw/inputs/2026/06/src_upload/original.md",
+        }),
+      ]);
     });
   });
 

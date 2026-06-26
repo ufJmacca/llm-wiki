@@ -1,8 +1,8 @@
 import { EventEmitter } from "node:events";
 import { execFile, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { constants, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { access, chmod, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { delimiter, dirname, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { promisify } from "node:util";
 
@@ -135,6 +135,24 @@ async function initializeGitRepository(wikiDir: string, remoteUrl: string, branc
   await execFileAsync("git", ["init"], { cwd: wikiDir });
   await execFileAsync("git", ["symbolic-ref", "HEAD", `refs/heads/${branch}`], { cwd: wikiDir });
   await execFileAsync("git", ["remote", "add", "origin", remoteUrl], { cwd: wikiDir });
+}
+
+async function resolveExecutable(name: string): Promise<string> {
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    if (directory === "") {
+      continue;
+    }
+
+    const path = resolve(directory, name);
+    try {
+      await access(path, constants.X_OK);
+      return path;
+    } catch {
+      // Keep searching PATH.
+    }
+  }
+
+  throw new Error(`Could not locate ${name} on PATH.`);
 }
 
 async function markQuartzDependenciesInstalled(wikiDir: string): Promise<void> {
@@ -282,9 +300,15 @@ function commandOrder(content: string, commands: readonly string[]): number[] {
 }
 
 function assertPublicProfileFailClosed(publicProfile: {
+  features?: Record<string, unknown>;
   visibility?: { include_private?: boolean; required_value?: string };
   safety?: Record<string, unknown>;
 }): void {
+  expect(publicProfile.features).toMatchObject({
+    upload: false,
+    review: false,
+    review_panel: false,
+  });
   expect(publicProfile.visibility).toEqual({
     include_private: false,
     required_value: "public",
@@ -356,10 +380,12 @@ describe("deploy github-pages commands", () => {
         name: string;
         mode: string;
         base_url: string;
+        features: Record<string, unknown>;
         visibility: { include_private: boolean; required_value: string };
         safety: Record<string, boolean>;
       };
       const publicProfile = parse(await readGeneratedFile(wikiDir, ".llm-wiki/profiles/public.yml")) as {
+        features: Record<string, unknown>;
         visibility: { include_private: boolean; required_value: string };
         safety: Record<string, boolean>;
       };
@@ -378,41 +404,33 @@ describe("deploy github-pages commands", () => {
         ".github/workflows/llm-wiki-pages.yml",
         ".llm-wiki/profiles/github-pages.yml",
       ]);
-      expect(payload.data.instructions).toContain("Run llm-wiki explore init before building Pages locally or in CI.");
-      expect(payload.data.instructions).not.toContain("Run cd quartz && npm install before building Pages locally or in CI.");
+      expect(payload.data.instructions).toEqual([
+        "Run llm-wiki deploy github-pages build-local to generate committed Pages output in quartz/public.",
+        "Run llm-wiki deploy github-pages check before publishing.",
+        "Commit quartz/public with the reviewed public source changes.",
+        "Open a pull request for review before merging Pages output.",
+        "In GitHub, enable Pages with Source: GitHub Actions.",
+      ]);
       expect(workflow).toContain("on:\n  push:\n    branches: [\"main\"]\n  workflow_dispatch:");
       assertWorkflowUsesOnlyLeastPagesPermissions(workflow);
       expect(workflow).toContain("uses: actions/checkout@v4");
-      expect(workflow).toContain("uses: actions/setup-node@v4");
-      expect(workflow).toContain("node-version: 22");
+      expect(workflow).not.toContain("uses: actions/setup-node@v4");
+      expect(workflow).not.toContain("node-version: 22");
       expect(workflow).not.toContain("run: npm ci");
       expect(workflow).not.toContain("cache: npm");
-      expect(workflow).toContain("npm install --global llm-wiki@latest");
-      expect(workflow).toContain("llm-wiki explore init");
-      expect(workflow).toContain("cd quartz && npm install");
-      expect(workflow).toContain("llm-wiki explore sync --profile github-pages");
-      expect(workflow).toContain("llm-wiki lint --profile github-pages --strict");
-      expect(workflow).toContain("llm-wiki explore build --profile github-pages");
-      expect(workflow).toContain("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME");
+      expect(workflow).not.toContain("npm install --global llm-wiki");
+      expect(workflow).not.toContain("llm-wiki explore init");
+      expect(workflow).not.toContain("cd quartz && npm install");
+      expect(workflow).not.toContain("llm-wiki explore sync");
+      expect(workflow).not.toContain("llm-wiki ingest");
+      expect(workflow).not.toContain("llm-wiki lint --profile github-pages --strict");
+      expect(workflow).not.toContain("llm-wiki explore build");
+      expect(workflow).not.toContain("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME");
       expect(workflow).toContain("uses: actions/upload-pages-artifact@v3");
       expect(workflow).toContain("path: quartz/public");
       expect(workflow).toContain("uses: actions/deploy-pages@v4");
-      expect(workflow.lastIndexOf("llm-wiki lint --profile github-pages --strict")).toBeGreaterThan(
-        workflow.indexOf("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME"),
-      );
-      expect(workflow.lastIndexOf("llm-wiki lint --profile github-pages --strict")).toBeLessThan(
-        workflow.indexOf("uses: actions/upload-pages-artifact@v3"),
-      );
       const workflowOrder = commandOrder(workflow, [
         "uses: actions/checkout@v4",
-        "uses: actions/setup-node@v4",
-        "npm install --global llm-wiki@latest",
-        "llm-wiki explore init",
-        "cd quartz && npm install",
-        "llm-wiki explore sync --profile github-pages",
-        "llm-wiki lint --profile github-pages --strict",
-        "llm-wiki explore build --profile github-pages",
-        "cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME",
         "uses: actions/upload-pages-artifact@v3",
         "uses: actions/deploy-pages@v4",
       ]);
@@ -425,6 +443,11 @@ describe("deploy github-pages commands", () => {
         visibility: {
           include_private: false,
           required_value: "public",
+        },
+        features: {
+          upload: false,
+          review: false,
+          review_panel: false,
         },
       });
       expect(deployProfile.safety).toMatchObject({
@@ -439,7 +462,7 @@ describe("deploy github-pages commands", () => {
     });
   });
 
-  it("materializes the Quartz build homepage during the generated workflow sync step", async () => {
+  it("leaves Quartz content generation to local sync outside the generated publisher workflow", async () => {
     await withTempWorkspace("llm-wiki-deploy-pages-workflow-homepage-sync-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
@@ -460,14 +483,217 @@ describe("deploy github-pages commands", () => {
       // Assert
       expect(sync.exitCode).toBe(0);
       expect(sync.stderr).toEqual([]);
-      expect(workflow).toContain("llm-wiki explore sync --profile github-pages");
-      expect(workflow).toContain("llm-wiki explore build --profile github-pages");
-      expect(workflow.indexOf("llm-wiki explore sync --profile github-pages")).toBeLessThan(
-        workflow.indexOf("llm-wiki explore build --profile github-pages"),
-      );
+      expect(workflow).not.toContain("llm-wiki explore sync --profile github-pages");
+      expect(workflow).not.toContain("llm-wiki explore build --profile github-pages");
       expect(payload.data.materialized_paths).toContain("quartz/content/curated/index.md");
       expect(payload.data.generated_paths).toContain("quartz/content/index.md");
       expect(buildHomepage).toBe(curatedIndex);
+    });
+  });
+
+  it("removes legacy quartz/public gitignore rules during deploy init", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-init-public-gitignore-migration-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir, "git@github.com:example-org/research-wiki.git");
+      await writeFile(
+        resolve(wikiDir, ".gitignore"),
+        ".DS_Store\n.llm-wiki/cache/\nquartz/content/\n/quartz/public/\nquartz/public/**\nquartz/quartz/\n",
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--json"]);
+      const payload = parseDeployInit(result.stdout);
+      const gitignore = await readFile(resolve(wikiDir, ".gitignore"), "utf8");
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(payload.warnings).toEqual(["Removed legacy quartz/public ignore rule from .gitignore."]);
+      expect(payload.data.updated_paths).toContain(".gitignore");
+      expect(gitignore).toContain("quartz/content/");
+      expect(gitignore).toContain("quartz/quartz/");
+      expect(gitignore).not.toContain("quartz/public/");
+      expect(gitignore).not.toContain("quartz/public/**");
+    });
+  });
+
+  it("accepts a symlinked .gitignore when no legacy quartz/public migration is needed", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-symlink-gitignore-no-migration-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      mockSuccessfulQuartzBuild();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir, "git@github.com:example-org/research-wiki.git");
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      const linkedGitignorePath = resolve(workspaceDir, "linked-gitignore");
+      const gitignore = await readFile(resolve(wikiDir, ".gitignore"), "utf8");
+      await writeFile(linkedGitignorePath, gitignore, "utf8");
+      await rm(resolve(wikiDir, ".gitignore"));
+      await symlink(linkedGitignorePath, resolve(wikiDir, ".gitignore"), "file");
+
+      // Act
+      const init = await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--json"]);
+      const buildLocal = await runCliBuffered(["deploy", "github-pages", "build-local", "--repo", wikiDir, "--json"]);
+      const initPayload = parseDeployInit(init.stdout);
+      const buildPayload = parseDeployBuildLocal(buildLocal.stdout);
+
+      // Assert
+      expect(init.exitCode).toBe(0);
+      expect(initPayload.warnings).toEqual([]);
+      expect(initPayload.data.updated_paths).not.toContain(".gitignore");
+      expect(buildLocal.exitCode).toBe(0);
+      expect(buildPayload.warnings).not.toContain("Removed legacy quartz/public ignore rule from .gitignore.");
+      expect(await readFile(linkedGitignorePath, "utf8")).toBe(gitignore);
+    });
+  });
+
+  it("rejects forbidden publisher workflow steps hidden in non-deploy jobs", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-extra-job-publisher-steps-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--custom-domain", "docs.example.com"]);
+      const workflowPath = resolve(wikiDir, ".github/workflows/llm-wiki-pages.yml");
+      await writeFile(
+        workflowPath,
+        `${await readFile(workflowPath, "utf8")}
+  remote-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hidden remote build
+        run: |
+          npm install --global llm-wiki
+          llm-wiki explore sync --profile github-pages
+`,
+        "utf8",
+      );
+
+      // Act
+      const status = await runCliBuffered(["deploy", "github-pages", "status", "--repo", wikiDir, "--json"]);
+      const check = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+
+      // Assert
+      expect(status.exitCode).toBe(0);
+      expect(parseDeployStatus(status.stdout).data.workflow.status).toBe("invalid");
+      expect(check.exitCode).toBe(1);
+      expect(parseDeployFailure(check.stdout).error.code).toBe("GITHUB_PAGES_WORKFLOW_INVALID");
+    });
+  });
+
+  it("rejects unlisted run steps before uploading the committed Pages artifact", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-build-run-step-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--custom-domain", "docs.example.com"]);
+      const workflowPath = resolve(wikiDir, ".github/workflows/llm-wiki-pages.yml");
+      await writeFile(
+        workflowPath,
+        (await readFile(workflowPath, "utf8")).replace(
+          "      - name: Upload committed Pages artifact\n",
+          "      - name: Build in CI\n        run: npm run build\n      - name: Upload committed Pages artifact\n",
+        ),
+        "utf8",
+      );
+
+      // Act
+      const status = await runCliBuffered(["deploy", "github-pages", "status", "--repo", wikiDir, "--json"]);
+      const check = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+
+      // Assert
+      expect(status.exitCode).toBe(0);
+      expect(parseDeployStatus(status.stdout).data.workflow.status).toBe("invalid");
+      expect(check.exitCode).toBe(1);
+      expect(parseDeployFailure(check.stdout).error.code).toBe("GITHUB_PAGES_WORKFLOW_INVALID");
+    });
+  });
+
+  it("rejects unlisted action steps before uploading the committed Pages artifact", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-build-action-step-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--custom-domain", "docs.example.com"]);
+      const workflowPath = resolve(wikiDir, ".github/workflows/llm-wiki-pages.yml");
+      await writeFile(
+        workflowPath,
+        (await readFile(workflowPath, "utf8")).replace(
+          "      - name: Upload committed Pages artifact\n",
+          "      - name: Local composite build\n        uses: ./.github/actions/build-quartz\n      - name: Upload committed Pages artifact\n",
+        ),
+        "utf8",
+      );
+
+      // Act
+      const status = await runCliBuffered(["deploy", "github-pages", "status", "--repo", wikiDir, "--json"]);
+      const check = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+
+      // Assert
+      expect(status.exitCode).toBe(0);
+      expect(parseDeployStatus(status.stdout).data.workflow.status).toBe("invalid");
+      expect(check.exitCode).toBe(1);
+      expect(parseDeployFailure(check.stdout).error.code).toBe("GITHUB_PAGES_WORKFLOW_INVALID");
+    });
+  });
+
+  it("rejects checkout steps that repopulate the committed Pages artifact before upload", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-artifact-checkout-step-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--custom-domain", "docs.example.com"]);
+      const workflowPath = resolve(wikiDir, ".github/workflows/llm-wiki-pages.yml");
+      await writeFile(
+        workflowPath,
+        (await readFile(workflowPath, "utf8")).replace(
+          "      - name: Upload committed Pages artifact\n",
+          "      - name: Checkout unreviewed Pages artifact\n        uses: actions/checkout@v4\n        with:\n          repository: example-org/unreviewed-pages\n          path: quartz/public\n      - name: Upload committed Pages artifact\n",
+        ),
+        "utf8",
+      );
+
+      // Act
+      const status = await runCliBuffered(["deploy", "github-pages", "status", "--repo", wikiDir, "--json"]);
+      const check = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+
+      // Assert
+      expect(status.exitCode).toBe(0);
+      expect(parseDeployStatus(status.stdout).data.workflow.status).toBe("invalid");
+      expect(check.exitCode).toBe(1);
+      expect(parseDeployFailure(check.stdout).error.code).toBe("GITHUB_PAGES_WORKFLOW_INVALID");
+    });
+  });
+
+  it("rejects job-level reusable workflow jobs", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-reusable-workflow-job-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--custom-domain", "docs.example.com"]);
+      const workflowPath = resolve(wikiDir, ".github/workflows/llm-wiki-pages.yml");
+      await writeFile(
+        workflowPath,
+        `${await readFile(workflowPath, "utf8")}
+  remote-build:
+    uses: ./.github/workflows/build-quartz.yml
+`,
+        "utf8",
+      );
+
+      // Act
+      const status = await runCliBuffered(["deploy", "github-pages", "status", "--repo", wikiDir, "--json"]);
+      const check = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+
+      // Assert
+      expect(status.exitCode).toBe(0);
+      expect(parseDeployStatus(status.stdout).data.workflow.status).toBe("invalid");
+      expect(check.exitCode).toBe(1);
+      expect(parseDeployFailure(check.stdout).error.code).toBe("GITHUB_PAGES_WORKFLOW_INVALID");
     });
   });
 
@@ -695,7 +921,7 @@ visibility:
     },
     {
       profilePath: ".llm-wiki/profiles/public.yml",
-      mutate: (content: string) => content.replace("  upload: false", "  upload: false\n  review_panel: true"),
+      mutate: (content: string) => content.replace("  review_panel: false", "  review_panel: true"),
       expectedCode: "PROFILE_REVIEW_FEATURE_FORBIDDEN",
       expectedMessage: "review_panel",
     },
@@ -1486,8 +1712,8 @@ const config: QuartzConfig = {`,
       await writeFile(
         workflowPath,
         (await readFile(workflowPath, "utf8")).replace(
-          "run: llm-wiki explore build --profile github-pages",
-          "run: npm run build",
+          "path: quartz/public",
+          "path: quartz/content",
         ),
         "utf8",
       );
@@ -1516,6 +1742,57 @@ const config: QuartzConfig = {`,
       expect(invalidWorkflowStatus.exitCode).toBe(0);
       expect(parseDeployStatus(invalidWorkflowStatus.stdout).data.workflow.status).toBe("invalid");
 
+      for (const [label, setupNodeAction] of [
+        ["tagged", "actions/setup-node@v3"],
+        ["pinned", "actions/setup-node@8f152b3d06b0286ee2e3a828bc0570901b6a096e"],
+      ] as const) {
+        // Arrange
+        const setupNodeWorkflowWiki = resolve(workspaceDir, `${label}-setup-node-workflow`);
+        await initializeWiki(setupNodeWorkflowWiki);
+        await runCliBuffered([
+          "deploy",
+          "github-pages",
+          "init",
+          "--repo",
+          setupNodeWorkflowWiki,
+          "--custom-domain",
+          "docs.example.com",
+        ]);
+        const setupNodeWorkflowPath = resolve(setupNodeWorkflowWiki, ".github/workflows/llm-wiki-pages.yml");
+        await writeFile(
+          setupNodeWorkflowPath,
+          (await readFile(setupNodeWorkflowPath, "utf8")).replace(
+            "      - name: Upload committed Pages artifact\n",
+            `      - name: Set up Node\n        uses: ${setupNodeAction}\n      - name: Upload committed Pages artifact\n`,
+          ),
+          "utf8",
+        );
+
+        // Act
+        const setupNodeWorkflow = await runCliBuffered([
+          "deploy",
+          "github-pages",
+          "check",
+          "--repo",
+          setupNodeWorkflowWiki,
+          "--json",
+        ]);
+        const setupNodeWorkflowStatus = await runCliBuffered([
+          "deploy",
+          "github-pages",
+          "status",
+          "--repo",
+          setupNodeWorkflowWiki,
+          "--json",
+        ]);
+
+        // Assert
+        expect(setupNodeWorkflow.exitCode).toBe(1);
+        expect(parseDeployFailure(setupNodeWorkflow.stdout).error.code).toBe("GITHUB_PAGES_WORKFLOW_INVALID");
+        expect(setupNodeWorkflowStatus.exitCode).toBe(0);
+        expect(parseDeployStatus(setupNodeWorkflowStatus.stdout).data.workflow.status).toBe("invalid");
+      }
+
       // Arrange
       const commentedWorkflowWiki = resolve(workspaceDir, "commented-workflow");
       await initializeWiki(commentedWorkflowWiki);
@@ -1532,8 +1809,8 @@ const config: QuartzConfig = {`,
       await writeFile(
         commentedWorkflowPath,
         (await readFile(commentedWorkflowPath, "utf8")).replace(
-          "      - name: Strict public lint\n        run: llm-wiki lint --profile github-pages --strict",
-          "      # - name: Strict public lint\n      #   run: llm-wiki lint --profile github-pages --strict",
+          "      - name: Upload committed Pages artifact\n        uses: actions/upload-pages-artifact@v3\n        with:\n          path: quartz/public",
+          "      # - name: Upload committed Pages artifact\n      #   uses: actions/upload-pages-artifact@v3\n      #   with:\n      #     path: quartz/public",
         ),
         "utf8",
       );
@@ -1770,6 +2047,348 @@ const config: QuartzConfig = {`,
         message: "Public preflight failed before GitHub Pages deployment.",
       });
       expect(checkPayload.error.hint).toContain("llm-wiki lint --profile github-pages --strict");
+    });
+  });
+
+  it("fails deploy check when Git still ignores committed Pages output", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-public-gitignore-check-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir, "git@github.com:example-org/research-wiki.git");
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await writeFile(
+        resolve(wikiDir, ".gitignore"),
+        `${await readFile(resolve(wikiDir, ".gitignore"), "utf8")}quartz/public/\n`,
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+      const payload = parseDeployFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(payload.error).toEqual({
+        code: "GITHUB_PAGES_PUBLIC_IGNORED",
+        message: "Committed GitHub Pages output is ignored by Git.",
+        hint: "Remove ignore rules such as quartz/public/ or rerun llm-wiki deploy github-pages init before committing quartz/public.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "GITHUB_PAGES_PUBLIC_IGNORED",
+          path: ".gitignore",
+        }),
+      ]);
+    });
+  });
+
+  it("fails deploy check when committed Pages output has not been generated", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-public-artifact-missing-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir, "git@github.com:example-org/research-wiki.git");
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+      const payload = parseDeployFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(payload.error).toEqual({
+        code: "GITHUB_PAGES_PUBLIC_ARTIFACT_MISSING",
+        message: "Committed GitHub Pages output is missing.",
+        hint: "Run llm-wiki deploy github-pages build-local, then commit quartz/public before rerunning deploy checks.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "GITHUB_PAGES_PUBLIC_ARTIFACT_MISSING",
+          path: "quartz/public",
+        }),
+      ]);
+    });
+  });
+
+  it("fails deploy check when committed Pages output is missing index.html", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-public-index-missing-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir, "git@github.com:example-org/research-wiki.git");
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/public"), { recursive: true });
+
+      // Act
+      const result = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+      const payload = parseDeployFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(payload.error).toEqual({
+        code: "GITHUB_PAGES_PUBLIC_ARTIFACT_INCOMPLETE",
+        message: "Committed GitHub Pages output is incomplete.",
+        hint: "Run llm-wiki deploy github-pages build-local, then commit quartz/public before rerunning deploy checks.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "GITHUB_PAGES_PUBLIC_ARTIFACT_INCOMPLETE",
+          path: "quartz/public/index.html",
+        }),
+      ]);
+    });
+  });
+
+  it.each([
+    { label: "missing", cname: null, expectedCode: "GITHUB_PAGES_PUBLIC_ARTIFACT_INCOMPLETE" },
+    { label: "stale", cname: "old.example.com\n", expectedCode: "GITHUB_PAGES_PUBLIC_ARTIFACT_INVALID" },
+  ])("fails deploy check when custom-domain Pages CNAME is $label", async ({ cname, expectedCode }) => {
+    await withTempWorkspace("llm-wiki-deploy-pages-public-cname-invalid-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir, "git@github.com:example-org/research-wiki.git");
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--custom-domain", "docs.example.com"]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/public"), { recursive: true });
+      await writeFile(resolve(wikiDir, "quartz/public/index.html"), "<!doctype html><title>Pages</title>\n", "utf8");
+      if (cname !== null) {
+        await writeFile(resolve(wikiDir, "quartz/public/CNAME"), cname, "utf8");
+      }
+
+      // Act
+      const result = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+      const payload = parseDeployFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(payload.error.code).toBe(expectedCode);
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: expectedCode,
+          path: "quartz/public/CNAME",
+        }),
+      ]);
+    });
+  });
+
+  it("fails deploy check when Pages CNAME remains committed without a configured custom domain", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-public-cname-stale-without-domain-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir, "git@github.com:example-org/research-wiki.git");
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/public"), { recursive: true });
+      await writeFile(resolve(wikiDir, "quartz/public/index.html"), "<!doctype html><title>Pages</title>\n", "utf8");
+      await writeFile(resolve(wikiDir, "quartz/public/CNAME"), "old.example.com\n", "utf8");
+
+      // Act
+      const result = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+      const payload = parseDeployFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(payload.error).toEqual({
+        code: "GITHUB_PAGES_PUBLIC_ARTIFACT_INVALID",
+        message: "Committed GitHub Pages custom domain artifact is stale.",
+        hint: "Remove quartz/public/CNAME or rerun llm-wiki deploy github-pages build-local without a custom domain, then commit quartz/public.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "GITHUB_PAGES_PUBLIC_ARTIFACT_INVALID",
+          path: "quartz/public/CNAME",
+        }),
+      ]);
+    });
+  });
+
+  it("fails deploy check when Git trackability cannot be verified", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-public-trackability-unknown-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--custom-domain", "docs.example.com"]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+      const payload = parseDeployFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(payload.error).toEqual({
+        code: "GITHUB_PAGES_PUBLIC_TRACKABILITY_UNKNOWN",
+        message: "Could not verify that quartz/public is trackable.",
+        hint: "Ensure Git is available and the wiki root is inside a Git worktree before rerunning deploy checks.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "GITHUB_PAGES_PUBLIC_TRACKABILITY_UNKNOWN",
+          path: ".gitignore",
+        }),
+      ]);
+    });
+  });
+
+  it("fails deploy check when a tracked Pages index still matches an ignore rule", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-public-tracked-index-ignore-check-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir, "git@github.com:example-org/research-wiki.git");
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/public"), { recursive: true });
+      await writeFile(resolve(wikiDir, "quartz/public/index.html"), "<!doctype html><title>Pages</title>\n", "utf8");
+      await execFileAsync("git", ["add", "--", "quartz/public/index.html"], { cwd: wikiDir });
+      await writeFile(
+        resolve(wikiDir, ".gitignore"),
+        `${await readFile(resolve(wikiDir, ".gitignore"), "utf8")}quartz/public/index.html\n`,
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+      const payload = parseDeployFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(payload.error).toEqual({
+        code: "GITHUB_PAGES_PUBLIC_IGNORED",
+        message: "Committed GitHub Pages output is ignored by Git.",
+        hint: "Remove ignore rules such as quartz/public/ or rerun llm-wiki deploy github-pages init before committing quartz/public.",
+      });
+    });
+  });
+
+  it("fails deploy check when Git ignores nested Pages asset output", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-public-nested-asset-gitignore-check-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir, "git@github.com:example-org/research-wiki.git");
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/public/assets"), { recursive: true });
+      await writeFile(resolve(wikiDir, "quartz/public/index.html"), "<!doctype html><title>Pages</title>\n", "utf8");
+      await writeFile(resolve(wikiDir, "quartz/public/assets/app.js"), "console.log('pages asset')\n", "utf8");
+      await writeFile(
+        resolve(wikiDir, ".gitignore"),
+        `${await readFile(resolve(wikiDir, ".gitignore"), "utf8")}quartz/public/assets/\n`,
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+      const payload = parseDeployFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(payload.error).toEqual({
+        code: "GITHUB_PAGES_PUBLIC_IGNORED",
+        message: "Committed GitHub Pages output is ignored by Git.",
+        hint: "Remove ignore rules such as quartz/public/ or rerun llm-wiki deploy github-pages init before committing quartz/public.",
+      });
+    });
+  });
+
+  it("batches Pages artifact trackability checks through one Git check-ignore invocation", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-public-trackability-batched-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir, "git@github.com:example-org/research-wiki.git");
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/public/assets"), { recursive: true });
+      await writeFile(resolve(wikiDir, "quartz/public/index.html"), "<!doctype html><title>Pages</title>\n", "utf8");
+      for (let index = 0; index < 20; index += 1) {
+        await writeFile(resolve(wikiDir, `quartz/public/assets/page-${index}.js`), "console.log('pages asset')\n", "utf8");
+      }
+
+      const realGit = await resolveExecutable("git");
+      const gitWrapperDir = resolve(workspaceDir, "git-wrapper-bin");
+      const gitWrapperPath = resolve(gitWrapperDir, "git");
+      const counterPath = resolve(workspaceDir, "git-check-ignore-count");
+      await mkdir(gitWrapperDir, { recursive: true });
+      await writeFile(counterPath, "", "utf8");
+      await writeFile(
+        gitWrapperPath,
+        `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+const { appendFileSync, readFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+const isCheckIgnore = args[0] === "check-ignore";
+if (isCheckIgnore) {
+  appendFileSync(process.env.LLM_WIKI_GIT_COUNTER_PATH, "check-ignore\\n");
+}
+const result = spawnSync(${JSON.stringify(realGit)}, args, {
+  encoding: "buffer",
+  input: isCheckIgnore ? readFileSync(0) : undefined,
+});
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+if (result.error) {
+  console.error(result.error.message);
+  process.exit(127);
+}
+process.exit(result.status ?? 1);
+`,
+        "utf8",
+      );
+      await chmod(gitWrapperPath, 0o755);
+      const originalPath = process.env.PATH;
+      const originalCounterPath = process.env.LLM_WIKI_GIT_COUNTER_PATH;
+      process.env.PATH = `${gitWrapperDir}${delimiter}${originalPath ?? ""}`;
+      process.env.LLM_WIKI_GIT_COUNTER_PATH = counterPath;
+
+      let result: Awaited<ReturnType<typeof runCliBuffered>>;
+      try {
+        // Act
+        result = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+      } finally {
+        process.env.PATH = originalPath;
+        if (originalCounterPath === undefined) {
+          delete process.env.LLM_WIKI_GIT_COUNTER_PATH;
+        } else {
+          process.env.LLM_WIKI_GIT_COUNTER_PATH = originalCounterPath;
+        }
+      }
+      const checkIgnoreCount = (await readFile(counterPath, "utf8")).trim().split("\n").filter(Boolean).length;
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(checkIgnoreCount).toBe(1);
     });
   });
 
@@ -2049,6 +2668,8 @@ export default config
       await markQuartzDependenciesInstalled(wikiDir);
       await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir]);
       await makeDefaultCuratedPagesPublic(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/public"), { recursive: true });
+      await writeFile(resolve(wikiDir, "quartz/public/index.html"), "<!doctype html><title>Pages</title>\n", "utf8");
 
       // Act
       const checkResult = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir]);
@@ -2065,7 +2686,7 @@ export default config
       expect(checkResult.stdout.join("\n")).toContain("Profiles: valid");
       expect(checkResult.stdout.join("\n")).toContain("Quartz: ready");
       expect(checkResult.stdout.join("\n")).toContain("Public preflight: pass");
-      expect(checkResult.stdout.join("\n")).toContain("Next: In GitHub, enable Pages with Source: GitHub Actions.");
+      expect(checkResult.stdout.join("\n")).toContain("Next: Commit quartz/public with the reviewed public source changes.");
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toEqual([]);
       expect(humanResult.exitCode).toBe(0);
@@ -2075,7 +2696,7 @@ export default config
       expect(humanResult.stdout.join("\n")).toContain("Profiles: valid");
       expect(humanResult.stdout.join("\n")).toContain("Quartz readiness: ready");
       expect(humanResult.stdout.join("\n")).toContain("Public preflight: pass");
-      expect(humanResult.stdout.join("\n")).toContain("Next: In GitHub, enable Pages with Source: GitHub Actions.");
+      expect(humanResult.stdout.join("\n")).toContain("Next: Commit quartz/public with the reviewed public source changes.");
       expect(spawnObservation.githubPagesManifestExistedBeforeBuild()).toBe(true);
       expect(spawnObservation.publicManifestExistedBeforeBuild()).toBe(false);
       expect(quartzConfig).toContain('baseUrl: "example-org.github.io/research-wiki",');
@@ -2116,19 +2737,23 @@ export default config
           status: "pass",
           issue_count: 0,
         },
-        setup_instructions: ["In GitHub, enable Pages with Source: GitHub Actions."],
+        setup_instructions: [
+          "Run llm-wiki deploy github-pages build-local to generate committed Pages output in quartz/public.",
+          "Run llm-wiki deploy github-pages check before publishing.",
+          "Commit quartz/public with the reviewed public source changes.",
+          "Open a pull request for review before merging Pages output.",
+          "In GitHub, enable Pages with Source: GitHub Actions.",
+        ],
       });
-      expect(workflow.indexOf("llm-wiki explore sync --profile github-pages")).toBeLessThan(
-        workflow.indexOf("llm-wiki lint --profile github-pages --strict"),
-      );
-      expect(workflow.indexOf("llm-wiki lint --profile github-pages --strict")).toBeLessThan(
-        workflow.indexOf("llm-wiki explore build --profile github-pages"),
-      );
-      expect(workflow.indexOf("llm-wiki explore build --profile github-pages")).toBeLessThan(
-        workflow.indexOf("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME"),
-      );
-      expect(workflow.indexOf("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME")).toBeLessThan(
+      expect(workflow).not.toContain("llm-wiki explore sync --profile github-pages");
+      expect(workflow).not.toContain("llm-wiki lint --profile github-pages --strict");
+      expect(workflow).not.toContain("llm-wiki explore build --profile github-pages");
+      expect(workflow).not.toContain("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME");
+      expect(workflow.indexOf("uses: actions/checkout@v4")).toBeLessThan(
         workflow.indexOf("uses: actions/upload-pages-artifact@v3"),
+      );
+      expect(workflow.indexOf("path: quartz/public")).toBeLessThan(
+        workflow.indexOf("uses: actions/deploy-pages@v4"),
       );
     });
   });
@@ -2156,12 +2781,8 @@ export default config
       expect(result.stderr).toEqual([]);
       expect(cachedCname).toBe("docs.example.com\n");
       expect(artifactCname).toBe("docs.example.com\n");
-      expect(workflow.indexOf("llm-wiki explore build --profile github-pages")).toBeLessThan(
-        workflow.indexOf("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME"),
-      );
-      expect(workflow.indexOf("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME")).toBeLessThan(
-        workflow.indexOf("uses: actions/upload-pages-artifact@v3"),
-      );
+      expect(workflow).not.toContain("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME");
+      expect(workflow).toContain("path: quartz/public");
     });
   });
 
@@ -2370,13 +2991,72 @@ export default config
       });
       expect(payload.data.public_preflight.status).toBe("pass");
       expect(payload.data.setup_instructions).toEqual([
-        "Run cd quartz && npm install before building Pages locally or in CI.",
+        "Run cd quartz && npm install before building GitHub Pages output.",
+        "Run llm-wiki deploy github-pages build-local to generate committed Pages output in quartz/public.",
+        "Run llm-wiki deploy github-pages check before publishing.",
+        "Commit quartz/public with the reviewed public source changes.",
+        "Open a pull request for review before merging Pages output.",
         "In GitHub, enable Pages with Source: GitHub Actions.",
       ]);
       expect(humanResult.stdout.join("\n")).toContain("GitHub Pages deploy status");
       expect(humanResult.stdout.join("\n")).toContain("Quartz: missing_dependencies");
+      expect(humanResult.stdout.join("\n")).toContain("Run cd quartz && npm install before building GitHub Pages output");
+      expect(humanResult.stdout.join("\n")).toContain("Commit quartz/public");
       expect(humanResult.stdout.join("\n")).toContain("enable Pages with Source: GitHub Actions");
       expect(await pathExists(resolve(wikiDir, ".github/workflows/llm-wiki-pages.yml"))).toBe(true);
+    });
+  });
+
+  it("places setup repair guidance before the publish checklist for incomplete deploy status", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-status-incomplete-guidance-", async (workspaceDir) => {
+      // Arrange
+      const uninitializedWiki = resolve(workspaceDir, "uninitialized");
+      await initializeWiki(uninitializedWiki);
+
+      const invalidWorkflowWiki = resolve(workspaceDir, "invalid-workflow");
+      await initializeWiki(invalidWorkflowWiki);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", invalidWorkflowWiki, "--custom-domain", "docs.example.com"]);
+      const workflowPath = resolve(invalidWorkflowWiki, ".github/workflows/llm-wiki-pages.yml");
+      await writeFile(
+        workflowPath,
+        (await readFile(workflowPath, "utf8")).replace("path: quartz/public", "path: quartz/content"),
+        "utf8",
+      );
+
+      // Act
+      const uninitializedStatus = await runCliBuffered([
+        "deploy",
+        "github-pages",
+        "status",
+        "--repo",
+        uninitializedWiki,
+        "--json",
+      ]);
+      const invalidWorkflowStatus = await runCliBuffered([
+        "deploy",
+        "github-pages",
+        "status",
+        "--repo",
+        invalidWorkflowWiki,
+        "--json",
+      ]);
+      const uninitializedInstructions = parseDeployStatus(uninitializedStatus.stdout).data.setup_instructions;
+      const invalidWorkflowInstructions = parseDeployStatus(invalidWorkflowStatus.stdout).data.setup_instructions;
+      const publishInstruction = "Run llm-wiki deploy github-pages build-local to generate committed Pages output in quartz/public.";
+
+      // Assert
+      expect(uninitializedStatus.exitCode).toBe(0);
+      expect(uninitializedInstructions[0]).toBe("Run llm-wiki deploy github-pages init.");
+      expect(uninitializedInstructions.indexOf("Run llm-wiki explore init before building GitHub Pages output.")).toBeLessThan(
+        uninitializedInstructions.indexOf(publishInstruction),
+      );
+      expect(invalidWorkflowStatus.exitCode).toBe(0);
+      expect(invalidWorkflowInstructions[0]).toBe(
+        "Regenerate the GitHub Pages workflow with llm-wiki deploy github-pages init.",
+      );
+      expect(invalidWorkflowInstructions.indexOf(invalidWorkflowInstructions[0] ?? "")).toBeLessThan(
+        invalidWorkflowInstructions.indexOf(publishInstruction),
+      );
     });
   });
 });

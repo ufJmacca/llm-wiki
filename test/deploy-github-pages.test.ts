@@ -641,6 +641,61 @@ visibility:
     });
   });
 
+  it.each([
+    {
+      profilePath: ".llm-wiki/profiles/github-pages.yml",
+      mutate: (content: string) => content.replace("  upload: false", "  upload: true"),
+      expectedCode: "PROFILE_UPLOAD_FEATURE_FORBIDDEN",
+      expectedMessage: "upload",
+    },
+    {
+      profilePath: ".llm-wiki/profiles/public.yml",
+      mutate: (content: string) => content.replace("  upload: false", "  upload: false\n  review_panel: true"),
+      expectedCode: "PROFILE_REVIEW_FEATURE_FORBIDDEN",
+      expectedMessage: "review_panel",
+    },
+  ] as const)(
+    "maps forbidden public-like feature config in $profilePath to deploy profile error $expectedCode",
+    async ({ profilePath, mutate, expectedCode, expectedMessage }) => {
+      await withTempWorkspace("llm-wiki-deploy-pages-forbidden-profile-feature-", async (workspaceDir) => {
+        // Arrange
+        const wikiDir = resolve(workspaceDir, "wiki");
+        await initializeWiki(wikiDir);
+        await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--custom-domain", "docs.example.com"]);
+        const absoluteProfilePath = resolve(wikiDir, profilePath);
+        await writeFile(absoluteProfilePath, mutate(await readFile(absoluteProfilePath, "utf8")), "utf8");
+
+        // Act
+        const status = await runCliBuffered(["deploy", "github-pages", "status", "--repo", wikiDir, "--json"]);
+        const check = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+        const statusPayload = parseDeployStatus(status.stdout);
+        const checkPayload = parseDeployFailure(check.stdout);
+
+        // Assert
+        expect(status.exitCode).toBe(0);
+        expect(statusPayload.data.profiles).toMatchObject({
+          status: "invalid",
+          error: {
+            code: expectedCode,
+            path: profilePath,
+            message: expect.stringContaining(expectedMessage),
+          },
+        });
+        expect(check.exitCode).toBe(1);
+        expect(checkPayload.error).toMatchObject({
+          code: expectedCode,
+          message: expect.stringContaining(expectedMessage),
+        });
+        expect(checkPayload.issues).toEqual([
+          expect.objectContaining({
+            code: expectedCode,
+            path: profilePath,
+          }),
+        ]);
+      });
+    },
+  );
+
   it.each(["not a url", "ftp://docs.example.com/wiki", "https://docs.example.com/wiki?preview=true", "https://docs.example.com/%2e%2e/private"])(
     "rejects edited deploy profile base_url values that are not safe absolute HTTPS URLs: %s",
     async (baseUrl) => {

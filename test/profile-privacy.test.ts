@@ -171,6 +171,37 @@ describe("profile privacy scaffold contract", () => {
     }
   });
 
+  it("scopes upload and review feature flags to private-capable profiles", async () => {
+    // Arrange
+    const parent = await mkdtemp(resolve(tmpdir(), "llm-wiki-profile-private-features-"));
+    const targetDir = resolve(parent, "wiki");
+
+    try {
+      await createWiki(targetDir, defaultOptions);
+
+      // Act
+      const localProfile = await readProfile(targetDir, "local");
+      const reviewProfile = await readProfile(targetDir, "review");
+      const publicProfile = await readProfile(targetDir, "public");
+
+      // Assert
+      expect(localProfile.features).toMatchObject({
+        upload: true,
+        review_panel: true,
+      });
+      expect(reviewProfile.features).toMatchObject({
+        review_panel: true,
+      });
+      expect(publicProfile.features).toMatchObject({
+        upload: false,
+      });
+      expect(publicProfile.features?.review).not.toBe(true);
+      expect(publicProfile.features?.review_panel).not.toBe(true);
+    } finally {
+      await rm(parent, { force: true, recursive: true });
+    }
+  });
+
   it("pairs public profile defaults with fail-closed lint rules", async () => {
     // Arrange
     const parent = await mkdtemp(resolve(tmpdir(), "llm-wiki-profile-lint-rules-"));

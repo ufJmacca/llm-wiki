@@ -1404,6 +1404,188 @@ safety:
     });
   });
 
+  it.each([
+    {
+      profile: "public",
+      featureName: "upload",
+      expectedRule: "public_profile_upload_feature_forbidden",
+    },
+    {
+      profile: "public",
+      featureName: "review",
+      expectedRule: "public_profile_review_feature_forbidden",
+    },
+    {
+      profile: "public",
+      featureName: "review_panel",
+      expectedRule: "public_profile_review_feature_forbidden",
+    },
+    {
+      profile: "github-pages",
+      featureName: "upload",
+      expectedRule: "public_profile_upload_feature_forbidden",
+    },
+    {
+      profile: "github-pages",
+      featureName: "review",
+      expectedRule: "public_profile_review_feature_forbidden",
+    },
+    {
+      profile: "github-pages",
+      featureName: "review_panel",
+      expectedRule: "public_profile_review_feature_forbidden",
+    },
+  ] as const)(
+    "fails strict lint when the $profile profile enables forbidden public-like feature features.$featureName",
+    async ({ profile, featureName, expectedRule }) => {
+      await withTempWorkspace(`llm-wiki-lint-${profile}-forbidden-feature-`, async (workspaceDir) => {
+        // Arrange
+        const wikiDir = resolve(workspaceDir, "wiki");
+        await initializeWiki(wikiDir);
+        await writeCuratedPage(
+          wikiDir,
+          "curated/home.md",
+          { type: "page", title: "Home", visibility: "public", source_ids: [] },
+          "# Home\n",
+        );
+        await writeFile(
+          resolve(wikiDir, `.llm-wiki/profiles/${profile}.yml`),
+          `name: ${profile}
+mode: deploy
+include:
+  - curated/home.md
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+features:
+  search: true
+  graph: true
+  backlinks: true
+  ${featureName}: true
+safety:
+  fail_on_private_pages: true
+  fail_on_private_links: true
+  fail_on_raw_links: true
+  fail_on_public_graph_private_nodes: true
+  fail_on_public_search_private_text: true
+`,
+          "utf8",
+        );
+
+        // Act
+        const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", profile, "--strict", "--json"]);
+        const payload = parseLintFailure(result.stdout);
+
+        // Assert
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toEqual([]);
+        expect(payload.error.code).toBe("lint_failed");
+        expectStableIssueRecords(payload.issues);
+        expect(issueByRuleAndPath(payload.issues, expectedRule, `.llm-wiki/profiles/${profile}.yml`)).toMatchObject({
+          severity: "error",
+          message: expect.stringContaining(`features.${featureName}`),
+          fixable: false,
+        });
+      });
+    },
+  );
+
+  it.each([
+    {
+      profile: "public",
+      include: "_llm-wiki/upload.md",
+      expectedRule: "public_profile_upload_route_forbidden",
+      expectedPath: "_llm-wiki/upload.md",
+      expectedMessage: "upload",
+      expectedFixHintPatterns: ["_llm-wiki/upload.md", "_llm-wiki/upload/**"],
+    },
+    {
+      profile: "public",
+      include: "_llm-wiki/review/**",
+      expectedRule: "public_profile_review_route_forbidden",
+      expectedPath: "_llm-wiki/review/overview.md",
+      expectedMessage: "review",
+      expectedFixHintPatterns: ["_llm-wiki/review/**"],
+    },
+    {
+      profile: "github-pages",
+      include: "_llm-wiki/upload.md",
+      expectedRule: "public_profile_upload_route_forbidden",
+      expectedPath: "_llm-wiki/upload.md",
+      expectedMessage: "upload",
+      expectedFixHintPatterns: ["_llm-wiki/upload.md", "_llm-wiki/upload/**"],
+    },
+    {
+      profile: "github-pages",
+      include: "_llm-wiki/review/**",
+      expectedRule: "public_profile_review_route_forbidden",
+      expectedPath: "_llm-wiki/review/overview.md",
+      expectedMessage: "review",
+      expectedFixHintPatterns: ["_llm-wiki/review/**"],
+    },
+  ] as const)(
+    "fails strict lint when the $profile profile config selects forbidden local Explorer route $include",
+    async ({ profile, include, expectedRule, expectedPath, expectedMessage, expectedFixHintPatterns }) => {
+      await withTempWorkspace(`llm-wiki-lint-${profile}-forbidden-route-`, async (workspaceDir) => {
+        // Arrange
+        const wikiDir = resolve(workspaceDir, "wiki");
+        await initializeWiki(wikiDir);
+        await writeCuratedPage(
+          wikiDir,
+          "curated/home.md",
+          { type: "page", title: "Home", visibility: "public", source_ids: [] },
+          "# Home\n",
+        );
+        await writeFile(
+          resolve(wikiDir, `.llm-wiki/profiles/${profile}.yml`),
+          `name: ${profile}
+mode: deploy
+include:
+  - curated/home.md
+  - ${include}
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+features:
+  search: true
+  graph: true
+  backlinks: true
+  upload: false
+safety:
+  fail_on_private_pages: true
+  fail_on_private_links: true
+  fail_on_raw_links: true
+  fail_on_public_graph_private_nodes: true
+  fail_on_public_search_private_text: true
+`,
+          "utf8",
+        );
+
+        // Act
+        const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", profile, "--strict", "--json"]);
+        const payload = parseLintFailure(result.stdout);
+
+        // Assert
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toEqual([]);
+        expect(payload.error.code).toBe("lint_failed");
+        expectStableIssueRecords(payload.issues);
+        const routeIssue = issueByRuleAndPath(payload.issues, expectedRule, expectedPath);
+        expect(routeIssue).toMatchObject({
+          severity: "error",
+          message: expect.stringContaining(expectedMessage),
+          fix_hint: expect.stringContaining(expectedFixHintPatterns[0]),
+          fixable: false,
+        });
+        for (const pattern of expectedFixHintPatterns) {
+          expect(routeIssue.fix_hint).toContain(pattern);
+        }
+      });
+    },
+  );
+
   it("ignores scaffold placeholders selected by the generated public profile", async () => {
     await withTempWorkspace("llm-wiki-lint-public-gitkeep-", async (workspaceDir) => {
       // Arrange

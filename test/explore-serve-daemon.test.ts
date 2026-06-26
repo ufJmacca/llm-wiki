@@ -49,6 +49,7 @@ type ExploreServeWithDaemonEnvelope = {
       url: string;
       upload_path: "/api/raw-upload";
       upload_token: string;
+      upload_session_id: string;
       commit_uploads: boolean;
     };
   };
@@ -98,6 +99,7 @@ type LocalDaemonRuntimeMetadata =
       upload_path: "/api/raw-upload";
       token_header: string;
       upload_token: string;
+      upload_session_id?: string;
       commit_uploads: boolean;
       auto_ingest_available: boolean;
       updated_at: string;
@@ -470,12 +472,15 @@ describe("explore serve local upload daemon integration", () => {
       expect(payload.data.daemon.port).toBeGreaterThan(0);
       expect(payload.data.daemon.url).toBe(`http://127.0.0.1:${payload.data.daemon.port}`);
       expect(payload.data.daemon.upload_token).toMatch(/^[a-f0-9]{64}$/);
+      expect(payload.data.daemon.upload_session_id).toMatch(/^upl_[a-f0-9]{16}$/);
+      expect(payload.data.daemon.upload_session_id).not.toBe(payload.data.daemon.upload_token);
       expect(metadataAtSpawn).toMatchObject({
         enabled: true,
         url: payload.data.daemon.url,
         upload_path: "/api/raw-upload",
         token_header: "x-llm-wiki-upload-token",
         upload_token: payload.data.daemon.upload_token,
+        upload_session_id: payload.data.daemon.upload_session_id,
         commit_uploads: false,
         auto_ingest_available: false,
       });
@@ -486,6 +491,7 @@ describe("explore serve local upload daemon integration", () => {
         upload_path: "/api/raw-upload",
         token_header: "x-llm-wiki-upload-token",
         upload_token: payload.data.daemon.upload_token,
+        upload_session_id: payload.data.daemon.upload_session_id,
         commit_uploads: false,
         auto_ingest_available: false,
       });
@@ -1084,12 +1090,14 @@ describe("explore serve local upload daemon integration", () => {
       });
       expect(payload.data.daemon.port).toBeGreaterThan(0);
       expect(payload.data.daemon.upload_token).toMatch(/^[a-f0-9]{64}$/);
+      expect(payload.data.daemon.upload_session_id).toMatch(/^upl_[a-f0-9]{16}$/);
       expect(metadataAtSpawn).toMatchObject({
         enabled: true,
         url: payload.data.daemon.url,
         upload_path: "/api/raw-upload",
         token_header: "x-llm-wiki-upload-token",
         upload_token: payload.data.daemon.upload_token,
+        upload_session_id: payload.data.daemon.upload_session_id,
         commit_uploads: false,
         auto_ingest_available: false,
       });

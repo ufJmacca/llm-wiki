@@ -64,6 +64,7 @@ export type QuartzLocalDaemonRuntimeMetadata =
       upload_path: string;
       token_header: string;
       upload_token: string;
+      upload_session_id?: string;
       commit_uploads: boolean;
       auto_ingest_available: boolean;
       updated_at?: string;

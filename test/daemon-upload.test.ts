@@ -30,6 +30,7 @@ type UploadSuccessEnvelope = {
     source_card_path: string;
     original_path: string;
     created_paths: string[];
+    message: string;
     commit: {
       attempted: boolean;
       ok: boolean;
@@ -52,6 +53,9 @@ type UploadFailureEnvelope = {
     hint: string;
   }>;
 };
+
+const ONE_MIB = 1024 * 1024;
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
 async function initializeWiki(targetDir: string): Promise<void> {
   const result = await runCliBuffered(["init", targetDir, "--no-git", "--json"]);
@@ -149,6 +153,39 @@ function textUploadForm(title: string, text: string): FormData {
   form.set("text", text);
 
   return form;
+}
+
+function fileUploadForm(fileName: string, content: BlobPart, type: string): FormData {
+  const form = new FormData();
+  form.set("file", new Blob([content], { type }), fileName);
+
+  return form;
+}
+
+function urlUploadForm(url: string, title?: string): FormData {
+  const form = new FormData();
+  if (title !== undefined) {
+    form.set("title", title);
+  }
+  form.set("url", url);
+
+  return form;
+}
+
+function expectSafeFailureEnvelope(
+  payload: UploadFailureEnvelope,
+  forbiddenValues: string[],
+): void {
+  const serialized = JSON.stringify(payload);
+
+  for (const forbiddenValue of forbiddenValues) {
+    expect(serialized).not.toContain(forbiddenValue);
+  }
+  expect(payload.error.message).not.toMatch(/\/tmp\/|\/workspace\/|[A-Z]:\\/);
+  for (const issue of payload.issues) {
+    expect(issue.message).not.toMatch(/\/tmp\/|\/workspace\/|[A-Z]:\\/);
+    expect(issue.path).not.toMatch(/\/tmp\/|\/workspace\/|[A-Z]:\\/);
+  }
 }
 
 function parseSourceCardFrontmatter<T>(content: string): T {
@@ -316,6 +353,7 @@ describe("local upload daemon", () => {
             },
           },
         });
+        expect(upload.body.data.message).toBe("Raw source uploaded and queued for ingest.");
         expect(upload.body.data.source_id).toMatch(/^src_\d{4}_\d{2}_\d{2}_meeting_notes_[a-f0-9]{12}$/);
         expect(upload.body.data.original_path).toMatch(/raw\/inputs\/\d{4}\/\d{2}\/.+\/original\.md$/);
         expect(upload.body.data.source_card_path).toBe(upload.body.data.original_path.replace(/original\.md$/, "_source.md"));
@@ -445,7 +483,7 @@ describe("local upload daemon", () => {
         expect(rejectedBody).toMatchObject({
           ok: false,
           error: {
-            code: "UPLOAD_CSRF_TOKEN_INVALID",
+            code: "UPLOAD_AUTH_FAILED",
           },
         });
       } finally {
@@ -482,6 +520,50 @@ describe("local upload daemon", () => {
             code: "UPLOAD_ORIGIN_NOT_ALLOWED",
           },
         });
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("rejects non-POST raw upload requests with a stable method error envelope", async () => {
+    await withTempWorkspace("llm-wiki-daemon-method-not-allowed-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+      try {
+        // Act
+        const response = await fetch(`${daemon.url}/api/raw-upload`, {
+          method: "GET",
+          headers: {
+            [UPLOAD_TOKEN_HEADER]: daemon.uploadToken,
+          },
+        });
+        const payload = await response.json() as UploadFailureEnvelope;
+        const queueFiles = (await readdir(resolve(wikiDir, "raw/queue"))).filter((entry) => entry.endsWith(".json"));
+
+        // Assert
+        expect(response.status).toBe(405);
+        expect(payload).toEqual({
+          ok: false,
+          error: {
+            code: "UPLOAD_METHOD_NOT_ALLOWED",
+            message: "Raw uploads must use POST.",
+            hint: "Send a multipart/form-data POST request to /api/raw-upload.",
+          },
+          issues: [
+            {
+              severity: "error",
+              code: "UPLOAD_METHOD_NOT_ALLOWED",
+              message: "Raw uploads must use POST.",
+              path: "/api/raw-upload",
+              hint: "Send a multipart/form-data POST request to /api/raw-upload.",
+            },
+          ],
+        });
+        expect(queueFiles).toEqual([]);
       } finally {
         await daemon.close();
       }
@@ -528,6 +610,7 @@ describe("local upload daemon", () => {
           source_card_path: firstUpload.body.data.source_card_path,
           queue_path: firstUpload.body.data.queue_path,
         });
+        expect(secondUpload.body.data.message).toBe("Raw source was already captured; no new artifacts were created.");
         expect(secondUpload.body.data.created_paths).toEqual([]);
         expect(sourceCard).toMatchObject({
           origin: "local-upload:text",
@@ -941,14 +1024,14 @@ describe("local upload daemon", () => {
         expect(payload).toMatchObject({
           ok: false,
           error: {
-            code: "UPLOAD_CSRF_TOKEN_INVALID",
-            message: "Raw upload requests must include a valid upload token.",
-            hint: `Set the ${UPLOAD_TOKEN_HEADER} header to the daemon upload_token value from readiness output.`,
+            code: "UPLOAD_AUTH_FAILED",
+            message: "Upload authentication failed.",
+            hint: "Refresh the local Explorer session and retry the upload.",
           },
         });
         expect(payload.issues[0]).toMatchObject({
           severity: "error",
-          code: "UPLOAD_CSRF_TOKEN_INVALID",
+          code: "UPLOAD_AUTH_FAILED",
           path: UPLOAD_TOKEN_HEADER,
         });
         expect(commitUpload).not.toHaveBeenCalled();
@@ -997,17 +1080,17 @@ describe("local upload daemon", () => {
         expect(payload).toEqual({
           ok: false,
           error: {
-            code: "UPLOAD_CSRF_TOKEN_INVALID",
-            message: "Raw upload requests must include a valid upload token.",
-            hint: `Set the ${UPLOAD_TOKEN_HEADER} header to the daemon upload_token value from readiness output.`,
+            code: "UPLOAD_AUTH_FAILED",
+            message: "Upload authentication failed.",
+            hint: "Refresh the local Explorer session and retry the upload.",
           },
           issues: [
             {
               severity: "error",
-              code: "UPLOAD_CSRF_TOKEN_INVALID",
-              message: "Raw upload requests must include a valid upload token.",
+              code: "UPLOAD_AUTH_FAILED",
+              message: "Upload authentication failed.",
               path: UPLOAD_TOKEN_HEADER,
-              hint: `Set the ${UPLOAD_TOKEN_HEADER} header to the daemon upload_token value from readiness output.`,
+              hint: "Refresh the local Explorer session and retry the upload.",
             },
           ],
         });
@@ -1018,7 +1101,45 @@ describe("local upload daemon", () => {
     });
   });
 
-  it("rejects multipart text fields that exceed the explicit field limit", async () => {
+  it("rejects invalid tokens without echoing tokens, bodies, secrets, or filesystem paths", async () => {
+    await withTempWorkspace("llm-wiki-daemon-auth-safe-envelope-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const forgedToken = "forged-token-secret-value";
+      const rawBodySecret = "raw-body-secret-value";
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+      try {
+        const form = textUploadForm("Forged Safe Envelope", rawBodySecret);
+
+        // Act
+        const response = await fetch(`${daemon.url}/api/raw-upload`, {
+          method: "POST",
+          headers: {
+            [UPLOAD_TOKEN_HEADER]: forgedToken,
+          },
+          body: form,
+        });
+        const payload = await response.json() as UploadFailureEnvelope;
+
+        // Assert
+        expect(response.status).toBe(403);
+        expect(payload.error.code).toBe("UPLOAD_AUTH_FAILED");
+        expectSafeFailureEnvelope(payload, [
+          forgedToken,
+          daemon.uploadToken,
+          rawBodySecret,
+          workspaceDir,
+          wikiDir,
+        ]);
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("rejects multipart text fields that exceed the explicit 1 MiB field limit", async () => {
     await withTempWorkspace("llm-wiki-daemon-field-limit-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
@@ -1038,7 +1159,7 @@ describe("local upload daemon", () => {
       try {
         const form = new FormData();
         form.set("title", "Oversized Text");
-        form.set("text", "x".repeat((25 * 1024 * 1024) + 1));
+        form.set("text", "x".repeat(ONE_MIB + 1));
 
         // Act
         const response = await fetch(`${daemon.url}/api/raw-upload`, {
@@ -1056,7 +1177,7 @@ describe("local upload daemon", () => {
           ok: false,
           error: {
             code: "UPLOAD_TOO_LARGE",
-            message: "Multipart field \"text\" exceeds the 26214400 byte limit.",
+            message: "Multipart field \"text\" exceeds the 1048576 byte limit.",
           },
         });
         expect(payload.issues[0]).toMatchObject({
@@ -1065,6 +1186,79 @@ describe("local upload daemon", () => {
           path: "text",
         });
         expect(commitUpload).not.toHaveBeenCalled();
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("accepts text fields at the 1 MiB limit", async () => {
+    await withTempWorkspace("llm-wiki-daemon-field-limit-boundary-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+      try {
+        const form = textUploadForm("Max Text", "x".repeat(ONE_MIB));
+
+        // Act
+        const upload = await uploadForm(daemon, form);
+
+        // Assert
+        expect(upload.status).toBe(201);
+        expect(upload.body.data).toMatchObject({
+          status: "added",
+          title: "Max Text",
+          source_kind: "text",
+          message: "Raw source uploaded and queued for ingest.",
+        });
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it.each([
+    ["title", (form: FormData) => form.set("title", "x".repeat(ONE_MIB + 1))],
+    ["url", (form: FormData) => form.set("url", `http://127.0.0.1/${"x".repeat(ONE_MIB)}`)],
+  ])("rejects %s fields that exceed the explicit 1 MiB field limit", async (fieldName, mutateForm) => {
+    await withTempWorkspace(`llm-wiki-daemon-${fieldName}-limit-`, async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+      try {
+        const form = fieldName === "title"
+          ? textUploadForm("Allowed Title", "Body under the limit.")
+          : urlUploadForm("http://127.0.0.1/source");
+        mutateForm(form);
+
+        // Act
+        const response = await fetch(`${daemon.url}/api/raw-upload`, {
+          method: "POST",
+          headers: {
+            [UPLOAD_TOKEN_HEADER]: daemon.uploadToken,
+          },
+          body: form,
+        });
+        const payload = await response.json() as UploadFailureEnvelope;
+
+        // Assert
+        expect(response.status).toBe(413);
+        expect(payload).toMatchObject({
+          ok: false,
+          error: {
+            code: "UPLOAD_TOO_LARGE",
+            message: `Multipart field "${fieldName}" exceeds the 1048576 byte limit.`,
+          },
+        });
+        expect(payload.issues[0]).toMatchObject({
+          severity: "error",
+          code: "UPLOAD_TOO_LARGE",
+          path: fieldName,
+        });
       } finally {
         await daemon.close();
       }
@@ -1178,6 +1372,309 @@ describe("local upload daemon", () => {
         });
         expect(queueFiles).toEqual([]);
         expect(commitUpload).not.toHaveBeenCalled();
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("rejects malformed multipart bodies before capture", async () => {
+    await withTempWorkspace("llm-wiki-daemon-malformed-multipart-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const rawBodySecret = "malformed-raw-body-secret";
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+      try {
+        // Act
+        const response = await fetch(`${daemon.url}/api/raw-upload`, {
+          method: "POST",
+          headers: {
+            "content-type": "multipart/form-data; boundary=broken-boundary",
+            [UPLOAD_TOKEN_HEADER]: daemon.uploadToken,
+          },
+          body: `--broken-boundary\r\nContent-Disposition: form-data; name="text"\r\n\r\n${rawBodySecret}`,
+        });
+        const payload = await response.json() as UploadFailureEnvelope;
+        const queueFiles = (await readdir(resolve(wikiDir, "raw/queue"))).filter((entry) => entry.endsWith(".json"));
+
+        // Assert
+        expect(response.status).toBe(400);
+        expect(payload).toMatchObject({
+          ok: false,
+          error: {
+            code: "UPLOAD_MULTIPART_INVALID",
+          },
+        });
+        expectSafeFailureEnvelope(payload, [rawBodySecret, daemon.uploadToken, workspaceDir, wikiDir]);
+        expect(queueFiles).toEqual([]);
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it.each([
+    {
+      name: "missing payload",
+      form: () => {
+        const form = new FormData();
+        form.set("title", "Metadata Only");
+        return form;
+      },
+      expectedMessage: "Raw upload payload must include exactly one file, text note, or URL.",
+    },
+    {
+      name: "text plus url payload kinds",
+      form: () => {
+        const form = textUploadForm("Two Payloads", "Text body.\n");
+        form.set("url", "https://example.com/source");
+        return form;
+      },
+      expectedMessage: "Raw upload payload must include exactly one file, text note, or URL.",
+    },
+    {
+      name: "file plus text payload kinds",
+      form: () => {
+        const form = fileUploadForm("mixed.md", "File body.\n", "text/markdown");
+        form.set("title", "Mixed Payloads");
+        form.set("text", "Text body.\n");
+        return form;
+      },
+      expectedMessage: "Raw upload payload must include exactly one file, text note, or URL.",
+    },
+    {
+      name: "file plus url payload kinds",
+      form: () => {
+        const form = fileUploadForm("mixed.md", "File body.\n", "text/markdown");
+        form.set("url", "https://example.com/source");
+        return form;
+      },
+      expectedMessage: "Raw upload payload must include exactly one file, text note, or URL.",
+    },
+    {
+      name: "missing text title",
+      form: () => {
+        const form = new FormData();
+        form.set("text", "Text body without required title.\n");
+        return form;
+      },
+      expectedMessage: "Text uploads require a title.",
+    },
+  ])("rejects $name with the PRD payload error code", async (scenario) => {
+    await withTempWorkspace(`llm-wiki-daemon-payload-${scenario.name.replaceAll(" ", "-")}-`, async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+      try {
+        // Act
+        const response = await fetch(`${daemon.url}/api/raw-upload`, {
+          method: "POST",
+          headers: {
+            [UPLOAD_TOKEN_HEADER]: daemon.uploadToken,
+          },
+          body: scenario.form(),
+        });
+        const payload = await response.json() as UploadFailureEnvelope;
+        const queueFiles = (await readdir(resolve(wikiDir, "raw/queue"))).filter((entry) => entry.endsWith(".json"));
+
+        // Assert
+        expect(response.status).toBe(400);
+        expect(payload).toMatchObject({
+          ok: false,
+          error: {
+            code: "UPLOAD_PAYLOAD_INVALID",
+            message: scenario.expectedMessage,
+          },
+        });
+        expect(payload.issues[0]).toMatchObject({
+          severity: "error",
+          code: "UPLOAD_PAYLOAD_INVALID",
+        });
+        expect(queueFiles).toEqual([]);
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("rejects invalid URL payloads with the PRD URL error code", async () => {
+    await withTempWorkspace("llm-wiki-daemon-invalid-url-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const unsafeUrl = "file:///etc/passwd";
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+      try {
+        // Act
+        const response = await fetch(`${daemon.url}/api/raw-upload`, {
+          method: "POST",
+          headers: {
+            [UPLOAD_TOKEN_HEADER]: daemon.uploadToken,
+          },
+          body: urlUploadForm(unsafeUrl),
+        });
+        const payload = await response.json() as UploadFailureEnvelope;
+
+        // Assert
+        expect(response.status).toBe(400);
+        expect(payload).toMatchObject({
+          ok: false,
+          error: {
+            code: "URL_INVALID",
+            message: "URL capture requires a valid http(s) URL.",
+          },
+        });
+        expect(payload.issues[0]).toMatchObject({
+          severity: "error",
+          code: "URL_INVALID",
+          path: "url",
+        });
+        expectSafeFailureEnvelope(payload, [unsafeUrl, "/etc/passwd", daemon.uploadToken, workspaceDir, wikiDir]);
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it.each([
+    ["notes.md", "text/markdown"],
+    ["notes.md", "application/octet-stream"],
+    ["notes.markdown", "text/markdown"],
+    ["notes.markdown", "application/octet-stream"],
+    ["notes.txt", "text/plain"],
+    ["notes.pdf", "application/pdf"],
+  ])("accepts allowed file type %s with MIME %s", async (fileName, mimeType) => {
+    await withTempWorkspace(`llm-wiki-daemon-allowed-${fileName}-`, async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const content = mimeType === "application/pdf"
+        ? "%PDF-1.4\n% local test PDF body\n"
+        : "Allowed file upload body.\n";
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+      try {
+        // Act
+        const upload = await uploadForm(daemon, fileUploadForm(fileName, content, mimeType));
+
+        // Assert
+        expect(upload.status).toBe(201);
+        expect(upload.body.data).toMatchObject({
+          status: "added",
+          source_kind: "file",
+          visibility: "private",
+          message: "Raw source uploaded and queued for ingest.",
+        });
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it.each([
+    {
+      fileName: "notes.exe",
+      mimeType: "text/plain",
+      expectedMessage: "File uploads must use .md, .markdown, .txt, or .pdf extensions.",
+    },
+    {
+      fileName: "notes.md",
+      mimeType: "application/json",
+      expectedMessage: "File uploads must use text/markdown, text/plain, or application/pdf MIME types.",
+    },
+    {
+      fileName: "notes.txt",
+      mimeType: "application/octet-stream",
+      expectedMessage: "File uploads must use text/markdown, text/plain, or application/pdf MIME types.",
+    },
+  ])("rejects unsupported file type $fileName with MIME $mimeType", async (scenario) => {
+    await withTempWorkspace(`llm-wiki-daemon-unsupported-${scenario.fileName}-`, async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const bodySecret = "unsupported-body-secret";
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+      try {
+        // Act
+        const response = await fetch(`${daemon.url}/api/raw-upload`, {
+          method: "POST",
+          headers: {
+            [UPLOAD_TOKEN_HEADER]: daemon.uploadToken,
+          },
+          body: fileUploadForm(scenario.fileName, bodySecret, scenario.mimeType),
+        });
+        const payload = await response.json() as UploadFailureEnvelope;
+        const queueFiles = (await readdir(resolve(wikiDir, "raw/queue"))).filter((entry) => entry.endsWith(".json"));
+
+        // Assert
+        expect(response.status).toBe(415);
+        expect(payload).toMatchObject({
+          ok: false,
+          error: {
+            code: "UPLOAD_TYPE_UNSUPPORTED",
+            message: scenario.expectedMessage,
+          },
+        });
+        expect(payload.issues[0]).toMatchObject({
+          severity: "error",
+          code: "UPLOAD_TYPE_UNSUPPORTED",
+          path: "file",
+        });
+        expectSafeFailureEnvelope(payload, [bodySecret, workspaceDir, wikiDir]);
+        expect(queueFiles).toEqual([]);
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("accepts file uploads at the 25 MiB limit and rejects larger files", async () => {
+    await withTempWorkspace("llm-wiki-daemon-file-size-limit-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+      try {
+        const maxFile = new Uint8Array(MAX_FILE_BYTES).fill(0x61);
+        const oversizedFile = new Uint8Array(MAX_FILE_BYTES + 1).fill(0x62);
+
+        // Act
+        const accepted = await uploadForm(daemon, fileUploadForm("max.txt", maxFile, "text/plain"));
+        const rejectedResponse = await fetch(`${daemon.url}/api/raw-upload`, {
+          method: "POST",
+          headers: {
+            [UPLOAD_TOKEN_HEADER]: daemon.uploadToken,
+          },
+          body: fileUploadForm("too-large.txt", oversizedFile, "text/plain"),
+        });
+        const rejected = await rejectedResponse.json() as UploadFailureEnvelope;
+
+        // Assert
+        expect(accepted.status).toBe(201);
+        expect(accepted.body.data).toMatchObject({
+          status: "added",
+          source_kind: "file",
+        });
+        expect(rejectedResponse.status).toBe(413);
+        expect(rejected).toMatchObject({
+          ok: false,
+          error: {
+            code: "UPLOAD_TOO_LARGE",
+            message: "Uploaded file exceeds the 26214400 byte limit.",
+          },
+        });
+        expect(rejected.issues[0]).toMatchObject({
+          severity: "error",
+          code: "UPLOAD_TOO_LARGE",
+          path: "file",
+        });
       } finally {
         await daemon.close();
       }

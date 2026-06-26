@@ -336,7 +336,7 @@ describe("generated LlmWikiUploadForm component", () => {
             form.urlInput.value = "";
             Object.defineProperty(form.fileInput, "files", {
               configurable: true,
-              value: [new File(["# Browser File\n\nPrivate file body.\n"], "Browser File.md", { type: "text/markdown" })],
+              value: [new File(["# Browser File\n\nPrivate file body.\n"], "Browser File.md")],
             });
           });
           const textUpload = await submitLiveUpload(form, "text", () => {
@@ -457,15 +457,15 @@ describe("generated LlmWikiUploadForm component", () => {
       return jsonResponse({
         ok: false,
         error: {
-          code: "UPLOAD_CSRF_TOKEN_INVALID",
-          message: "Raw upload requests must include a valid upload token.",
+          code: "UPLOAD_AUTH_FAILED",
+          message: "Upload authentication failed.",
           hint: "Set the upload token header from runtime metadata.",
         },
         issues: [
           {
             severity: "error",
-            code: "UPLOAD_CSRF_TOKEN_INVALID",
-            message: "Raw upload requests must include a valid upload token.",
+            code: "UPLOAD_AUTH_FAILED",
+            message: "Upload authentication failed.",
             path: "x-llm-wiki-upload-token",
             hint: "Set the upload token header from runtime metadata.",
           },
@@ -483,9 +483,9 @@ describe("generated LlmWikiUploadForm component", () => {
     submit(form);
 
     // Assert
-    await waitFor(() => expect(form.status.textContent).toBe("Raw upload requests must include a valid upload token."));
-    expect(detailValue(form.details, "Code")).toBe("UPLOAD_CSRF_TOKEN_INVALID");
-    expect(detailValue(form.details, "Message")).toBe("Raw upload requests must include a valid upload token.");
+    await waitFor(() => expect(form.status.textContent).toBe("Upload authentication failed."));
+    expect(detailValue(form.details, "Code")).toBe("UPLOAD_AUTH_FAILED");
+    expect(detailValue(form.details, "Message")).toBe("Upload authentication failed.");
     expect(detailValue(form.details, "Hint")).toBe("Set the upload token header from runtime metadata.");
     expect(detailValue(form.details, "Path")).toBe("x-llm-wiki-upload-token");
     expect(detailValue(form.details, "Browser guidance")).toBe(

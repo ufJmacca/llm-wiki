@@ -99,7 +99,8 @@ describe("README local Explorer upload and review documentation", () => {
       "A successful browser upload shows the title, `source_id`, source kind, queue status, source card path, original path, and next ingest command.",
       "llm-wiki ingest <source_id>",
       "llm-wiki ingest <source_id> --auto",
-      "Local browser upload is different from `llm-wiki upload init --target github`: the local form talks only to the loopback daemon in the current wiki, while the remote upload scaffold prepares a future hosted PR-first backend.",
+      "Remote/serverless upload scaffolding is outside the v1 GitHub Pages path and is not exposed as a public CLI workflow.",
+      "The supported upload path is the loopback daemon started by Explorer.",
     ];
 
     // Act
@@ -108,6 +109,26 @@ describe("README local Explorer upload and review documentation", () => {
     // Assert
     for (const expectedText of requiredDocumentation) {
       expect(readme).toContain(expectedText);
+    }
+  });
+
+  it("does not advertise removed standalone daemon or remote upload scaffold commands", async () => {
+    // Arrange
+    const removedPublicCommandDocs = [
+      ["llm-wiki", "daemon"].join(" "),
+      ["llm-wiki", "upload", "init", "--target", "github"].join(" "),
+      ["`daemon`", "starts"].join(" "),
+      ["`upload", "init", "--target", "github`"].join(" "),
+      ["remote upload scaffold", "generation"].join(" "),
+    ];
+
+    // Act
+    const readme = await readReadme();
+
+    // Assert
+    expect(readme).toContain("The standalone daemon and remote upload scaffold commands are not part of the v1 public CLI.");
+    for (const removedText of removedPublicCommandDocs) {
+      expect(readme).not.toContain(removedText);
     }
   });
 

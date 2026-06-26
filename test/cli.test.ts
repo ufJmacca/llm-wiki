@@ -121,6 +121,51 @@ describe("llm-wiki CLI baseline", () => {
     expect(stderr).toEqual([]);
   });
 
+  it("omits removed daemon and upload commands from root help", async () => {
+    // Arrange
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+
+    // Act
+    const exitCode = await runCli(["--help"], {
+      stdout: (message) => stdout.push(message),
+      stderr: (message) => stderr.push(message),
+    });
+    const help = stdout.join("\n");
+
+    // Assert
+    expect(exitCode).toBe(0);
+    expect(stderr).toEqual([]);
+    expect(help).toContain("explore");
+    expect(help).toContain("deploy");
+    expect(help).not.toMatch(/\bdaemon\b/);
+    expect(help).not.toMatch(/\bupload\b/);
+  });
+
+  it("exits non-zero for removed standalone daemon and upload commands", async () => {
+    // Arrange
+    const daemonOutput = { stdout: [] as string[], stderr: [] as string[] };
+    const uploadOutput = { stdout: [] as string[], stderr: [] as string[] };
+
+    // Act
+    const daemonExitCode = await runCli(["daemon"], {
+      stdout: (message) => daemonOutput.stdout.push(message),
+      stderr: (message) => daemonOutput.stderr.push(message),
+    });
+    const uploadExitCode = await runCli(["upload", "init", "--target", "github"], {
+      stdout: (message) => uploadOutput.stdout.push(message),
+      stderr: (message) => uploadOutput.stderr.push(message),
+    });
+
+    // Assert
+    expect(daemonExitCode).toBeGreaterThan(0);
+    expect(uploadExitCode).toBeGreaterThan(0);
+    expect(daemonOutput.stdout).toEqual([]);
+    expect(uploadOutput.stdout).toEqual([]);
+    expect(daemonOutput.stderr.join("\n")).toContain("unknown command 'daemon'");
+    expect(uploadOutput.stderr.join("\n")).toContain("unknown command 'upload'");
+  });
+
   it("describes ingest manual, local agent, auto, validation, and HTTP provider modes in help", async () => {
     // Arrange
     const stdout: string[] = [];

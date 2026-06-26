@@ -467,6 +467,7 @@ describe("explore build command", () => {
           existsSync(resolve(wikiDir, "quartz/content/curated/home.md"));
         rmSync(resolve(wikiDir, "quartz/public"), { recursive: true, force: true });
         mkdirSync(resolve(wikiDir, "quartz/public/raw/inputs/2026/06/src_upload"), { recursive: true });
+        writeFileSync(resolve(wikiDir, "quartz/public/index.html"), "<!doctype html><title>Pages</title>\n", "utf8");
         writeFileSync(
           resolve(wikiDir, "quartz/public/raw/inputs/2026/06/src_upload/original.md"),
           "# Raw Upload\n",
@@ -631,6 +632,7 @@ describe("explore build command", () => {
         const layout = readFileSync(resolve(wikiDir, "quartz/quartz.layout.ts"), "utf8");
         uploadImportPresentBeforeBuild = layout.includes('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"');
         mkdirSync(resolve(wikiDir, "quartz/public/assets"), { recursive: true });
+        writeFileSync(resolve(wikiDir, "quartz/public/index.html"), "<!doctype html><title>Pages</title>\n", "utf8");
         writeFileSync(resolve(wikiDir, "quartz/public/assets/upload.js"), "LlmWikiUploadForm\n", "utf8");
 
         const child = new EventEmitter() as ChildProcessWithoutNullStreams;
@@ -696,6 +698,7 @@ describe("explore build command", () => {
           }
 
           mkdirSync(resolve(wikiDir, "quartz/public/assets"), { recursive: true });
+          writeFileSync(resolve(wikiDir, "quartz/public/index.html"), "<!doctype html><title>Pages</title>\n", "utf8");
           writeFileSync(resolve(wikiDir, "quartz/public/assets/upload.js"), "LlmWikiUploadForm\n", "utf8");
           child.emit("close", 0, null);
         });

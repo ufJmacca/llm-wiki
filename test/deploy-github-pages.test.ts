@@ -276,12 +276,32 @@ function mockQuartzBuildDoesNotCreatePublicOutput(): void {
   });
 }
 
+function mockQuartzBuildCreatesPublicDirectoryWithoutIndex(): void {
+  spawnMock.mockImplementation((_command: string, _args: string[], options: SpawnOptionsWithoutStdio) => {
+    const cwd = typeof options.cwd === "string" ? options.cwd : "";
+    const wikiDir = resolve(cwd, "..");
+    rmSync(resolve(wikiDir, "quartz/public"), { recursive: true, force: true });
+    mkdirSync(resolve(wikiDir, "quartz/public/assets"), { recursive: true });
+    writeFileSync(resolve(wikiDir, "quartz/public/assets/app.js"), "console.log('pages shell')\n", "utf8");
+
+    const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = new PassThrough();
+    child.kill = vi.fn();
+    queueMicrotask(() => child.emit("close", 0, null));
+
+    return child;
+  });
+}
+
 function mockQuartzBuildEmitsPublicUploadLeak(): void {
   spawnMock.mockImplementation((_command: string, _args: string[], options: SpawnOptionsWithoutStdio) => {
     const cwd = typeof options.cwd === "string" ? options.cwd : "";
     const wikiDir = resolve(cwd, "..");
     const leakDir = resolve(wikiDir, "quartz/public/assets");
     mkdirSync(leakDir, { recursive: true });
+    writeFileSync(resolve(wikiDir, "quartz/public/index.html"), "<!doctype html><title>Pages</title>\n", "utf8");
     writeFileSync(resolve(leakDir, "upload.js"), "LlmWikiUploadForm\n", "utf8");
 
     const child = new EventEmitter() as ChildProcessWithoutNullStreams;
@@ -2928,6 +2948,41 @@ export default config
     });
   });
 
+  it("fails build-local when Quartz exits successfully without producing the Pages homepage", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-build-local-missing-homepage-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      mockQuartzBuildCreatesPublicDirectoryWithoutIndex();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--custom-domain", "docs.example.com"]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["deploy", "github-pages", "build-local", "--repo", wikiDir, "--json"]);
+      const payload = parseDeployFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(spawnMock).toHaveBeenCalled();
+      expect(payload.error).toEqual({
+        code: "PUBLIC_PROFILE_ARTIFACT_INCOMPLETE",
+        message: "Quartz build did not produce the expected Pages homepage.",
+        hint: "Ensure the Quartz build writes quartz/public/index.html before rerunning llm-wiki explore build.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "PUBLIC_PROFILE_ARTIFACT_INCOMPLETE",
+          path: "quartz/public/index.html",
+        }),
+      ]);
+    });
+  });
+
   it("fails build-local when the Quartz build emits static upload leaks into the Pages artifact", async () => {
     await withTempWorkspace("llm-wiki-deploy-pages-build-local-post-build-leak-", async (workspaceDir) => {
       // Arrange
@@ -2960,6 +3015,75 @@ export default config
           path: "quartz/public/assets/upload.js",
         }),
       ]);
+    });
+  });
+
+  it("produces a reviewable publication diff that excludes private raw upload artifacts", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-reviewable-diff-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      mockSuccessfulQuartzBuild();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeGitRepository(wikiDir, "git@github.com:example-org/research-wiki.git");
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await execFileAsync("git", ["add", "--all"], { cwd: wikiDir });
+      await execFileAsync(
+        "git",
+        ["-c", "user.name=llm-wiki", "-c", "user.email=llm-wiki@example.invalid", "commit", "-m", "baseline"],
+        { cwd: wikiDir },
+      );
+
+      const rawUpload = await runCliBuffered([
+        "add-text",
+        "--repo",
+        wikiDir,
+        "--title",
+        "Private Uploaded Notes",
+        "--text",
+        "Queued private upload body that must not be published.",
+        "--json",
+      ]);
+      const publicPagePath = "curated/topics/reviewed-public.md";
+      await writeCuratedPage(
+        wikiDir,
+        publicPagePath,
+        {
+          type: "topic",
+          title: "Reviewed Public",
+          visibility: "public",
+          source_ids: [],
+        },
+        "# Reviewed Public\n\nA reviewed public page ready for publication.\n",
+      );
+
+      // Act
+      const buildLocal = await runCliBuffered(["deploy", "github-pages", "build-local", "--repo", wikiDir, "--json"]);
+      await execFileAsync("git", ["add", "--", publicPagePath, "quartz/public"], { cwd: wikiDir });
+      const { stdout: stagedStdout } = await execFileAsync("git", ["diff", "--cached", "--name-only"], { cwd: wikiDir });
+      const { stdout: workspaceStdout } = await execFileAsync("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
+        cwd: wikiDir,
+      });
+      const manifest = await readFile(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.github-pages.json"), "utf8");
+      const pagesIndex = await readFile(resolve(wikiDir, "quartz/public/index.html"), "utf8");
+      const stagedPaths = stagedStdout.trim().split("\n").filter(Boolean);
+
+      // Assert
+      expect(rawUpload.exitCode).toBe(0);
+      expect(buildLocal.exitCode).toBe(0);
+      expect(stagedPaths).toEqual([publicPagePath, "quartz/public/index.html"]);
+      expect(stagedPaths.some((path) => path.startsWith("raw/") || path.startsWith("quartz/public/raw/"))).toBe(false);
+      expect(stagedPaths).not.toContain("curated/log.md");
+      expect(workspaceStdout).toContain("raw/inputs/");
+      expect(workspaceStdout).toContain("raw/queue/");
+      expect(workspaceStdout).toContain("curated/log.md");
+      expect(manifest).toContain(`"source_path": "${publicPagePath}"`);
+      expect(manifest).not.toContain("raw/inputs/");
+      expect(manifest).not.toContain("raw/queue/");
+      expect(pagesIndex).not.toContain("Queued private upload body");
     });
   });
 

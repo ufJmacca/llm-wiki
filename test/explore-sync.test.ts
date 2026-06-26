@@ -77,6 +77,7 @@ type ReviewFrontmatter = {
     href: string;
     count_key?: string;
   }>;
+  llm_wiki_upload_page_enabled?: boolean;
 };
 
 type SourceCaptureData = {
@@ -318,7 +319,7 @@ async function makeDefaultCuratedPagesPublic(wikiDir: string): Promise<void> {
   }
 }
 
-function expectedLocalReviewGeneratedPaths(options: { includeRoot?: boolean } = {}): string[] {
+function expectedLocalReviewGeneratedPaths(options: { includeRoot?: boolean; includeUpload?: boolean } = {}): string[] {
   const paths = [
     "quartz/content/_llm-wiki/review/contradictions.md",
     "quartz/content/_llm-wiki/review/needs-review.md",
@@ -330,8 +331,10 @@ function expectedLocalReviewGeneratedPaths(options: { includeRoot?: boolean } = 
     "quartz/content/_llm-wiki/review/stale-pages.md",
     "quartz/content/_llm-wiki/review/status.md",
     "quartz/content/_llm-wiki/review/visibility-warnings.md",
-    "quartz/content/_llm-wiki/upload.md",
   ];
+  if (options.includeUpload === true) {
+    paths.push("quartz/content/_llm-wiki/upload.md");
+  }
   if (options.includeRoot === true) {
     paths.push("quartz/content/index.md");
   }
@@ -406,7 +409,7 @@ async function listTree(rootDir: string, relativeDir: string): Promise<string[]>
 }
 
 describe("explore sync command", () => {
-  it("materializes local Markdown, raw source cards, upload entrypoint, root page, and full review page set", async () => {
+  it("materializes local Markdown, raw source cards, root page, and review pages without an inactive upload entrypoint", async () => {
     await withTempWorkspace("llm-wiki-explore-sync-local-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
@@ -432,7 +435,6 @@ describe("explore sync command", () => {
       const overview = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/overview.md");
       const status = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/status.md");
       const sourceQueue = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/source-queue.md");
-      const upload = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/upload.md");
 
       // Assert
       expect(result.exitCode).toBe(0);
@@ -441,10 +443,11 @@ describe("explore sync command", () => {
       expect(payload.data.materialized_paths).toContain("quartz/content/curated/home.md");
       expect(payload.data.materialized_paths).toContain("quartz/content/index.md");
       expect(payload.data.generated_paths).toEqual(expectedLocalReviewGeneratedPaths());
+      expect(payload.data.generated_paths).not.toContain("quartz/content/_llm-wiki/upload.md");
       expect(payload.data.excluded_paths).toEqual(expect.arrayContaining([expect.stringMatching(/original\.md$/)]));
       expect(syncedPaths).toContain("quartz/content/curated/home.md");
       expect(syncedPaths).toContain("quartz/content/index.md");
-      expect(syncedPaths).toContain("quartz/content/_llm-wiki/upload.md");
+      expect(syncedPaths).not.toContain("quartz/content/_llm-wiki/upload.md");
       expect(syncedPaths).toContain("quartz/content/_llm-wiki/review/status.md");
       expect(syncedPaths).toContain("quartz/content/_llm-wiki/review/source-queue.md");
       expect(syncedPaths.some((path) => path.endsWith("/_source.md"))).toBe(true);
@@ -453,13 +456,12 @@ describe("explore sync command", () => {
       expect(manifest.files.some((file) => file.source_path.endsWith("/_source.md"))).toBe(true);
       expect(manifest.files.some((file) => file.source_path.endsWith("/original.md"))).toBe(false);
       expect(manifest.generated_files.map((file) => file.content_path)).toEqual(expectedLocalReviewGeneratedPaths());
-      expect(upload).toContain("llm_wiki_component: LlmWikiUploadForm");
-      expect(upload).toContain("llm_wiki_upload: true");
-      expect(upload).not.toContain("<LlmWikiUploadForm");
       expect(overview).toContain("llm_wiki_component: LlmWikiReviewPanel");
       expect(overview).toContain("| Queue total | 1 |");
       expect(status).toContain("| Queued | 1 |");
       expect(sourceQueue).toContain("llm_wiki_component: LlmWikiQueueDashboard");
+      expect(sourceQueue).toContain("llm_wiki_upload_page_enabled: false");
+      expect(sourceQueue).not.toContain("_llm-wiki/upload");
       expect(sourceQueue).toContain(capture.source.source_id);
       expect(sourceQueue).toContain("Queue Note");
     });
@@ -693,6 +695,7 @@ describe("explore sync command", () => {
           llm_wiki_queue_ingesting: 1,
           llm_wiki_queue_blocked: 1,
           llm_wiki_queue_completed: 1,
+          llm_wiki_upload_page_enabled: false,
         });
         expect(frontmatter.llm_wiki_queue_items).toEqual([
           expect.objectContaining({
@@ -1062,14 +1065,19 @@ describe("explore sync command", () => {
         const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", profile, "--json"]);
         const payload = parseExploreSync(result.stdout);
         const rootIndex = await readGeneratedFile(wikiDir, "quartz/content/index.md");
+        const sourceQueue = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/source-queue.md");
+        const sourceQueueFrontmatter = parseGeneratedFrontmatter(sourceQueue);
 
         // Assert
         expect(result.exitCode).toBe(0);
         expect(result.stderr).toEqual([]);
         expect(payload.data.generated_paths).toEqual(expectedLocalReviewGeneratedPaths({ includeRoot: true }));
+        expect(payload.data.generated_paths).not.toContain("quartz/content/_llm-wiki/upload.md");
         expect(payload.data.materialized_paths).not.toContain("quartz/content/curated/index.md");
+        expect(sourceQueueFrontmatter.llm_wiki_upload_page_enabled).toBe(false);
+        expect(sourceQueue).not.toContain("_llm-wiki/upload");
         expect(rootIndex).toContain("[[curated/home|Curated home]]");
-        expect(rootIndex).toContain("[[_llm-wiki/upload|Upload]]");
+        expect(rootIndex).not.toContain("[[_llm-wiki/upload|Upload]]");
         expect(rootIndex).toContain("[[_llm-wiki/review/overview|Review overview]]");
         expect(rootIndex).toContain("[[_llm-wiki/review/status|Status]]");
         expect(rootIndex).toContain("[[_llm-wiki/review/source-queue|Source queue]]");
@@ -1428,7 +1436,7 @@ visibility:
     });
   });
 
-  it("materializes review profile content with upload, root, full review pages, and no raw originals", async () => {
+  it("materializes review profile content with root and review pages, no inactive upload entrypoint, and no raw originals", async () => {
     await withTempWorkspace("llm-wiki-explore-sync-review-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
@@ -1458,9 +1466,11 @@ visibility:
       expect(result.stderr).toEqual([]);
       expect(payload.data.profile).toBe("review");
       expect(payload.data.generated_paths).toEqual(expectedLocalReviewGeneratedPaths());
+      expect(payload.data.generated_paths).not.toContain("quartz/content/_llm-wiki/upload.md");
       expect(manifest.profile).toBe("review");
       expect(manifest.files.some((file) => file.source_path.endsWith("/_source.md"))).toBe(true);
       expect(manifest.files.some((file) => file.source_path.includes("raw/queue/"))).toBe(false);
+      await expect(pathExists(resolve(wikiDir, "quartz/content/_llm-wiki/upload.md"))).resolves.toBe(false);
       expect(overview).toContain("| Source queue | 1 |");
       expect(sourceQueue).toContain(capture.source.source_id);
       expect(sourceQueue).toContain("Review Queue Note");

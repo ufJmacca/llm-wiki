@@ -54,6 +54,7 @@ export type QuartzSyncResult = {
 
 export type QuartzSyncOptions = {
   preserveContentRoot?: boolean;
+  uploadDaemonActive?: boolean;
 };
 
 export type QuartzLocalDaemonRuntimeMetadata =
@@ -316,7 +317,9 @@ export async function syncQuartzContent(
     : localRootMaterializedPageDefinitions(selection.markdown, selection.excludedRawOriginals);
   const privateExplorerPages = publicLike
     ? []
-    : localExplorerPageDefinitions(profile, scan, selection.markdown);
+    : localExplorerPageDefinitions(profile, scan, selection.markdown, {
+        includeUploadPage: options.uploadDaemonActive === true,
+      });
   const buildHomepagePages = publicLike
     ? quartzBuildHomepageDefinitions(selection.markdown, selection.excludedRawOriginals)
     : [];
@@ -832,25 +835,29 @@ function localExplorerPageDefinitions(
   profile: WikiProfile,
   scan: RepoScan,
   files: readonly RepoMarkdownFile[],
+  options: { includeUploadPage?: boolean } = {},
 ): StaticReviewPage[] {
   const reviewScan = filterReviewScanForProfile(scan, profile);
   const reviewData = buildReviewDataModel(scan, {
     profile,
     materializedMarkdownPaths: new Set(files.map((file) => file.path)),
   });
-  const fallbackHomepage = localGeneratedHomepageDefinition(files);
+  const includeUploadPage = options.includeUploadPage === true;
+  const fallbackHomepage = localGeneratedHomepageDefinition(files, { includeUploadPage });
 
   return [
     ...(fallbackHomepage === null ? [] : [fallbackHomepage]),
-    {
-      path: "quartz/content/_llm-wiki/upload.md",
-      title: "Upload",
-      content: uploadPageContent(),
-    },
+    ...(includeUploadPage
+      ? [{
+          path: "quartz/content/_llm-wiki/upload.md",
+          title: "Upload",
+          content: uploadPageContent(),
+        }]
+      : []),
     {
       path: "quartz/content/_llm-wiki/review/overview.md",
       title: "Review Overview",
-      content: reviewOverviewContent(reviewData),
+      content: reviewOverviewContent(reviewData, { includeUploadPage }),
     },
     {
       path: "quartz/content/_llm-wiki/review/profile-summary.md",
@@ -860,7 +867,7 @@ function localExplorerPageDefinitions(
     {
       path: "quartz/content/_llm-wiki/review/source-queue.md",
       title: "Source Queue",
-      content: sourceQueueContent(reviewData),
+      content: sourceQueueContent(reviewData, { includeUploadPage }),
     },
     {
       path: "quartz/content/_llm-wiki/review/recent-ingests.md",
@@ -925,7 +932,7 @@ function localExplorerPageDefinitions(
     {
       path: "quartz/content/_llm-wiki/review/status.md",
       title: "Review Status",
-      content: reviewStatusContent(reviewData),
+      content: reviewStatusContent(reviewData, { includeUploadPage }),
     },
   ];
 }
@@ -953,7 +960,10 @@ function localRootMaterializedPageDefinitions(
   return [];
 }
 
-function localGeneratedHomepageDefinition(files: readonly RepoMarkdownFile[]): StaticReviewPage | null {
+function localGeneratedHomepageDefinition(
+  files: readonly RepoMarkdownFile[],
+  options: { includeUploadPage?: boolean } = {},
+): StaticReviewPage | null {
   if (
     files.some(materializesToQuartzBuildHomepage) ||
     files.some((file) => file.path === QUARTZ_BUILD_HOMEPAGE_SOURCE_PATH)
@@ -964,7 +974,7 @@ function localGeneratedHomepageDefinition(files: readonly RepoMarkdownFile[]): S
   return {
     path: QUARTZ_BUILD_HOMEPAGE_CONTENT_PATH,
     title: "LLM Wiki Home",
-    content: generatedLocalHomeContent(),
+    content: generatedLocalHomeContent({ includeUploadPage: options.includeUploadPage === true }),
   };
 }
 
@@ -2994,6 +3004,7 @@ function slugFromMarkdownPath(path: string): FullSlug {
 const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
   const frontmatter = fileData.frontmatter ?? {}
   const currentSlug = fileData.slug ?? ("index" as FullSlug)
+  const uploadPageEnabled = booleanValue(frontmatter.llm_wiki_upload_page_enabled)
   const counts = [
     ["Total", numberValue(frontmatter.llm_wiki_queue_total)],
     ["Queued", numberValue(frontmatter.llm_wiki_queue_queued)],
@@ -3021,7 +3032,10 @@ const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
         <div class="llm-wiki-queue-dashboard__zero">
           <p>No sources are currently queued.</p>
           <p>
-            <a class="internal" href={resolveRelative(currentSlug, "_llm-wiki/upload" as FullSlug)}>Upload sources</a>{" "}
+            {uploadPageEnabled ? (
+              <a class="internal" href={resolveRelative(currentSlug, "_llm-wiki/upload" as FullSlug)}>Upload sources</a>
+            ) : null}
+            {" "}
             <a class="internal" href={resolveRelative(currentSlug, "_llm-wiki/review/source-queue" as FullSlug)}>Open source queue</a>
           </p>
         </div>
@@ -4059,14 +4073,15 @@ llm-wiki explore sync --profile local
 `;
 }
 
-function generatedLocalHomeContent(): string {
+function generatedLocalHomeContent(options: { includeUploadPage?: boolean } = {}): string {
+  const uploadLink = options.includeUploadPage === true ? "- [[_llm-wiki/upload|Upload]]\n" : "";
+
   return `${generatedPageFrontmatter("LLM Wiki Home", "LlmWikiReviewPanel")}# LLM Wiki Home
 
 Start from the generated Explorer surfaces below.
 
 - [[curated/home|Curated home]]
-- [[_llm-wiki/upload|Upload]]
-- [[_llm-wiki/review/overview|Review overview]]
+${uploadLink}- [[_llm-wiki/review/overview|Review overview]]
 - [[_llm-wiki/review/status|Status]]
 - [[_llm-wiki/review/source-queue|Source queue]]
 `;
@@ -4077,8 +4092,8 @@ function uploadPageContent(): string {
 `;
 }
 
-function reviewOverviewContent(reviewData: ReviewDataModel): string {
-  return `${generatedReviewPageFrontmatter("Review Overview", "LlmWikiReviewPanel", reviewData, queueDashboardFrontmatterFields(reviewData))}# Review Overview
+function reviewOverviewContent(reviewData: ReviewDataModel, options: { includeUploadPage?: boolean } = {}): string {
+  return `${generatedReviewPageFrontmatter("Review Overview", "LlmWikiReviewPanel", reviewData, queueDashboardFrontmatterFields(reviewData, options))}# Review Overview
 
 ## Status
 
@@ -4106,8 +4121,8 @@ function reviewOverviewContent(reviewData: ReviewDataModel): string {
 `;
 }
 
-function reviewStatusContent(reviewData: ReviewDataModel): string {
-  return `${generatedReviewPageFrontmatter("Review Status", "LlmWikiReviewPanel", reviewData, queueDashboardFrontmatterFields(reviewData))}# Review Status
+function reviewStatusContent(reviewData: ReviewDataModel, options: { includeUploadPage?: boolean } = {}): string {
+  return `${generatedReviewPageFrontmatter("Review Status", "LlmWikiReviewPanel", reviewData, queueDashboardFrontmatterFields(reviewData, options))}# Review Status
 
 | Status | Count |
 |---|---:|
@@ -4137,7 +4152,7 @@ function profileSummaryContent(reviewData: ReviewDataModel, scan: RepoScan): str
 `;
 }
 
-function sourceQueueContent(reviewData: ReviewDataModel): string {
+function sourceQueueContent(reviewData: ReviewDataModel, options: { includeUploadPage?: boolean } = {}): string {
   const rows = reviewData.queue.items.map((item) =>
     [
       item.source_id,
@@ -4152,7 +4167,7 @@ function sourceQueueContent(reviewData: ReviewDataModel): string {
   );
 
   return `${generatedReviewPageFrontmatter("Source Queue", "LlmWikiQueueDashboard", reviewData, [
-    ...queueDashboardFrontmatterFields(reviewData),
+    ...queueDashboardFrontmatterFields(reviewData, options),
     "llm_wiki_source_badge: true",
   ])}# Source Queue
 
@@ -4174,8 +4189,9 @@ ${reviewItemsJson(reviewData.queue.items)}
 `;
 }
 
-function queueDashboardFrontmatterFields(reviewData: ReviewDataModel): string[] {
+function queueDashboardFrontmatterFields(reviewData: ReviewDataModel, options: { includeUploadPage?: boolean } = {}): string[] {
   const frontmatter = {
+    llm_wiki_upload_page_enabled: options.includeUploadPage === true,
     llm_wiki_queue_dashboard: true,
     llm_wiki_queue_total: reviewData.queue.counts.total,
     llm_wiki_queue_queued: reviewData.queue.counts.queued,

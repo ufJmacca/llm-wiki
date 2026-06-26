@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
 import { resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "node:child_process";
@@ -52,6 +53,24 @@ type ExploreServeWithDaemonEnvelope = {
     };
   };
   warnings: string[];
+};
+
+type ExploreServeFailureEnvelope = {
+  ok: false;
+  command: "explore.serve";
+  repo: string;
+  error: {
+    code: string;
+    message: string;
+    hint: string;
+  };
+  issues: Array<{
+    severity: "error";
+    code: string;
+    message: string;
+    path: string;
+    hint: string;
+  }>;
 };
 
 type UploadSuccessEnvelope = {
@@ -203,6 +222,12 @@ function parseExploreServe(stdout: string[]): ExploreServeWithDaemonEnvelope {
   return JSON.parse(stdout[0]) as ExploreServeWithDaemonEnvelope;
 }
 
+function parseExploreServeFailure(stdout: string[]): ExploreServeFailureEnvelope {
+  expect(stdout).toHaveLength(1);
+
+  return JSON.parse(stdout[0]) as ExploreServeFailureEnvelope;
+}
+
 type ExecFileCallback = (error: (Error & { code?: number | string }) | null, stdout: string, stderr: string) => void;
 
 function mockGitOutsideWorkTree(options: { allowUploadCommit: boolean }): void {
@@ -258,6 +283,53 @@ function restoreEnvValue(key: string, value: string | undefined): void {
   }
 
   process.env[key] = value;
+}
+
+async function writeGitHubPagesProfile(wikiDir: string): Promise<void> {
+  const publicProfile = await readFile(resolve(wikiDir, ".llm-wiki/profiles/public.yml"), "utf8");
+  await writeFile(
+    resolve(wikiDir, ".llm-wiki/profiles/github-pages.yml"),
+    publicProfile.replace(
+      /^name: public\nmode: deploy\n/u,
+      "name: github-pages\nmode: deploy\nbase_url: https://docs.example.com\n",
+    ),
+    "utf8",
+  );
+}
+
+async function withOccupiedLoopbackPort<T>(run: (port: number) => Promise<T>): Promise<T> {
+  const server = createServer();
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", rejectListen);
+      resolveListen();
+    });
+  });
+  const address = server.address();
+  if (typeof address !== "object" || address === null) {
+    await closeServer(server);
+    throw new Error("Could not reserve a loopback port for daemon profile gate assertions.");
+  }
+
+  try {
+    return await run(address.port);
+  } finally {
+    await closeServer(server);
+  }
+}
+
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>((resolveClose, rejectClose) => {
+    server.close((error) => {
+      if (error !== undefined) {
+        rejectClose(error);
+        return;
+      }
+
+      resolveClose();
+    });
+  });
 }
 
 function expectScrubbedGitOptions(options: unknown, cwd: string): void {
@@ -368,6 +440,7 @@ describe("explore serve local upload daemon integration", () => {
       const metadata = JSON.parse(
         await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/runtime/local-daemon.json"),
       ) as LocalDaemonRuntimeMetadata;
+      const sourceQueue = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/source-queue.md");
       const form = new FormData();
       form.set("title", "Explorer Upload");
       form.set("text", "Explorer daemon upload body.\n");
@@ -417,6 +490,7 @@ describe("explore serve local upload daemon integration", () => {
         auto_ingest_available: false,
       });
       expect(metadata.updated_at).toEqual(expect.any(String));
+      expect(sourceQueue).toContain("llm_wiki_upload_page_enabled: true");
       expect(uploadResponse.status).toBe(201);
       expect(upload).toMatchObject({
         ok: true,
@@ -1033,83 +1107,135 @@ describe("explore serve local upload daemon integration", () => {
     });
   });
 
-  it("does not write token-bearing daemon metadata for public profile serves after sync", async () => {
-    await withTempWorkspace("llm-wiki-explore-serve-daemon-public-no-metadata-", async (workspaceDir) => {
-      // Arrange
-      mockGitOutsideWorkTree({ allowUploadCommit: false });
-      const quartz = mockLongRunningQuartz();
-      const wikiDir = resolve(workspaceDir, "wiki");
-      const stdout: string[] = [];
-      const stderr: string[] = [];
-      const metadataPath = "quartz/content/_llm-wiki/runtime/local-daemon.json";
-      await initializeWiki(wikiDir);
-      await initializeQuartzRuntime(wikiDir);
-      await markQuartzDependenciesInstalled(wikiDir);
-      await makeDefaultCuratedPagesPublic(wikiDir);
-      await writeLocalDaemonRuntimeMetadata(wikiDir, {
-        enabled: true,
-        url: "http://127.0.0.1:9",
-        upload_path: "/api/raw-upload",
-        token_header: "x-llm-wiki-upload-token",
-        upload_token: "stale-public-token",
-        commit_uploads: true,
-        auto_ingest_available: true,
-        updated_at: "2026-06-23T00:00:00.000Z",
-      });
-
-      // Act
-      const serveResult = runCli([
-        "explore",
-        "serve",
-        "--repo",
-        wikiDir,
-        "--profile",
-        "public",
-        "--port",
-        "8792",
-        "--with-daemon",
-        "--daemon-port",
-        "0",
-        "--json",
-      ], {
-        stdout: (message) => stdout.push(message),
-        stderr: (message) => stderr.push(message),
-        stdin: async () => "",
-      });
-      await Promise.race([
-        quartz.waitUntilStarted(),
-        serveResult.then((exitCode) => {
-          throw new Error(`explore serve exited before Quartz started: ${exitCode}; stderr=${stderr.join("\n")}`);
-        }),
-      ]);
-      await waitFor(
-        async () => stdout.join("\n"),
-        (content) => content.includes("\"ok\":true"),
-        "public serve JSON readiness envelope without daemon runtime metadata",
-      );
-      const payload = parseExploreServe(stdout);
-
-      // Assert
-      expect(stderr).toEqual([]);
-      expect(payload.data).toMatchObject({
-        profile: "public",
-        host: "127.0.0.1",
-        port: 8792,
-        daemon: {
-          host: "127.0.0.1",
+  it.each(["public", "github-pages"] as const)(
+    "rejects %s --with-daemon before daemon bind, Quartz readiness, or runtime metadata writes",
+    async (profile) => {
+      await withTempWorkspace(`llm-wiki-explore-serve-daemon-${profile}-forbidden-`, async (workspaceDir) => {
+        // Arrange
+        mockGitOutsideWorkTree({ allowUploadCommit: false });
+        const wikiDir = resolve(workspaceDir, "wiki");
+        const metadataPath = "quartz/content/_llm-wiki/runtime/local-daemon.json";
+        await initializeWiki(wikiDir);
+        await initializeQuartzRuntime(wikiDir);
+        await makeDefaultCuratedPagesPublic(wikiDir);
+        if (profile === "github-pages") {
+          await writeGitHubPagesProfile(wikiDir);
+        }
+        await writeLocalDaemonRuntimeMetadata(wikiDir, {
+          enabled: true,
+          url: "http://127.0.0.1:9",
           upload_path: "/api/raw-upload",
-          commit_uploads: false,
-        },
-      });
-      expect(payload.data.daemon.upload_token).toMatch(/^[a-f0-9]{64}$/);
-      expect(quartz.metadataBeforeServe()).toBeNull();
-      expect(existsSync(resolve(wikiDir, metadataPath))).toBe(false);
+          token_header: "x-llm-wiki-upload-token",
+          upload_token: "stale-public-token",
+          commit_uploads: true,
+          auto_ingest_available: true,
+          updated_at: "2026-06-23T00:00:00.000Z",
+        });
 
-      quartz.close();
-      await expect(serveResult).resolves.toBe(0);
-      expect(existsSync(resolve(wikiDir, metadataPath))).toBe(false);
-    });
-  });
+        // Act
+        await withOccupiedLoopbackPort(async (daemonPort) => {
+          const result = await runCliBuffered([
+            "explore",
+            "serve",
+            "--repo",
+            wikiDir,
+            "--profile",
+            profile,
+            "--port",
+            "8792",
+            "--with-daemon",
+            "--daemon-port",
+            String(daemonPort),
+            "--json",
+          ]);
+          const payload = parseExploreServeFailure(result.stdout);
+
+          // Assert
+          expect(result.exitCode).toBe(1);
+          expect(result.stderr).toEqual([]);
+          expect(payload.error.code).toBe("UPLOAD_DAEMON_PROFILE_FORBIDDEN");
+          expect(payload.error.message).toContain("--with-daemon");
+          expect(payload.error.message).toContain(profile);
+          expect(payload.error.hint).toContain("--profile local");
+          expect(payload.issues).toContainEqual(expect.objectContaining({
+            code: "UPLOAD_DAEMON_PROFILE_FORBIDDEN",
+            path: "--with-daemon",
+          }));
+          expect(result.stdout.join("\n")).not.toMatch(/[a-f0-9]{64}/u);
+          expect(result.stdout.join("\n")).not.toContain("upload_token");
+          expect(spawnMock).not.toHaveBeenCalled();
+          expect(existsSync(resolve(wikiDir, metadataPath))).toBe(false);
+        });
+      });
+    },
+  );
+
+  it.each(["local", "review"] as const)(
+    "serves %s without daemon metadata or an upload page when --with-daemon is omitted",
+    async (profile) => {
+      await withTempWorkspace(`llm-wiki-explore-serve-${profile}-no-daemon-upload-`, async (workspaceDir) => {
+        // Arrange
+        mockGitOutsideWorkTree({ allowUploadCommit: false });
+        const quartz = mockLongRunningQuartz();
+        const wikiDir = resolve(workspaceDir, "wiki");
+        const stdout: string[] = [];
+        const stderr: string[] = [];
+        await initializeWiki(wikiDir);
+        await initializeQuartzRuntime(wikiDir);
+        await markQuartzDependenciesInstalled(wikiDir);
+
+        // Act
+        const serveResult = runCli([
+          "explore",
+          "serve",
+          "--repo",
+          wikiDir,
+          "--profile",
+          profile,
+          "--port",
+          "8792",
+          "--json",
+        ], {
+          stdout: (message) => stdout.push(message),
+          stderr: (message) => stderr.push(message),
+          stdin: async () => "",
+        });
+        await Promise.race([
+          quartz.waitUntilStarted(),
+          serveResult.then((exitCode) => {
+            throw new Error(`explore serve exited before Quartz started: ${exitCode}; stderr=${stderr.join("\n")}`);
+          }),
+        ]);
+        await waitFor(
+          async () => stdout.join("\n"),
+          (content) => content.includes("\"ok\":true"),
+          `${profile} serve JSON readiness envelope without daemon metadata`,
+        );
+        const payload = JSON.parse(stdout[0] ?? "{}") as {
+          data: {
+            profile: "local" | "review";
+            sync: { generated_paths: string[] };
+            daemon?: unknown;
+          };
+        };
+
+        // Assert
+        expect(stderr).toEqual([]);
+        expect(payload.data.profile).toBe(profile);
+        expect(payload.data).not.toHaveProperty("daemon");
+        expect(payload.data.sync.generated_paths).not.toContain("quartz/content/_llm-wiki/upload.md");
+        expect(quartz.metadataBeforeServe()).toBeNull();
+        expect(existsSync(resolve(wikiDir, "quartz/content/_llm-wiki/upload.md"))).toBe(false);
+        expect(existsSync(resolve(wikiDir, "quartz/content/_llm-wiki/runtime/local-daemon.json"))).toBe(false);
+        const sourceQueue = await readGeneratedFile(wikiDir, "quartz/content/_llm-wiki/review/source-queue.md");
+        expect(sourceQueue).toContain("llm_wiki_upload_page_enabled: false");
+        expect(sourceQueue).not.toContain("_llm-wiki/upload");
+
+        quartz.close();
+        await expect(serveResult).resolves.toBe(0);
+      });
+    },
+  );
 
   it("sanitizes disabled daemon metadata so stale token fields cannot be persisted", async () => {
     await withTempWorkspace("llm-wiki-explore-serve-daemon-disabled-metadata-", async (workspaceDir) => {

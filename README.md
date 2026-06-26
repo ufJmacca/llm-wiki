@@ -197,15 +197,15 @@ Review pages are derived from live repository state rather than hidden caches. `
 
 `llm-wiki explore open` reads the recorded Explorer state and prints the current URL. JSON output is stable as `{ url, opened }`; `opened` is currently `false` because the command avoids launching a platform browser process.
 
-`llm-wiki explore build --profile public` runs public sync, strict public lint, then `npm run build` from `quartz/`. Static builds accept only `public` and `github-pages` profiles, and the build stops before sync if a local or review profile is requested. The build also stops before Quartz runs if strict public lint has error-severity issues or dependencies are missing.
+`llm-wiki explore build --profile public` is the safe public Quartz build wrapper. It runs public sync, strict public preflight, invokes the Quartz build with upload runtime stripped from the public layout, materializes configured Pages artifacts, and scans `quartz/public` before returning success. Static builds accept only `public` and `github-pages` profiles, and the build stops before sync if a local or review profile is requested. Use this wrapper instead of running the raw Quartz build directly for public or GitHub Pages output.
 
 ## GitHub Pages Deploy
 
 `llm-wiki deploy github-pages init` writes `.github/workflows/llm-wiki-pages.yml`, `.llm-wiki/profiles/github-pages.yml`, and refreshes `.llm-wiki/profiles/public.yml` with fail-closed public defaults. Without `--custom-domain`, the command infers the Pages base URL from the GitHub `origin` remote. With `--custom-domain docs.example.com`, it uses `https://docs.example.com`.
 
-The generated workflow uses least required Pages permissions (`contents: read`, `pages: write`, `id-token: write`), supports `workflow_dispatch`, sets up Node 22, installs the `llm-wiki` CLI without requiring root npm project files, installs Quartz dependencies under `quartz/`, runs GitHub Pages profile sync, strict public lint, Quartz build, uploads `quartz/public`, and deploys through the official Pages actions.
+The generated workflow uses least required Pages permissions (`contents: read`, `pages: write`, `id-token: write`), supports `workflow_dispatch`, sets up Node 22, installs the `llm-wiki` CLI without requiring root npm project files, installs Quartz dependencies under `quartz/`, runs GitHub Pages profile sync, strict public lint, the safe `llm-wiki explore build --profile github-pages` wrapper, uploads `quartz/public`, and deploys through the official Pages actions.
 
-`llm-wiki deploy github-pages check` validates the workflow, deploy profiles, Quartz runtime dependencies, and strict public preflight. `build-local` runs the same public sync, strict lint, and Quartz build sequence locally. `status` reports readiness without failing on incomplete setup and prints setup instructions such as installing Quartz dependencies and enabling GitHub Pages with Source: GitHub Actions.
+`llm-wiki deploy github-pages check` validates the workflow, deploy profiles, Quartz runtime dependencies, and strict public preflight. `build-local` runs the safe GitHub Pages build wrapper locally and verifies the generated `quartz/public` artifact. `status` reports readiness without failing on incomplete setup and prints setup instructions such as installing Quartz dependencies and enabling GitHub Pages with Source: GitHub Actions.
 
 ## Source Capture
 

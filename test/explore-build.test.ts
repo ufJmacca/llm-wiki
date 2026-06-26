@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { execFile, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { PassThrough } from "node:stream";
@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { stringify } from "yaml";
 import { describe, expect, it, vi } from "vitest";
 
+import { runCli } from "../src/cli.js";
 import { parseInitJson, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
 
 const spawnMock = vi.hoisted(() => vi.fn());
@@ -107,18 +108,32 @@ function mockSuccessfulSpawn(): {
   syncedBeforeBuild: () => boolean;
   rootIndexMaterializedBeforeBuild: () => boolean;
   contentGitignoreAbsentBeforeBuild: () => boolean;
+  uploadRuntimeAbsentBeforeBuild: () => boolean;
 } {
   let syncedBeforeBuild = false;
   let rootIndexMaterializedBeforeBuild = false;
   let contentGitignoreAbsentBeforeBuild = false;
+  let uploadRuntimeAbsentBeforeBuild = false;
   spawnMock.mockImplementation((_command: string, _args: string[], options: SpawnOptionsWithoutStdio) => {
     const cwd = typeof options.cwd === "string" ? options.cwd : "";
     const wikiDir = resolve(cwd, "..");
+    const layout = readFileSync(resolve(wikiDir, "quartz/quartz.layout.ts"), "utf8");
     syncedBeforeBuild =
       existsSync(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.public.json")) &&
       existsSync(resolve(wikiDir, "quartz/content/curated/home.md"));
     rootIndexMaterializedBeforeBuild = existsSync(resolve(wikiDir, "quartz/content/index.md"));
     contentGitignoreAbsentBeforeBuild = !existsSync(resolve(wikiDir, "quartz/content/.gitignore"));
+    uploadRuntimeAbsentBeforeBuild = !layout.includes("LlmWikiUploadForm");
+    rmSync(resolve(wikiDir, "quartz/public"), { recursive: true, force: true });
+    mkdirSync(resolve(wikiDir, "quartz/public"), { recursive: true });
+    writeFileSync(resolve(wikiDir, "quartz/public/index.html"), "<!doctype html><title>Public</title>\n", "utf8");
+    if (!uploadRuntimeAbsentBeforeBuild) {
+      writeFileSync(
+        resolve(wikiDir, "quartz/public/postscript.js"),
+        'const component = "LlmWikiUploadForm"; window.llm_wiki_daemon = true;\n',
+        "utf8",
+      );
+    }
 
     const child = new EventEmitter() as ChildProcessWithoutNullStreams;
     child.stdout = new PassThrough();
@@ -134,6 +149,7 @@ function mockSuccessfulSpawn(): {
     syncedBeforeBuild: () => syncedBeforeBuild,
     rootIndexMaterializedBeforeBuild: () => rootIndexMaterializedBeforeBuild,
     contentGitignoreAbsentBeforeBuild: () => contentGitignoreAbsentBeforeBuild,
+    uploadRuntimeAbsentBeforeBuild: () => uploadRuntimeAbsentBeforeBuild,
   };
 }
 
@@ -174,6 +190,18 @@ async function makeDefaultCuratedPagesPublic(wikiDir: string): Promise<void> {
       `# ${title}\n`,
     );
   }
+}
+
+async function makePublicProfileValidAsGitHubPagesFallback(wikiDir: string): Promise<void> {
+  const publicProfilePath = resolve(wikiDir, ".llm-wiki/profiles/public.yml");
+  const publicProfile = await readFile(publicProfilePath, "utf8");
+  await writeFile(
+    publicProfilePath,
+    publicProfile.replace(/^name: public\nmode: deploy\n/u, "name: public\nmode: deploy\nbase_url: https://docs.example.com\n"),
+    "utf8",
+  );
+  await rm(resolve(wikiDir, ".llm-wiki/profiles/github-pages.yml"), { force: true });
+  await rm(resolve(wikiDir, ".llm-wiki/profiles/github-pages.yaml"), { force: true });
 }
 
 async function withProcessPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T>): Promise<T> {
@@ -246,10 +274,11 @@ describe("explore build command", () => {
       expect(result.stderr).toEqual([]);
       expect(spawnObservation.syncedBeforeBuild()).toBe(true);
       expect(spawnObservation.rootIndexMaterializedBeforeBuild()).toBe(true);
+      expect(spawnObservation.uploadRuntimeAbsentBeforeBuild()).toBe(true);
       expect(spawnMock).toHaveBeenCalledWith(
         "npm",
         ["run", "build"],
-        { cwd: resolve(wikiDir, "quartz"), stdio: ["ignore", "pipe", "pipe"] },
+        expect.objectContaining({ cwd: resolve(wikiDir, "quartz"), stdio: ["ignore", "pipe", "pipe"] }),
       );
       expect(payload.data).toMatchObject({
         profile: "public",
@@ -270,6 +299,318 @@ describe("explore build command", () => {
         },
       });
       await expect(readFile(resolve(wikiDir, "quartz/content/index.md"), "utf8")).resolves.toContain("# Index");
+      await expect(readFile(resolve(wikiDir, "quartz/quartz.layout.ts"), "utf8")).resolves.toContain(
+        'import LlmWikiUploadForm from "./components/LlmWikiUploadForm"',
+      );
+      expect(existsSync(resolve(wikiDir, "quartz/public/postscript.js"))).toBe(false);
+    });
+  });
+
+  it("fails when Quartz exits successfully without producing the Pages output directory", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-missing-public-output-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      spawnMock.mockImplementation((_command: string, _args: string[], options: SpawnOptionsWithoutStdio) => {
+        const cwd = typeof options.cwd === "string" ? options.cwd : "";
+        const wikiDir = resolve(cwd, "..");
+        rmSync(resolve(wikiDir, "quartz/public"), { recursive: true, force: true });
+
+        const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        child.stdin = new PassThrough();
+        child.kill = vi.fn();
+        queueMicrotask(() => child.emit("close", 0, null));
+
+        return child;
+      });
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"]);
+      const payload = parseExploreBuildFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(spawnMock).toHaveBeenCalled();
+      expect(payload.error).toEqual({
+        code: "PUBLIC_PROFILE_ARTIFACT_MISSING",
+        message: "Quartz build did not produce the expected Pages output directory.",
+        hint: "Ensure the Quartz build writes static Pages output to quartz/public before rerunning llm-wiki explore build.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "PUBLIC_PROFILE_ARTIFACT_MISSING",
+          path: "quartz/public",
+        }),
+      ]);
+    });
+  });
+
+  it("does not block a clean public rebuild on stale leaked quartz/public output", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-stale-public-output-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const spawnObservation = mockSuccessfulSpawn();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/public/assets"), { recursive: true });
+      await writeFile(resolve(wikiDir, "quartz/public/assets/upload.js"), "LlmWikiUploadForm\n", "utf8");
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"]);
+      const payload = parseExploreBuild(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(spawnObservation.syncedBeforeBuild()).toBe(true);
+      expect(payload.data.lint.counts.error).toBe(0);
+      expect(existsSync(resolve(wikiDir, "quartz/public/assets/upload.js"))).toBe(false);
+    });
+  });
+
+  it("strips formatted upload runtime blocks before public Quartz builds", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-formatted-upload-runtime-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const spawnObservation = mockSuccessfulSpawn();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      const layoutPath = resolve(wikiDir, "quartz/quartz.layout.ts");
+      const originalLayout = await readFile(layoutPath, "utf8");
+      const formattedLayout = originalLayout.replace(
+        "      component: LlmWikiUploadForm(),",
+        "      component:\n        LlmWikiUploadForm(),",
+      );
+      expect(formattedLayout).not.toBe(originalLayout);
+      await writeFile(layoutPath, formattedLayout, "utf8");
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"]);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(spawnObservation.uploadRuntimeAbsentBeforeBuild()).toBe(true);
+      await expect(readFile(layoutPath, "utf8")).resolves.toBe(formattedLayout);
+      expect(existsSync(resolve(wikiDir, "quartz/public/postscript.js"))).toBe(false);
+    });
+  });
+
+  it("restores the upload layout synchronously when a public Quartz build is interrupted", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-signal-layout-restore-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const beforeSigint = new Set(process.listeners("SIGINT"));
+      const beforeSigterm = new Set(process.listeners("SIGTERM"));
+      let spawned!: ChildProcessWithoutNullStreams;
+      let resolveSpawned!: () => void;
+      const spawnedPromise = new Promise<void>((resolveSpawnedPromise) => {
+        resolveSpawned = resolveSpawnedPromise;
+      });
+      spawnMock.mockImplementation(() => {
+        const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        child.stdin = new PassThrough();
+        child.kill = vi.fn();
+        spawned = child;
+        resolveSpawned();
+
+        return child;
+      });
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      const layoutPath = resolve(wikiDir, "quartz/quartz.layout.ts");
+      const originalLayout = await readFile(layoutPath, "utf8");
+
+      try {
+        // Act
+        const buildResult = runCli(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"], {
+          stdout: (message) => stdout.push(message),
+          stderr: (message) => stderr.push(message),
+          stdin: async () => "",
+        });
+        await spawnedPromise;
+        await expect(readFile(layoutPath, "utf8")).resolves.not.toContain("LlmWikiUploadForm");
+
+        const addedSigintListeners = process.listeners("SIGINT").filter((listener) => !beforeSigint.has(listener));
+        expect(addedSigintListeners.length).toBeGreaterThanOrEqual(2);
+        for (const listener of addedSigintListeners) {
+          listener("SIGINT");
+        }
+        spawned.emit("close", 0, null);
+        const exitCode = await buildResult;
+
+        // Assert
+        expect(exitCode).toBe(1);
+        expect(stderr).toEqual([]);
+        expect(stdout.join("\n")).toContain("Quartz build was interrupted by SIGINT.");
+        await expect(readFile(layoutPath, "utf8")).resolves.toBe(originalLayout);
+        expect(process.listeners("SIGINT").filter((listener) => !beforeSigint.has(listener))).toEqual([]);
+        expect(process.listeners("SIGTERM").filter((listener) => !beforeSigterm.has(listener))).toEqual([]);
+      } finally {
+        for (const listener of process.listeners("SIGINT")) {
+          if (!beforeSigint.has(listener)) {
+            process.off("SIGINT", listener);
+          }
+        }
+        for (const listener of process.listeners("SIGTERM")) {
+          if (!beforeSigterm.has(listener)) {
+            process.off("SIGTERM", listener);
+          }
+        }
+      }
+    });
+  });
+
+  it("keeps customized upload layouts intact when stripping would leave upload references behind", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-custom-upload-runtime-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      let uploadImportPresentBeforeBuild = false;
+      spawnMock.mockImplementation((_command: string, _args: string[], options: SpawnOptionsWithoutStdio) => {
+        const cwd = typeof options.cwd === "string" ? options.cwd : "";
+        const wikiDir = resolve(cwd, "..");
+        const layout = readFileSync(resolve(wikiDir, "quartz/quartz.layout.ts"), "utf8");
+        uploadImportPresentBeforeBuild = layout.includes('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"');
+        mkdirSync(resolve(wikiDir, "quartz/public/assets"), { recursive: true });
+        writeFileSync(resolve(wikiDir, "quartz/public/assets/upload.js"), "LlmWikiUploadForm\n", "utf8");
+
+        const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        child.stdin = new PassThrough();
+        child.kill = vi.fn();
+        queueMicrotask(() => child.emit("close", 0, null));
+
+        return child;
+      });
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      const layoutPath = resolve(wikiDir, "quartz/quartz.layout.ts");
+      const originalLayout = await readFile(layoutPath, "utf8");
+      const customizedLayout = originalLayout.replace(
+        'import LlmWikiUploadForm from "./components/LlmWikiUploadForm"\n',
+        'import LlmWikiUploadForm from "./components/LlmWikiUploadForm"\nconst customUploadRuntime = LlmWikiUploadForm\n',
+      );
+      await writeFile(layoutPath, customizedLayout, "utf8");
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"]);
+      const payload = parseExploreBuildFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(uploadImportPresentBeforeBuild).toBe(true);
+      expect(payload.error).toEqual({
+        code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+        message: "Public profile leak check failed after Quartz build: public_static_upload_component_leak.",
+        hint: "Remove upload, runtime, review, queue, raw, and secret data from committed GitHub Pages static output.",
+      });
+      await expect(readFile(layoutPath, "utf8")).resolves.toBe(customizedLayout);
+    });
+  });
+
+  it("leaves embedded upload render calls intact instead of writing partial TypeScript", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-embedded-upload-runtime-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      let layoutBeforeBuild = "";
+      spawnMock.mockImplementation((_command: string, _args: string[], options: SpawnOptionsWithoutStdio) => {
+        const cwd = typeof options.cwd === "string" ? options.cwd : "";
+        const wikiDir = resolve(cwd, "..");
+        layoutBeforeBuild = readFileSync(resolve(wikiDir, "quartz/quartz.layout.ts"), "utf8");
+
+        const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+        const stderr = new PassThrough();
+        child.stdout = new PassThrough();
+        child.stderr = stderr;
+        child.stdin = new PassThrough();
+        child.kill = vi.fn();
+        queueMicrotask(() => {
+          if (layoutBeforeBuild.includes("const customUpload = \n")) {
+            stderr.write("SyntaxError: expected expression after assignment\n");
+            child.emit("close", 1, null);
+            return;
+          }
+
+          mkdirSync(resolve(wikiDir, "quartz/public/assets"), { recursive: true });
+          writeFileSync(resolve(wikiDir, "quartz/public/assets/upload.js"), "LlmWikiUploadForm\n", "utf8");
+          child.emit("close", 0, null);
+        });
+
+        return child;
+      });
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      const layoutPath = resolve(wikiDir, "quartz/quartz.layout.ts");
+      const originalLayout = await readFile(layoutPath, "utf8");
+      const uploadRuntimeBlock = `    Component.ConditionalRender({
+      component: LlmWikiUploadForm(),
+      condition: (page) =>
+        page.fileData.frontmatter?.llm_wiki_upload === true ||
+        page.fileData.frontmatter?.llm_wiki_component === "LlmWikiUploadForm",
+    }),
+`;
+      const embeddedUploadRuntime = `const customUpload = Component.ConditionalRender({
+  component: LlmWikiUploadForm(),
+  condition: (page) =>
+    page.fileData.frontmatter?.llm_wiki_upload === true ||
+    page.fileData.frontmatter?.llm_wiki_component === "LlmWikiUploadForm",
+})
+
+`;
+      const customizedLayout = originalLayout
+        .replace(
+          'import LlmWikiUploadForm from "./components/LlmWikiUploadForm"\n',
+          `import LlmWikiUploadForm from "./components/LlmWikiUploadForm"\n${embeddedUploadRuntime}`,
+        )
+        .replace(uploadRuntimeBlock, "    customUpload,\n");
+      expect(customizedLayout).not.toBe(originalLayout);
+      await writeFile(layoutPath, customizedLayout, "utf8");
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "public", "--json"]);
+      const payload = parseExploreBuildFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(layoutBeforeBuild).toContain("const customUpload = Component.ConditionalRender");
+      expect(layoutBeforeBuild).toContain('import LlmWikiUploadForm from "./components/LlmWikiUploadForm"');
+      expect(layoutBeforeBuild).not.toContain("const customUpload = \n");
+      expect(payload.error).toEqual({
+        code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+        message: "Public profile leak check failed after Quartz build: public_static_upload_component_leak.",
+        hint: "Remove upload, runtime, review, queue, raw, and secret data from committed GitHub Pages static output.",
+      });
+      await expect(readFile(layoutPath, "utf8")).resolves.toBe(customizedLayout);
     });
   });
 
@@ -309,6 +650,50 @@ describe("explore build command", () => {
           path: "quartz/content/_llm-wiki/runtime/local-daemon.json",
         }),
       ]);
+    });
+  });
+
+  it("runs github-pages fallback leak preflight against the resolved public profile before syncing", async () => {
+    await withTempWorkspace("llm-wiki-explore-build-github-pages-fallback-leak-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      mockSuccessfulSpawn();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await makePublicProfileValidAsGitHubPagesFallback(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/content/_llm-wiki/runtime"), { recursive: true });
+      await writeFile(
+        resolve(wikiDir, "quartz/content/_llm-wiki/runtime/local-daemon.json"),
+        '{"enabled":true,"token_header":"x-llm-wiki-upload-token","upload_token":"redacted"}\n',
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["explore", "build", "--repo", wikiDir, "--profile", "github-pages", "--json"]);
+      const payload = parseExploreBuildFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(payload.error).toEqual({
+        code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+        message: "Public profile leak check failed: public_quartz_runtime_metadata_leak.",
+        hint: "Remove generated local daemon metadata from quartz/content before syncing or building public Quartz output.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+          path: "quartz/content/_llm-wiki/runtime/local-daemon.json",
+        }),
+      ]);
+      await expect(readFile(resolve(wikiDir, "quartz/content/_llm-wiki/runtime/local-daemon.json"), "utf8")).resolves.toContain(
+        "upload_token",
+      );
     });
   });
 
@@ -445,7 +830,7 @@ describe("explore build command", () => {
         expect(spawnMock).toHaveBeenCalledWith(
           "npm.cmd",
           ["run", "build"],
-          { cwd: resolve(wikiDir, "quartz"), stdio: ["ignore", "pipe", "pipe"] },
+          expect.objectContaining({ cwd: resolve(wikiDir, "quartz"), stdio: ["ignore", "pipe", "pipe"] }),
         );
       });
     });

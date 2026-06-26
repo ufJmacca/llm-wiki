@@ -3302,6 +3302,181 @@ safety:
     });
   });
 
+  it("fails public strict lint when committed Quartz public output contains upload-capable code", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-static-output-leaks-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await writeFile(
+        resolve(wikiDir, ".llm-wiki/profiles/public.yml"),
+        `name: public
+mode: deploy
+include:
+  - curated/index.md
+  - curated/topics/public-topic.md
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+safety:
+  fail_on_private_pages: true
+  fail_on_private_links: true
+  fail_on_raw_links: true
+  fail_on_public_graph_private_nodes: true
+  fail_on_public_search_private_text: true
+`,
+        "utf8",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/index.md",
+        { type: "index", title: "Public Index", visibility: "public", source_ids: [] },
+        "# Public Index\n\n- [[topics/public-topic|Public Topic]]\n",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/public-topic.md",
+        { type: "topic", title: "Public Topic", visibility: "public", source_ids: [] },
+        "# Public Topic\n\nPublic body.\n",
+      );
+      await mkdir(resolve(wikiDir, "quartz/public/assets"), { recursive: true });
+      await writeFile(
+        resolve(wikiDir, "quartz/public/assets/upload.js"),
+        "customElements.define('llm-wiki-upload', LlmWikiUploadForm);\nfetch('/api/raw-upload');\n",
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("lint_failed");
+      expectStableIssueRecords(payload.issues);
+      expect(issueByRuleAndPath(payload.issues, "public_static_upload_component_leak", "quartz/public/assets/upload.js")).toMatchObject({
+        severity: "error",
+        line: 1,
+        message: expect.stringContaining("upload component"),
+        fix_hint: expect.stringContaining("GitHub Pages"),
+        fixable: false,
+      });
+      expect(issueByRuleAndPath(payload.issues, "public_static_upload_endpoint_leak", "quartz/public/assets/upload.js")).toMatchObject({
+        severity: "error",
+        line: 2,
+        message: expect.stringContaining("/api/raw-upload"),
+        fix_hint: expect.stringContaining("GitHub Pages"),
+        fixable: false,
+      });
+    });
+  });
+
+  it("fails public strict lint for scanner-only Quartz static leaks", async () => {
+    await withTempWorkspace("llm-wiki-lint-public-static-scanner-only-leaks-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await writeFile(
+        resolve(wikiDir, ".llm-wiki/profiles/public.yml"),
+        `name: public
+mode: deploy
+include:
+  - curated/index.md
+  - curated/topics/public-topic.md
+exclude: []
+visibility:
+  include_private: false
+  required_value: public
+safety:
+  fail_on_private_pages: true
+  fail_on_private_links: true
+  fail_on_raw_links: true
+  fail_on_public_graph_private_nodes: true
+  fail_on_public_search_private_text: true
+`,
+        "utf8",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/index.md",
+        { type: "index", title: "Public Index", visibility: "public", source_ids: [] },
+        "# Public Index\n\n- [[topics/public-topic|Public Topic]]\n",
+      );
+      await writeCuratedPage(
+        wikiDir,
+        "curated/topics/public-topic.md",
+        { type: "topic", title: "Public Topic", visibility: "public", source_ids: [] },
+        "# Public Topic\n\nPublic body.\n",
+      );
+
+      const sourceId = "src_2026_06_23_path_only_222222";
+      const expectedLeaks = [
+        {
+          ruleId: "public_static_raw_inputs_leak",
+          path: `quartz/content/raw/inputs/2026/06/${sourceId}/original.pdf`,
+          content: "%PDF-1.7\n",
+          message: "raw input path metadata",
+        },
+        {
+          ruleId: "public_static_raw_queue_leak",
+          path: `quartz/content/raw/queue/${sourceId}.json`,
+          content: "{}\n",
+          message: "raw queue metadata",
+        },
+        {
+          ruleId: "public_static_upload_token_leak",
+          path: "quartz/content/public/token.html",
+          content: "<script>window.llm_wiki_upload_token = true;</script>\n",
+          message: "local upload token metadata",
+        },
+        {
+          ruleId: "public_static_raw_inputs_leak",
+          path: `quartz/public/raw/inputs/2026/06/${sourceId}/original.pdf`,
+          content: "%PDF-1.7\n",
+          message: "raw input path metadata",
+        },
+        {
+          ruleId: "public_static_raw_queue_leak",
+          path: `quartz/public/raw/queue/${sourceId}.json`,
+          content: "{}\n",
+          message: "raw queue metadata",
+        },
+        {
+          ruleId: "public_static_upload_token_leak",
+          path: "quartz/public/assets/token.html",
+          content: "<script>window.llm_wiki_upload_token = true;</script>\n",
+          message: "local upload token metadata",
+        },
+      ];
+
+      for (const leak of expectedLeaks) {
+        const absolutePath = resolve(wikiDir, leak.path);
+        await mkdir(resolve(absolutePath, ".."), { recursive: true });
+        await writeFile(absolutePath, leak.content, "utf8");
+      }
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--profile", "public", "--strict", "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("lint_failed");
+      expectStableIssueRecords(payload.issues);
+      for (const leak of expectedLeaks) {
+        expect(issueByRuleAndPath(payload.issues, leak.ruleId, leak.path)).toMatchObject({
+          severity: "error",
+          line: 1,
+          message: expect.stringContaining(leak.message),
+          fix_hint: expect.stringContaining("GitHub Pages"),
+          fixable: false,
+        });
+      }
+    });
+  });
+
   it("fails public strict lint when generated Quartz content contains stale private Markdown frontmatter", async () => {
     await withTempWorkspace("llm-wiki-lint-public-generated-quartz-private-markdown-", async (workspaceDir) => {
       // Arrange

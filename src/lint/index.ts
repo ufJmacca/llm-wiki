@@ -3,6 +3,7 @@ import { basename, dirname, resolve } from "node:path";
 
 import { publicLikeProfileFeatureIssues } from "../profiles/index.js";
 import { scanWikiRepository, isRawOriginalPath, type RepoMarkdownFile, type RepoScan, type SourceCard } from "../scanner/repo.js";
+import type { StaticLeakFinding } from "../scanner/staticLeaks.js";
 import {
   computeContentHash,
   parseSourceId,
@@ -29,6 +30,7 @@ export type LintIssue = {
 export type LintOptions = {
   profile?: string;
   strict?: boolean;
+  staticOutputLeakRoots?: readonly string[];
 };
 
 export type LintResult = {
@@ -164,6 +166,8 @@ export async function lintWikiWithFix(repoRoot: string, options: LintOptions = {
 function scanOptionsForLint(options: LintOptions): Parameters<typeof scanWikiRepository>[1] {
   return {
     includeGeneratedQuartzContent: shouldScanGeneratedQuartzContentForLint(options),
+    includeStaticOutputLeaks: shouldScanGeneratedQuartzContentForLint(options),
+    staticOutputLeakRoots: options.staticOutputLeakRoots,
   };
 }
 
@@ -1467,8 +1471,59 @@ function publicProfileIssues(scan: RepoScan, profileName: string, linkIndex: Lin
   issues.push(...publicRawSourceIndexLeakIssues(scan, selectedPaths, markdownByPath, requiredVisibility));
   issues.push(...publicStaleIndexRowLeakIssues(scan, selectedPaths, markdownByPath, requiredVisibility));
   issues.push(...publicGeneratedQuartzContentLeakIssues(scan));
+  issues.push(...publicStaticOutputLeakIssues(scan));
 
   return issues;
+}
+
+function publicStaticOutputLeakIssues(scan: RepoScan): LintIssue[] {
+  return scan.staticOutputLeaks.flatMap((finding) => {
+    if (shouldSuppressLegacyQuartzContentStaticFinding(finding, scan)) {
+      return [];
+    }
+
+    return [
+      {
+        rule_id: staticLeakRuleId(finding),
+        severity: finding.severity,
+        path: finding.path,
+        line: finding.line,
+        message: finding.message,
+        fix_hint: finding.hint,
+        fixable: false,
+      },
+    ];
+  });
+}
+
+function shouldSuppressLegacyQuartzContentStaticFinding(finding: StaticLeakFinding, scan: RepoScan): boolean {
+  if (!finding.path.startsWith("quartz/content/")) {
+    return false;
+  }
+
+  if (finding.code === "STATIC_DAEMON_METADATA_LEAK" && finding.path.startsWith(PUBLIC_QUARTZ_RUNTIME_ROOT)) {
+    return true;
+  }
+
+  if (finding.code === "STATIC_UPLOAD_FORM_LEAK" && isGeneratedQuartzUploadPath(finding.path)) {
+    return true;
+  }
+
+  if (finding.code === "STATIC_REVIEW_PAGE_LEAK" && finding.path.startsWith(PUBLIC_QUARTZ_REVIEW_ROOT)) {
+    return true;
+  }
+
+  const generatedFile = scan.generatedQuartzContentFiles.find((file) => file.path === finding.path);
+  const legacyMarker = generatedFile ? firstGeneratedQuartzPrivateDataMarker(generatedFile.content) : null;
+  return legacyMarker !== null && legacyMarker.code === finding.code && legacyMarker.line === finding.line;
+}
+
+function staticLeakRuleId(finding: StaticLeakFinding): string {
+  if (finding.code === "STATIC_SCAN_TARGET_UNSAFE") {
+    return "public_static_scan_target_unsafe";
+  }
+
+  return `public_static_${finding.code.replace(/^STATIC_/u, "").replace(/_LEAK$/u, "").toLowerCase()}_leak`;
 }
 
 function publicGeneratedQuartzContentLeakIssues(scan: RepoScan): LintIssue[] {
@@ -1564,28 +1619,32 @@ function isGeneratedQuartzUploadPath(path: string): boolean {
   return path === `${PUBLIC_QUARTZ_UPLOAD_ROOT}.md` || path.startsWith(`${PUBLIC_QUARTZ_UPLOAD_ROOT}/`);
 }
 
-function firstGeneratedQuartzPrivateDataMarker(content: Buffer): { line: number; description: string } | null {
+function firstGeneratedQuartzPrivateDataMarker(content: Buffer): { code: StaticLeakFinding["code"]; line: number; description: string } | null {
   const text = content.toString("utf8");
-  const markerPatterns = [
+  const markerPatterns: Array<{ code: StaticLeakFinding["code"]; pattern: RegExp; description: string }> = [
     {
+      code: "STATIC_UPLOAD_TOKEN_LEAK",
       pattern: /\bupload_token\b/iu,
       description: "local upload token metadata",
     },
     {
+      code: "STATIC_UPLOAD_TOKEN_LEAK",
       pattern: /\bx-llm-wiki-upload-token\b/iu,
       description: "local upload token header metadata",
     },
     {
+      code: "STATIC_RAW_INPUTS_LEAK",
       pattern: /\braw\/inputs\/[^\s"'`)<]+/iu,
       description: "raw original path metadata",
     },
     {
+      code: "STATIC_RAW_QUEUE_LEAK",
       pattern: /\braw\/queue\/[^\s"'`)<]+|\bqueue_path\b|\boriginal_path\b/iu,
       description: "raw queue metadata",
     },
   ];
 
-  let firstMatch: { index: number; description: string } | null = null;
+  let firstMatch: { code: StaticLeakFinding["code"]; index: number; description: string } | null = null;
   for (const marker of markerPatterns) {
     const match = marker.pattern.exec(text);
     if (match?.index === undefined) {
@@ -1594,6 +1653,7 @@ function firstGeneratedQuartzPrivateDataMarker(content: Buffer): { line: number;
 
     if (firstMatch === null || match.index < firstMatch.index) {
       firstMatch = {
+        code: marker.code,
         index: match.index,
         description: marker.description,
       };
@@ -1605,6 +1665,7 @@ function firstGeneratedQuartzPrivateDataMarker(content: Buffer): { line: number;
   }
 
   return {
+    code: firstMatch.code,
     line: lineNumberAtIndex(text, firstMatch.index),
     description: firstMatch.description,
   };

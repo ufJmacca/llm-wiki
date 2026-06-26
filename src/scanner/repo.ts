@@ -13,6 +13,7 @@ import {
   type QueueItemScan,
   type RuntimeLogScan,
 } from "./index.js";
+import { scanStaticOutputLeaks, type StaticLeakFinding } from "./staticLeaks.js";
 
 export type RepoFile = {
   path: string;
@@ -68,6 +69,7 @@ export type RepoScan = {
   profiles: RepoProfileFile[];
   rawOriginals: RepoOriginalFile[];
   generatedQuartzContentFiles: RepoGeneratedFile[];
+  staticOutputLeaks: StaticLeakFinding[];
   log: RepoLogFile | null;
 };
 
@@ -76,6 +78,8 @@ export type RepoScanMode = "full" | "liveMarkdown";
 export type ScanWikiRepositoryOptions = {
   mode?: RepoScanMode;
   includeGeneratedQuartzContent?: boolean;
+  includeStaticOutputLeaks?: boolean;
+  staticOutputLeakRoots?: readonly string[];
 };
 
 const SKIPPED_ROOTS = [
@@ -170,6 +174,10 @@ export async function scanWikiRepository(
   const queueItems = queueFiles.flatMap((queueFile) => (queueFile.scan.item ? [{ ...queueFile, item: queueFile.scan.item }] : []));
   const generatedQuartzContentFiles =
     mode === "full" && options.includeGeneratedQuartzContent === true ? await scanGeneratedQuartzContentFiles(rootDir) : [];
+  const staticOutputLeaks =
+    mode === "full" && options.includeStaticOutputLeaks === true
+      ? (await scanStaticOutputLeaks(rootDir, staticOutputLeakScanOptions(options))).findings
+      : [];
 
   return {
     rootDir,
@@ -183,8 +191,13 @@ export async function scanWikiRepository(
     profiles: sortByPath(profiles),
     rawOriginals: sortByPath(rawOriginals),
     generatedQuartzContentFiles,
+    staticOutputLeaks,
     log,
   };
+}
+
+function staticOutputLeakScanOptions(options: ScanWikiRepositoryOptions): Parameters<typeof scanStaticOutputLeaks>[1] {
+  return options.staticOutputLeakRoots === undefined ? undefined : { roots: options.staticOutputLeakRoots };
 }
 
 export async function listRepositoryFilePaths(rootDir: string): Promise<string[]> {

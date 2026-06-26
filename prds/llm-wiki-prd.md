@@ -86,7 +86,7 @@ It creates and manages:
 - Dataview-compatible frontmatter and dashboards.
 - A Quartz Explorer for local browser-based reading and review.
 - A GitHub Pages-first deployment path for public Quartz output.
-- Optional local and remote upload workflows that add new raw sources into the repo.
+- Optional local/private upload workflows that add new raw sources into the repo before reviewed static publication.
 
 One-sentence version:
 
@@ -138,12 +138,13 @@ Public deployment should be GitHub Pages-first. The CLI should generate a GitHub
 
 Private raw sources, private curated pages, internal logs, source queues, and review dashboards must not be included in public deploys unless explicitly configured.
 
-### 5.10 Upload-capable through local and remote modes
+### 5.10 Upload-capable through local/private modes
 
 The Quartz UI should be able to support raw source upload:
 
 - Locally through a local `llm-wiki daemon`.
-- Remotely through an authenticated backend that commits to Git or opens a PR.
+- Through a privately hosted `llm-wiki` instance when explicitly configured outside GitHub Pages.
+- Never from GitHub Pages static output.
 
 ---
 
@@ -272,9 +273,9 @@ As a user, I want the local Quartz Explorer to provide an upload form backed by 
 llm-wiki explore serve --profile local --with-daemon
 ```
 
-### 8.10 Raw upload from deployed site
+### 8.10 Static publication from reviewed uploads
 
-As an authorized remote user, I want a public or private deployed Quartz site to accept source submissions through an authenticated backend that writes to Git or opens a PR.
+As a maintainer, I want uploads to happen in local/private `llm-wiki`, then publish reviewed static output through a repo branch or PR for GitHub Pages to serve.
 
 ---
 
@@ -313,9 +314,8 @@ flowchart LR
   PublicProfile --> GHA[GitHub Actions]
   GHA --> Pages[GitHub Pages]
 
-  Pages --> UploadRemote[Optional remote upload form]
-  UploadRemote --> Serverless[Authenticated upload backend]
-  Serverless --> PR[Git commit or PR into raw/inputs]
+  Pages --> StaticOnly[Static read-only site]
+  StaticOnly --> NoUpload[No upload UI or upload API]
 ```
 
 ---
@@ -1617,7 +1617,7 @@ Quartz can render static pages, but write actions need a write path.
 
 For local exploration, that write path can be a local `llm-wiki daemon`.
 
-For a deployed site, that write path must be an authenticated backend that commits to Git or opens a PR.
+GitHub Pages is static and has no write path. Any upload path must run in a local/private `llm-wiki` instance, then publish reviewed static output through the repo.
 
 ### 20.2 Local upload
 
@@ -1652,34 +1652,32 @@ Local upload requirements:
 - Optionally triggers ingest.
 - Optionally commits the upload.
 
-### 20.3 Remote deployed upload
+### 20.3 GitHub Pages upload boundary
 
 Flow:
 
 ```mermaid
 sequenceDiagram
   participant User
-  participant Site as Deployed Quartz Site
-  participant API as Authenticated Upload API
-  participant Git as Git Provider
+  participant Local as Local/private llm-wiki
   participant Repo as LLM Wiki Repo
+  participant Pages as GitHub Pages
 
-  User->>Site: Upload file / URL / text
-  Site->>API: POST /api/raw-upload
-  API->>API: Auth, validate, hash, scan
-  API->>Git: Create branch, commit, or PR
-  Git->>Repo: Add raw/inputs/... and raw/queue/...
-  API->>Site: Return source_id and PR/status URL
+  User->>Local: Upload file / URL / text
+  Local->>Repo: Add private raw/inputs/... and raw/queue/...
+  User->>Local: Review and ingest approved sources
+  Local->>Repo: Build and commit static public output
+  Repo->>Pages: Serve committed static files
 ```
 
-Remote upload requirements:
+GitHub Pages publication requirements:
 
-- Authentication required by default.
-- Rate limiting required for public forms.
-- File type restrictions required.
-- Creates branch/PR by default.
-- Does not directly publish uploaded content.
-- Does not automatically trust uploaded sources.
+- Uploads are handled only by local/private `llm-wiki` instances.
+- GitHub Pages must not render upload forms.
+- GitHub Pages must not expose upload API routes or endpoint config.
+- GitHub Pages must not contain upload tokens, daemon metadata, secrets, raw originals, or private queue state.
+- Reviewed static output is committed to the repo before GitHub Pages serves it.
+- Pull requests are the default publication review path.
 
 ### 20.4 Upload API contract
 
@@ -1803,8 +1801,8 @@ Requirements:
 | FR-037 | Warn if GitHub Pages source is not set to Actions | P1 |
 | FR-038 | Emit clear setup checklist after deploy init | P0 |
 | FR-039 | Support custom default branch name | P1 |
-| FR-040 | Remote upload form/backend scaffold | P2 |
-| FR-041 | Create PR/commit for remote uploaded raw source | P2 |
+| FR-040 | Keep GitHub Pages output static and upload-free | P0 for deploy |
+| FR-041 | Commit reviewed static output through PR-first publication | P2 |
 | FR-042 | Optional QMD integration | P2 |
 | FR-043 | Optional MCP server | P3 |
 | FR-044 | Support non-GitHub deploy targets later | P3 |
@@ -1921,13 +1919,13 @@ Post-MVP:
 - Uses GitHub Pages artifact upload and deploy actions.
 - Uses strict public profile lint before build.
 
-### 24.5 Upload backend
+### 24.5 Static publication from local upload
 
-MVP of remote upload feature:
+MVP of local-upload-to-Pages publication:
 
-- GitHub App or GitHub token-based serverless function.
-- Creates branch/PR with raw files and queue JSON.
-- Configurable for private repo.
+- Local/private upload creates raw files and queue JSON.
+- Reviewed public-safe static output is committed through a branch/PR.
+- GitHub Pages serves only the committed static output.
 
 ---
 
@@ -1960,7 +1958,7 @@ MVP of remote upload feature:
 ### 25.2 MVP may exclude
 
 - Local raw upload daemon.
-- Remote upload backend.
+- Static publication from local/private upload.
 - QMD integration.
 - MCP server.
 - Fully automated URL article extraction.
@@ -1969,7 +1967,7 @@ MVP of remote upload feature:
 - Browser extension.
 - Non-GitHub deploy targets.
 
-The strategic priority is that **Quartz Explorer is P0**, while **GitHub Pages deploy is the first-class deploy path**, and **remote upload is later**.
+The strategic priority is that **Quartz Explorer is P0**, while **GitHub Pages deploy is the first-class static deploy path**, and upload remains local/private rather than a GitHub Pages runtime feature.
 
 ---
 
@@ -1984,8 +1982,8 @@ V1 should add:
 - Review dashboards.
 - Source status widgets.
 - Better graph/profile filtering.
-- Remote GitHub Pages upload backend scaffold.
-- GitHub PR workflow for remote uploads.
+- Static GitHub Pages publication from reviewed local uploads.
+- GitHub PR workflow for reviewed static output.
 - URL capture backend.
 - Watch mode:
 
@@ -2136,7 +2134,7 @@ The GitHub Actions workflow fails before build if private/raw content would ente
 
 ### 29.11 Upload
 
-In local mode, a user can upload a raw source through the Quartz Explorer when the local daemon is running. In remote mode, the upload form requires an authenticated backend that creates a Git commit or PR.
+In local mode, a user can upload a raw source through the Quartz Explorer when the local daemon is running. GitHub Pages mode is static and must not include an upload form, upload API route, upload endpoint config, tokens, or write credentials.
 
 ---
 
@@ -2180,8 +2178,8 @@ In local mode, a user can upload a raw source through the Quartz Explorer when t
 ### 30.6 Upload
 
 - Local upload success rate.
-- Remote upload success rate.
-- PR/commit creation success rate.
+- Reviewed static publication success rate.
+- PR/commit creation success rate for reviewed static output.
 - Uploaded sources eventually ingested.
 
 ---
@@ -2206,7 +2204,7 @@ Mitigation: Treat profiles as explicit, documented build modes. Generate manifes
 
 ### 31.5 Risk: Static upload is misunderstood
 
-Mitigation: Be explicit that local upload requires the local daemon and remote upload requires an authenticated backend. The static site alone cannot write to the repo.
+Mitigation: Be explicit that upload requires a local/private `llm-wiki` instance. The GitHub Pages static site cannot accept uploads or write to the repo.
 
 ### 31.6 Risk: Agent-specific behavior diverges
 
@@ -2230,7 +2228,7 @@ Mitigation: Version the workflow template inside the CLI and add `llm-wiki deplo
 4. Should local Quartz Explorer include source cards by default, or only in a review/source profile?
 5. Should local `llm-wiki daemon` be part of MVP or V1?
 6. Should GitHub Pages deploy include branch protection/environment protection recommendations by default?
-7. Should public uploads create PRs only, or can trusted users commit directly?
+7. Should reviewed static output always publish through PRs, or can trusted local maintainers opt into direct commits?
 8. Should the product ship with a default Quartz theme optimized for LLM Wikis?
 9. Should source-level provenance be enough for MVP, or should V1 introduce claim-level provenance?
 10. How should the CLI handle private-team deployments, given GitHub Pages sites should be treated as public by default?
@@ -2281,14 +2279,14 @@ Add:
 - Source status components.
 - Watch mode.
 
-### 33.4 Phase 3: Remote upload and GitHub PR flow
+### 33.4 Phase 3: Static Pages publication from local upload
 
 Add:
 
-- Remote upload form.
-- Serverless backend template.
-- GitHub PR/commit flow.
-- Upload auth/rate limiting.
+- Upload-free GitHub Pages output checks.
+- Static output commit support.
+- GitHub PR-first publication flow.
+- Documentation that uploads happen through local/private `llm-wiki`, not GitHub Pages.
 
 ### 33.5 Phase 4: Search and agent integrations
 

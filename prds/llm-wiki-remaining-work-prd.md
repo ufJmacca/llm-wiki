@@ -58,7 +58,7 @@ This follow-up PRD covers the remaining work needed to move from an init-only fo
 - Functional Quartz Explorer runtime.
 - GitHub Pages deploy workflow generation and local preflight.
 - Local upload daemon and browser upload form.
-- Remote upload backend scaffold and Git PR/commit flow.
+- Static GitHub Pages publication from reviewed local upload output.
 - Cross-command `--repo`, `--json`, `--quiet` consistency.
 - Performance targets and profile-isolated manifests/build outputs.
 
@@ -456,27 +456,28 @@ Acceptance criteria:
 - Daemon never exposes raw originals through public profiles.
 - Daemon refuses non-local binding without an explicit flag.
 
-### 8.2 Remote upload scaffold
+### 8.2 Local upload to GitHub Pages publication
 
-Implement a scaffold, not a hosted service:
+Implement a static publication flow, not a deployed upload service:
 
 ```bash
-llm-wiki upload init --target github
+llm-wiki explore serve --profile local --with-daemon
+llm-wiki deploy github-pages build-local
 ```
 
 Requirements:
 
-- Generate a serverless/backend template with authentication hooks.
-- Validate file type and size restrictions.
-- Rate limiting is required by default for public forms.
-- Create branch/commit or PR into raw inputs.
-- Uploaded content is queued, not published.
+- Uploads are accepted only by local/private `llm-wiki` instances.
+- GitHub Pages output never includes upload forms, upload API routes, upload endpoint config, daemon metadata, tokens, or secrets.
+- Uploaded content remains queued and private until reviewed and ingested.
+- Reviewed static pages are built, committed to the repo, and then served by GitHub Pages.
+- Publication uses a PR-first flow by default.
 
 Acceptance criteria:
 
-- Scaffold documents required secrets and permissions.
-- Default remote mode creates PRs rather than committing directly.
-- Public deploy output can include a remote upload form only when a backend is configured.
+- Local/private upload creates queued raw source artifacts without publishing them.
+- Public and `github-pages` deploy output exclude all upload functionality.
+- Static Pages output can be committed to a branch and reviewed in a pull request before publication.
 
 ---
 
@@ -561,9 +562,9 @@ Implement workflow/profile generation, base URL inference, custom domain support
 
 Implement local daemon, upload API, Explorer upload form integration, and optional upload commit behavior.
 
-### REM-010: Remote Upload Scaffold V1
+### REM-010: Static Pages Publication from Local Upload V1
 
-Implement authenticated backend scaffold, GitHub PR/commit flow, upload form configuration, rate limiting defaults, and documentation.
+Implement local-upload-to-static-Pages publication, including upload-free GitHub Pages output, static output commit support, PR-first publication, and documentation that the legacy remote upload scaffold is not a GitHub Pages upload path.
 
 ---
 
@@ -578,7 +579,7 @@ The follow-up implementation is complete when:
 - GitHub Pages deploy workflow generation and local build preflight work.
 - Review profile exposes queued sources, recent ingests, contradictions, stale pages, orphans, and needs-review pages.
 - Local upload works only through a localhost daemon.
-- Remote upload is scaffolded with authentication, rate limiting, and PR-first Git behavior.
+- GitHub Pages publication is static and upload-free, with reviewed output committed through a PR-first flow.
 
 ---
 
@@ -591,4 +592,4 @@ The follow-up implementation is complete when:
 5. Should `explore init` install Quartz dependencies automatically or require an explicit `--install` flag?
 6. Should public deploy require all included pages to have `review_status: approved`?
 7. Should local upload commits be enabled by default or only with an explicit flag?
-8. Should remote upload scaffold target GitHub Actions, serverless functions, or both?
+8. Should the legacy remote upload scaffold be removed, hidden, or retained with documentation that it is not a GitHub Pages feature?

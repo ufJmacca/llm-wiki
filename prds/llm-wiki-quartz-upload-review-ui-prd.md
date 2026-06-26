@@ -30,7 +30,7 @@ This PRD defines the missing local Explorer UI: a working upload form, queue sta
 
 ## 3. Non-Goals
 
-- Implement remote deployed upload UI. That is covered by the remote upload PRD.
+- Implement upload UI for GitHub Pages or other public static deployments. GitHub Pages upload is explicitly out of scope; upload belongs to local/private `llm-wiki` instances.
 - Implement live collaborative review workflows.
 - Implement an Obsidian plugin.
 - Replace Quartz's built-in search, backlinks, graph, or wikilink rendering.
@@ -304,7 +304,7 @@ Update docs to cover:
 
 - Starting local Explorer with upload enabled.
 - Browser upload payload types.
-- Difference between local browser upload and remote deployed upload.
+- Difference between local browser upload and static GitHub Pages publication.
 - Why local daemon binds only to loopback.
 - How to ingest an uploaded source after upload.
 - How review pages map to raw queue, lint, and log state.

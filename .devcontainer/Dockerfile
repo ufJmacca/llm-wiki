@@ -1,6 +1,6 @@
 FROM mcr.microsoft.com/playwright:v1.58.2-noble AS playwright_browsers
 
-FROM docker:28-cli AS docker_cli
+FROM docker:29.6.0-cli AS docker_cli
 
 FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04
 

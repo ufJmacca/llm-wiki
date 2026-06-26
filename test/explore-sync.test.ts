@@ -1436,6 +1436,45 @@ visibility:
     });
   });
 
+  it.each(["public", "github-pages"] as const)(
+    "does not block %s sync on stale quartz/public upload artifacts",
+    async (profile) => {
+      await withTempWorkspace(`llm-wiki-explore-sync-${profile}-stale-public-output-`, async (workspaceDir) => {
+        // Arrange
+        const wikiDir = resolve(workspaceDir, "wiki");
+        await initializeWiki(wikiDir);
+        await makeDefaultCuratedPagesPublic(wikiDir);
+        if (profile === "github-pages") {
+          await prepareGitHubPagesSyncProfile(wikiDir);
+        }
+        await writeCuratedPage(
+          wikiDir,
+          "curated/topics/public-topic.md",
+          {
+            type: "topic",
+            title: "Public Topic",
+            visibility: "public",
+            source_ids: [],
+          },
+          "# Public Topic\n\nPublic body.\n",
+        );
+        const stalePublicArtifact = "quartz/public/assets/upload.js";
+        await mkdir(resolve(wikiDir, "quartz/public/assets"), { recursive: true });
+        await writeFile(resolve(wikiDir, stalePublicArtifact), "LlmWikiUploadForm\nfetch('/api/raw-upload')\n", "utf8");
+
+        // Act
+        const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", profile, "--json"]);
+        const payload = parseExploreSync(result.stdout);
+
+        // Assert
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toEqual([]);
+        expect(payload.data.materialized_paths).toContain("quartz/content/curated/topics/public-topic.md");
+        expect(await pathExists(resolve(wikiDir, stalePublicArtifact))).toBe(true);
+      });
+    },
+  );
+
   it("materializes review profile content with root and review pages, no inactive upload entrypoint, and no raw originals", async () => {
     await withTempWorkspace("llm-wiki-explore-sync-review-", async (workspaceDir) => {
       // Arrange

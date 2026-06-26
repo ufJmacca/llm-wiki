@@ -55,6 +55,7 @@ export type QuartzSyncResult = {
 export type QuartzSyncOptions = {
   preserveContentRoot?: boolean;
   uploadDaemonActive?: boolean;
+  lintResult?: LintResult;
 };
 
 export type QuartzLocalDaemonRuntimeMetadata =
@@ -108,6 +109,7 @@ export type QuartzOperationErrorCode =
   | "PROFILE_UNSUPPORTED"
   | "PROFILE_UPLOAD_FEATURE_FORBIDDEN"
   | "PROFILE_REVIEW_FEATURE_FORBIDDEN"
+  | "PUBLIC_PROFILE_ARTIFACT_MISSING"
   | "PUBLIC_LINT_FAILED"
   | "PUBLIC_PROFILE_LEAK_CHECK_FAILED"
   | "QUARTZ_COMMAND_FAILED"
@@ -135,6 +137,7 @@ const INSTALL_COMMAND = "cd quartz && npm install" as const;
 const QUARTZ_VERSION = "4.5.2" as const;
 const EXPLORE_PROFILE_NAMES = ["local", "review", "public", "github-pages"] as const satisfies readonly ExploreProfileName[];
 const QUARTZ_CONTENT_IGNORE_RULE = "quartz/content/";
+const QUARTZ_CONTENT_OUTPUT_ROOT = "quartz/content" as const;
 const QUARTZ_CONTENT_IGNORE_PROBE = "quartz/content/.llm-wiki-sync-probe.md";
 const QUARTZ_CONTENT_GITIGNORE_PATH = "quartz/content/.gitignore";
 const QUARTZ_CONTENT_GITIGNORE_CONTENT = "*\n";
@@ -304,7 +307,7 @@ export async function syncQuartzContent(
   const selection = selectMarkdownForProfile(profile, scan.markdown, scan.rawOriginals);
   const warnings = await ensureQuartzContentIgnored(repoRoot);
   if (publicLike) {
-    await assertPublicSyncIsSafe(repoRoot, scan, profile, selection.markdown, selection.matchedMarkdown);
+    await assertPublicSyncIsSafe(repoRoot, scan, profile, selection.markdown, selection.matchedMarkdown, options.lintResult);
     if (!preserveContentRoot) {
       await clearQuartzContent(repoRoot);
       await removeQuartzManifests(repoRoot);
@@ -650,7 +653,11 @@ async function assertPublicSyncIsSafe(
   matchedFiles: readonly RepoMarkdownFile[],
   lintResult?: LintResult,
 ): Promise<void> {
-  const publicLintResult = lintResult ?? await lintWiki(repoRoot, { profile: profile.sourceName, strict: true });
+  const publicLintResult = lintResult ?? await lintWiki(repoRoot, {
+    profile: profile.sourceName,
+    strict: true,
+    staticOutputLeakRoots: [QUARTZ_CONTENT_OUTPUT_ROOT],
+  });
   const materializedPaths = new Set(materializedFiles.map((file) => file.path));
   const matchedPaths = new Set(matchedFiles.map((file) => file.path));
   const matchedMissingOrInvalidVisibilityPaths = new Set(

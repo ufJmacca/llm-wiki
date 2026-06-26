@@ -227,7 +227,7 @@ export async function captureUploadedFileSource(
     originalExtension: normalizeOriginalExtension(extname(safeFileName), "bin"),
     content: options.content,
     now: options.now ?? new Date(),
-    command: options.command ?? `llm-wiki daemon upload ${safeFileName}`,
+    command: options.command ?? `llm-wiki explore serve --with-daemon upload ${safeFileName}`,
   });
 }
 

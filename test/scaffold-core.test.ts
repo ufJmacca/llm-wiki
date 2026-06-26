@@ -165,6 +165,28 @@ describe("core wiki scaffold templates", () => {
     expect(gitignore).not.toContain("quartz/public/");
   });
 
+  it("documents local upload review and static GitHub Pages publication in the generated README", () => {
+    // Arrange
+    const plannedEntries = new Map(planWikiScaffold(defaultOptions).map((entry) => [entry.path, entry.content]));
+    const requiredDocumentation = [
+      "Run local upload with `llm-wiki explore serve --profile local --with-daemon`.",
+      "Review private queued sources under `raw/queue/` and their private source cards before ingest.",
+      "Ingest approved sources into curated Markdown with `llm-wiki ingest <source_id>`.",
+      "Publish to GitHub Pages by running `llm-wiki deploy github-pages build-local`, running `llm-wiki deploy github-pages check`, committing `quartz/public`, opening a pull request, merging it, and letting Pages serve the committed static files.",
+      "GitHub Pages never supports uploads, upload endpoint config, tokens, runtime daemon metadata, raw originals, private source cards, queue state, or review pages.",
+      "Treat existing `upload/github/serverless/*` files as unsupported migration debris for GitHub Pages.",
+    ];
+
+    // Act
+    const readme = plannedEntries.get("README.md");
+
+    // Assert
+    expect(readme).toBeDefined();
+    for (const expectedText of requiredDocumentation) {
+      expect(readme).toContain(expectedText);
+    }
+  });
+
   it("scaffolds executable Codex config only for the Codex agent", () => {
     // Arrange
     const codexEntries = new Map(

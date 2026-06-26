@@ -205,6 +205,12 @@ Review pages are derived from live repository state rather than hidden caches. `
 
 The generated workflow is publisher-only. It uses least required Pages permissions (`contents: read`, `pages: write`, `id-token: write`), supports the configured branch `push` trigger and `workflow_dispatch`, checks out the repository, uploads the committed `quartz/public` directory with `actions/upload-pages-artifact`, and deploys through the official Pages actions. It does not set up Node, install `llm-wiki` or Quartz dependencies, run Explorer sync, ingest, lint, or build steps, or generate Pages output in CI.
 
+GitHub Pages is static publication only: it never supports uploads, upload endpoint configuration, upload tokens, runtime daemon metadata, raw originals, private source cards, queue state, or generated review pages.
+
+The supported publication flow is local/private upload, private queue review, ingest into curated Markdown, `llm-wiki deploy github-pages build-local`, `llm-wiki deploy github-pages check`, commit `quartz/public`, open a pull request, merge it, and let GitHub Pages serve the committed static files.
+
+Do not commit raw upload artifacts, `_llm-wiki/runtime/local-daemon.json`, queue internals, or review-only Explorer pages to the Pages payload.
+
 `llm-wiki deploy github-pages check` validates the workflow, deploy profiles, Quartz runtime dependencies, strict public preflight, and that committed Pages output under `quartz/public` remains trackable by Git. `build-local` runs the safe GitHub Pages build wrapper locally and verifies the generated `quartz/public` artifact. `status` reports readiness without failing on incomplete setup and prints setup instructions such as running `build-local`, running `check`, committing `quartz/public`, opening a pull request, installing Quartz dependencies, and enabling GitHub Pages with Source: GitHub Actions.
 
 ## Source Capture
@@ -250,6 +256,15 @@ Uploads are not committed by default. Pass `--commit-uploads` to `llm-wiki explo
 ## Remote Upload Scope
 
 Remote/serverless upload scaffolding is not exposed in the v1 public CLI and is out of scope for GitHub Pages. GitHub Pages publication uses local/private upload, maintainer review, ingest into curated content, public sync/build checks, and a reviewed commit or pull request before static files are served.
+
+Legacy scaffold files may exist from earlier remote-upload experiments:
+
+- `upload/github/serverless/README.md`
+- `upload/github/serverless/functions/raw-upload.ts`
+- `upload/github/serverless/package.json`
+- `upload/github/serverless/wrangler.toml`
+
+Treat existing `upload/github/serverless/*` files as unsupported migration debris for GitHub Pages. They are not a Pages upload path and should not be wired into public or `github-pages` profiles.
 
 ## Queue and Log
 

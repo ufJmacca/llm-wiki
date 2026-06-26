@@ -299,6 +299,75 @@ export async function readGitCurrentBranch(targetDir: string): Promise<string | 
   }
 }
 
+export async function isGitPathIgnored(targetDir: string, path: string): Promise<boolean | null> {
+  const insideWorkTree = await gitStdout(targetDir, ["rev-parse", "--is-inside-work-tree"]);
+  if (insideWorkTree !== "true") {
+    return null;
+  }
+
+  try {
+    await execFileAsync("git", ["check-ignore", "-q", "--no-index", "--", path], {
+      cwd: targetDir,
+      env: gitCommandEnv(),
+    });
+    return true;
+  } catch (error) {
+    if (isExecError(error) && error.code === 1) {
+      return false;
+    }
+
+    throw new Error(`git check-ignore failed: ${formatGitError(error)}`);
+  }
+}
+
+export async function areAnyGitPathsIgnored(targetDir: string, paths: readonly string[]): Promise<boolean | null> {
+  const insideWorkTree = await gitStdout(targetDir, ["rev-parse", "--is-inside-work-tree"]);
+  if (insideWorkTree !== "true") {
+    return null;
+  }
+
+  for (const batch of chunk(paths, 512)) {
+    if (batch.length === 0) {
+      continue;
+    }
+
+    if (await areAnyGitPathsIgnoredBatch(targetDir, batch)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function areAnyGitPathsIgnoredBatch(targetDir: string, paths: readonly string[]): Promise<boolean> {
+  return new Promise((resolveCheck, rejectCheck) => {
+    const child = execFile(
+      "git",
+      ["check-ignore", "-z", "--stdin", "--no-index"],
+      {
+        cwd: targetDir,
+        env: gitCommandEnv(),
+        maxBuffer: 16 * 1024 * 1024,
+      },
+      (error) => {
+        if (!error) {
+          resolveCheck(true);
+          return;
+        }
+
+        if (isExecError(error) && error.code === 1) {
+          resolveCheck(false);
+          return;
+        }
+
+        rejectCheck(new Error(`git check-ignore failed: ${formatGitError(error)}`));
+      },
+    );
+
+    child.stdin?.end(`${paths.join("\0")}\0`, "utf8");
+  });
+}
+
 export async function isGitRepositoryEnabled(targetDir: string): Promise<boolean> {
   try {
     await lstat(resolve(targetDir, ".git"));
@@ -749,6 +818,15 @@ function shellQuote(value: string): string {
 
 function normalizeGitAddPaths(paths: readonly string[]): string[] {
   return [...new Set(paths)].sort();
+}
+
+function chunk<T>(items: readonly T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+
+  return chunks;
 }
 
 function parseGitStatusChangedPaths(stdout: string): string[] {

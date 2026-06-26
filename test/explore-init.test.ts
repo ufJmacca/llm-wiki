@@ -1178,7 +1178,7 @@ export const defaultListPageLayout: PageLayout = {
     });
   });
 
-  it("keeps generated wiki ignore rules aligned with generated Quartz content and build output", async () => {
+  it("keeps generated wiki ignore rules aligned with generated Quartz internals and committed Pages output", async () => {
     await withTempWorkspace("llm-wiki-explore-init-gitignore-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
@@ -1189,9 +1189,9 @@ export const defaultListPageLayout: PageLayout = {
 
       // Assert
       expect(gitignore).toContain("quartz/content/");
-      expect(gitignore).toContain("quartz/public/");
       expect(gitignore).toContain("quartz/.quartz-cache/");
       expect(gitignore).toContain("quartz/quartz/");
+      expect(gitignore).not.toContain("quartz/public/");
     });
   });
 
@@ -1203,7 +1203,7 @@ export const defaultListPageLayout: PageLayout = {
       await initializeWiki(wikiDir);
       await writeFile(
         resolve(wikiDir, ".gitignore"),
-        ".DS_Store\n.llm-wiki/cache/\nnode_modules/\nquartz/.quartz-cache/\nquartz/content/\nquartz/public/\n",
+        ".DS_Store\n.llm-wiki/cache/\nnode_modules/\nquartz/.quartz-cache/\nquartz/content/\n",
         "utf8",
       );
 

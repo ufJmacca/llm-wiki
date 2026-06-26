@@ -194,9 +194,9 @@ describe("profile privacy scaffold contract", () => {
       });
       expect(publicProfile.features).toMatchObject({
         upload: false,
+        review: false,
+        review_panel: false,
       });
-      expect(publicProfile.features?.review).not.toBe(true);
-      expect(publicProfile.features?.review_panel).not.toBe(true);
     } finally {
       await rm(parent, { force: true, recursive: true });
     }

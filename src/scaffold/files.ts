@@ -95,7 +95,6 @@ node_modules/
 quartz/.quartz-cache/
 quartz/content/
 quartz/quartz/
-quartz/public/
 `;
 }
 

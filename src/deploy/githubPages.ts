@@ -1,4 +1,4 @@
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { parse } from "yaml";
@@ -12,7 +12,7 @@ import { assertQuartzDependenciesInstalled } from "../quartz/server.js";
 import { RuntimeCommandError } from "../runtime/errors.js";
 import { publicProfileContent } from "../scaffold/templates/profiles.js";
 import { validateTextFileWriteInsideRoot, writeTextFileInsideRoot, type BinaryWriteError } from "../utils/fs.js";
-import { readGitCurrentBranch, readGitRemoteUrl, readGitTopLevel } from "../utils/git.js";
+import { areAnyGitPathsIgnored, readGitCurrentBranch, readGitRemoteUrl, readGitTopLevel } from "../utils/git.js";
 import {
   customDomainHostIsValid,
   deployProfileBaseUrlError,
@@ -84,6 +84,12 @@ export type DeployPublicPreflightState = {
 const GITHUB_PAGES_WORKFLOW_PATH = ".github/workflows/llm-wiki-pages.yml" as const;
 const GITHUB_PAGES_PROFILE_PATH = ".llm-wiki/profiles/github-pages.yml" as const;
 const PUBLIC_PROFILE_PATH = ".llm-wiki/profiles/public.yml" as const;
+const GITIGNORE_PATH = ".gitignore" as const;
+const QUARTZ_PUBLIC_ARTIFACT_PROBES = [
+  "quartz/public/index.html",
+  "quartz/public/assets/llm-wiki-trackability-probe",
+  "quartz/public/static/llm-wiki-trackability-probe",
+] as const;
 const PROFILE_EXTENSIONS = ["yml", "yaml"] as const;
 const QUARTZ_INSTALL_COMMAND = "cd quartz && npm install" as const;
 const GITHUB_PAGES_BUILD_COMMAND = "llm-wiki explore build --profile github-pages" as const;
@@ -105,15 +111,6 @@ type RequiredWorkflowStep =
 
 const REQUIRED_WORKFLOW_STEPS = [
   { kind: "uses", uses: "actions/checkout@v4" },
-  { kind: "uses", uses: "actions/setup-node@v4", with: { "node-version": "22" } },
-  { kind: "run", command: "npm install --global llm-wiki@latest" },
-  { kind: "run", command: "llm-wiki explore init" },
-  { kind: "run", command: "cd quartz && npm install" },
-  { kind: "run", command: "llm-wiki explore sync --profile github-pages" },
-  { kind: "run", command: "llm-wiki lint --profile github-pages --strict" },
-  { kind: "run", command: GITHUB_PAGES_BUILD_COMMAND },
-  { kind: "run", command: "cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME" },
-  { kind: "run", command: "llm-wiki lint --profile github-pages --strict" },
   { kind: "uses", uses: "actions/upload-pages-artifact@v3", with: { path: "quartz/public" } },
   { kind: "uses", uses: "actions/deploy-pages@v4" },
 ] as const satisfies readonly RequiredWorkflowStep[];
@@ -132,6 +129,7 @@ export async function initializeGitHubPagesDeploy(
   const deployProfilePath = await profileWritePath(repoRoot, "github-pages");
   const publicProfilePath = await profileWritePath(repoRoot, "public");
   const quartz = await quartzState(repoRoot);
+  const migrationWarnings = await removeLegacyQuartzPublicIgnoreRules(repoRoot);
   const createdPaths: string[] = [];
   const updatedPaths: string[] = [];
 
@@ -147,6 +145,9 @@ export async function initializeGitHubPagesDeploy(
       updatedPaths.push(entry.path);
     }
   }
+  if (migrationWarnings.length > 0) {
+    updatedPaths.push(GITIGNORE_PATH);
+  }
 
   return {
     data: {
@@ -157,9 +158,9 @@ export async function initializeGitHubPagesDeploy(
       custom_domain: customDomain,
       created_paths: createdPaths,
       updated_paths: updatedPaths,
-      instructions: setupInstructions({ quartz }),
+      instructions: setupInstructions({ quartz }, { includeStateRemediation: false }),
     },
-    warnings: [],
+    warnings: migrationWarnings,
   };
 }
 
@@ -229,10 +230,14 @@ export async function checkGitHubPagesDeploy(repoRoot: string): Promise<{ data: 
     });
   }
 
+  await assertQuartzPublicArtifactTrackable(repoRoot);
+  await assertQuartzPublicArtifactExistsForDeployCheck(repoRoot);
+
   return status;
 }
 
 export async function buildGitHubPagesLocal(repoRoot: string): Promise<{ data: GitHubPagesBuildLocalResult; warnings: string[] }> {
+  const migrationWarnings = await removeLegacyQuartzPublicIgnoreRules(repoRoot);
   await assertGitHubPagesWorkflowValid(repoRoot);
   await assertGitHubPagesProfileValid(repoRoot);
   const build = await buildQuartzExplorer(repoRoot, "github-pages");
@@ -248,7 +253,7 @@ export async function buildGitHubPagesLocal(repoRoot: string): Promise<{ data: G
       public_preflight: status.data.public_preflight,
       setup_instructions: status.data.setup_instructions,
     },
-    warnings: [...build.warnings, ...status.warnings],
+    warnings: [...migrationWarnings, ...build.warnings, ...status.warnings],
   };
 }
 
@@ -617,26 +622,31 @@ function workflowHasRequiredTriggers(parsed: unknown): boolean {
 }
 
 function workflowDeployStepsAreValid(parsed: unknown): boolean {
-  if (!isRecord(parsed) || !isRecord(parsed.jobs) || !isRecord(parsed.jobs.deploy)) {
+  if (!isRecord(parsed) || !isRecord(parsed.jobs) || !workflowJobsArePublisherOnly(parsed.jobs)) {
     return false;
   }
 
-  const steps = parsed.jobs.deploy.steps;
-  if (!Array.isArray(steps)) {
+  const deployJob = parsed.jobs.deploy;
+  if (!isRecord(deployJob)) {
     return false;
   }
 
-  let nextSearchIndex = 0;
-  for (const requiredStep of REQUIRED_WORKFLOW_STEPS) {
-    const stepIndex = steps.findIndex((step, index) => index >= nextSearchIndex && workflowStepMatches(step, requiredStep));
-    if (stepIndex === -1) {
-      return false;
-    }
-
-    nextSearchIndex = stepIndex + 1;
+  const steps = deployJob.steps;
+  if (!Array.isArray(steps) || steps.length !== REQUIRED_WORKFLOW_STEPS.length) {
+    return false;
   }
 
-  return true;
+  return REQUIRED_WORKFLOW_STEPS.every((requiredStep, index) => workflowStepMatches(steps[index], requiredStep));
+}
+
+function workflowJobsArePublisherOnly(jobs: Record<string, unknown>): boolean {
+  const jobNames = Object.keys(jobs);
+  if (jobNames.length !== 1 || jobNames[0] !== "deploy") {
+    return false;
+  }
+
+  const deployJob = jobs.deploy;
+  return isRecord(deployJob) && !("uses" in deployJob);
 }
 
 function workflowStepMatches(step: unknown, requiredStep: RequiredWorkflowStep): boolean {
@@ -657,7 +667,7 @@ function workflowStepUsesAction(step: Record<string, unknown>, requiredStep: Ext
   }
 
   if (requiredStep.with === undefined) {
-    return true;
+    return step.with === undefined;
   }
 
   const stepWith = step.with;
@@ -665,7 +675,9 @@ function workflowStepUsesAction(step: Record<string, unknown>, requiredStep: Ext
     return false;
   }
 
-  return Object.entries(requiredStep.with).every(([key, value]) => String(stepWith[key]) === value);
+  const expectedEntries = Object.entries(requiredStep.with);
+  return Object.keys(stepWith).length === expectedEntries.length &&
+    expectedEntries.every(([key, value]) => String(stepWith[key]) === value);
 }
 
 function workflowStepRunsCommand(step: Record<string, unknown>, command: string): boolean {
@@ -858,30 +870,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Install llm-wiki CLI
-        run: npm install --global llm-wiki@latest
-      - name: Initialize Quartz runtime
-        run: llm-wiki explore init
-      - name: Install Quartz dependencies
-        run: cd quartz && npm install
-      - name: Sync public Quartz content
-        run: llm-wiki explore sync --profile github-pages
-      - name: Strict public lint
-        run: llm-wiki lint --profile github-pages --strict
-      - name: Build Quartz
-        run: ${GITHUB_PAGES_BUILD_COMMAND}
-      - name: Preserve custom domain
-        run: |
-          if [ -f .llm-wiki/cache/github-pages-CNAME ]; then
-            cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME
-          fi
-      - name: Scan built Pages artifact
-        run: llm-wiki lint --profile github-pages --strict
-      - name: Upload Pages artifact
+      - name: Upload committed Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: quartz/public
@@ -976,6 +965,8 @@ features:
   graph: true
   backlinks: true
   upload: false
+  review: false
+  review_panel: false
 source_links:
   allow_local_file_links: false
 safety:
@@ -991,28 +982,292 @@ deploy:
 `;
 }
 
+async function removeLegacyQuartzPublicIgnoreRules(repoRoot: string): Promise<string[]> {
+  const content = await readOptionalGitignoreForMigration(repoRoot);
+  if (content === null) {
+    return [];
+  }
+
+  const lineBreak = content.includes("\r\n") ? "\r\n" : "\n";
+  const lines = content.split(/\r\n|\n/u);
+  const filteredLines = lines.filter((line) => !isLegacyQuartzPublicIgnoreLine(line));
+  if (filteredLines.length === lines.length) {
+    return [];
+  }
+
+  const write = await writeTextFileInsideRoot(repoRoot, GITIGNORE_PATH, filteredLines.join(lineBreak));
+  if (!write.ok) {
+    throw deployError({
+      code: "GITHUB_PAGES_GITIGNORE_UPDATE_FAILED",
+      message: "Failed to remove legacy GitHub Pages artifact ignore rule.",
+      path: GITIGNORE_PATH,
+      hint: write.error.hint,
+    });
+  }
+
+  return ["Removed legacy quartz/public ignore rule from .gitignore."];
+}
+
+async function readOptionalGitignoreForMigration(repoRoot: string): Promise<string | null> {
+  try {
+    return await readFile(resolve(repoRoot, GITIGNORE_PATH), "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return null;
+    }
+
+    throw deployError({
+      code: "GITHUB_PAGES_READ_FAILED",
+      message: `Failed to read ${GITIGNORE_PATH}.`,
+      path: GITIGNORE_PATH,
+      hint: error instanceof Error ? error.message : "Fix filesystem permissions before rerunning the command.",
+    });
+  }
+}
+
+function isLegacyQuartzPublicIgnoreLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith("!")) {
+    return false;
+  }
+
+  const normalized = trimmed.replace(/^\/+/u, "").replace(/\/+$/u, "");
+  return normalized === "quartz/public" || normalized === "quartz/public/*" || normalized === "quartz/public/**";
+}
+
+async function assertQuartzPublicArtifactTrackable(repoRoot: string): Promise<void> {
+  let ignored: boolean | null;
+  try {
+    ignored = await areQuartzPublicArtifactPathsIgnored(repoRoot);
+  } catch (error) {
+    throw deployError({
+      code: "GITHUB_PAGES_PUBLIC_TRACKABILITY_UNKNOWN",
+      message: "Could not verify that quartz/public is trackable.",
+      path: GITIGNORE_PATH,
+      hint: error instanceof Error ? error.message : "Fix Git ignore configuration before rerunning deploy checks.",
+    });
+  }
+
+  if (ignored === null) {
+    throw deployError({
+      code: "GITHUB_PAGES_PUBLIC_TRACKABILITY_UNKNOWN",
+      message: "Could not verify that quartz/public is trackable.",
+      path: GITIGNORE_PATH,
+      hint: "Ensure Git is available and the wiki root is inside a Git worktree before rerunning deploy checks.",
+    });
+  }
+
+  if (!ignored) {
+    return;
+  }
+
+  throw deployError({
+    code: "GITHUB_PAGES_PUBLIC_IGNORED",
+    message: "Committed GitHub Pages output is ignored by Git.",
+    path: GITIGNORE_PATH,
+    hint: "Remove ignore rules such as quartz/public/ or rerun llm-wiki deploy github-pages init before committing quartz/public.",
+  });
+}
+
+async function assertQuartzPublicArtifactExistsForDeployCheck(repoRoot: string): Promise<void> {
+  let publicIsDirectory = false;
+  try {
+    const state = await lstat(resolve(repoRoot, "quartz/public"));
+    publicIsDirectory = state.isDirectory();
+  } catch (error) {
+    if (!isNodeError(error) || (error.code !== "ENOENT" && error.code !== "ENOTDIR")) {
+      throw deployError({
+        code: "GITHUB_PAGES_READ_FAILED",
+        message: "Failed to inspect committed GitHub Pages output.",
+        path: "quartz/public",
+        hint: error instanceof Error ? error.message : "Fix filesystem permissions before rerunning deploy checks.",
+      });
+    }
+
+    throwQuartzPublicArtifactMissing();
+  }
+
+  if (!publicIsDirectory) {
+    throwQuartzPublicArtifactMissing();
+  }
+
+  await assertQuartzPublicArtifactFile(repoRoot, "quartz/public/index.html");
+
+  const deployProfile = await readWikiProfile(repoRoot, "github-pages");
+  if (!deployProfile.ok) {
+    throw deployError(profileErrorToStateError(deployProfile.error));
+  }
+
+  const cnamePath = "quartz/public/CNAME";
+  if (deployProfile.value.customDomain === null) {
+    try {
+      await lstat(resolve(repoRoot, cnamePath));
+      throw deployError({
+        code: "GITHUB_PAGES_PUBLIC_ARTIFACT_INVALID",
+        message: "Committed GitHub Pages custom domain artifact is stale.",
+        path: cnamePath,
+        hint: "Remove quartz/public/CNAME or rerun llm-wiki deploy github-pages build-local without a custom domain, then commit quartz/public.",
+      });
+    } catch (error) {
+      if (error instanceof RuntimeCommandError) {
+        throw error;
+      }
+
+      if (isNodeError(error) && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
+        return;
+      }
+
+      throw deployError({
+        code: "GITHUB_PAGES_READ_FAILED",
+        message: "Failed to inspect committed GitHub Pages output.",
+        path: cnamePath,
+        hint: error instanceof Error ? error.message : "Fix filesystem permissions before rerunning deploy checks.",
+      });
+    }
+
+    return;
+  }
+
+  await assertQuartzPublicArtifactFile(repoRoot, cnamePath);
+  let cname: string;
+  try {
+    cname = (await readFile(resolve(repoRoot, cnamePath), "utf8")).trim();
+  } catch (error) {
+    throw deployError({
+      code: "GITHUB_PAGES_READ_FAILED",
+      message: "Failed to inspect committed GitHub Pages output.",
+      path: cnamePath,
+      hint: error instanceof Error ? error.message : "Fix filesystem permissions before rerunning deploy checks.",
+    });
+  }
+  if (cname === deployProfile.value.customDomain) {
+    return;
+  }
+
+  throw deployError({
+    code: "GITHUB_PAGES_PUBLIC_ARTIFACT_INVALID",
+    message: "Committed GitHub Pages custom domain artifact does not match the deploy profile.",
+    path: cnamePath,
+    hint: `Run llm-wiki deploy github-pages build-local so quartz/public/CNAME contains ${deployProfile.value.customDomain}, then commit quartz/public.`,
+  });
+}
+
+async function assertQuartzPublicArtifactFile(repoRoot: string, path: string): Promise<void> {
+  try {
+    const state = await lstat(resolve(repoRoot, path));
+    if (state.isFile()) {
+      return;
+    }
+  } catch (error) {
+    if (!isNodeError(error) || (error.code !== "ENOENT" && error.code !== "ENOTDIR")) {
+      throw deployError({
+        code: "GITHUB_PAGES_READ_FAILED",
+        message: "Failed to inspect committed GitHub Pages output.",
+        path,
+        hint: error instanceof Error ? error.message : "Fix filesystem permissions before rerunning deploy checks.",
+      });
+    }
+  }
+
+  throw deployError({
+    code: "GITHUB_PAGES_PUBLIC_ARTIFACT_INCOMPLETE",
+    message: "Committed GitHub Pages output is incomplete.",
+    path,
+    hint: "Run llm-wiki deploy github-pages build-local, then commit quartz/public before rerunning deploy checks.",
+  });
+}
+
+function throwQuartzPublicArtifactMissing(): never {
+  throw deployError({
+    code: "GITHUB_PAGES_PUBLIC_ARTIFACT_MISSING",
+    message: "Committed GitHub Pages output is missing.",
+    path: "quartz/public",
+    hint: "Run llm-wiki deploy github-pages build-local, then commit quartz/public before rerunning deploy checks.",
+  });
+}
+
+async function areQuartzPublicArtifactPathsIgnored(repoRoot: string): Promise<boolean | null> {
+  const artifactPaths = await quartzPublicArtifactTrackabilityPaths(repoRoot);
+  return await areAnyGitPathsIgnored(repoRoot, artifactPaths);
+}
+
+async function quartzPublicArtifactTrackabilityPaths(repoRoot: string): Promise<string[]> {
+  const paths = new Set<string>(QUARTZ_PUBLIC_ARTIFACT_PROBES);
+  await collectQuartzPublicArtifactPaths(repoRoot, "quartz/public", paths);
+  return [...paths];
+}
+
+async function collectQuartzPublicArtifactPaths(repoRoot: string, relativePath: string, paths: Set<string>): Promise<void> {
+  let state: Awaited<ReturnType<typeof lstat>>;
+  try {
+    state = await lstat(resolve(repoRoot, relativePath));
+  } catch {
+    return;
+  }
+
+  if (state.isSymbolicLink() || state.isFile()) {
+    paths.add(relativePath);
+    return;
+  }
+
+  if (!state.isDirectory()) {
+    return;
+  }
+
+  const entries = await readdir(resolve(repoRoot, relativePath));
+  for (const entry of entries.sort()) {
+    await collectQuartzPublicArtifactPaths(repoRoot, `${relativePath}/${entry}`, paths);
+  }
+}
+
 function setupInstructions(
   state: Partial<Pick<GitHubPagesCheckResult, "workflow" | "profiles" | "quartz" | "public_preflight">>,
+  options: { includeStateRemediation?: boolean } = {},
 ): string[] {
-  const instructions: string[] = [];
-  if (state.workflow?.status === "missing" || state.profiles?.status === "missing") {
-    instructions.push("Run llm-wiki deploy github-pages init to generate Pages workflow and profiles.");
-  }
-  if (state.workflow?.status === "invalid" || state.profiles?.status === "invalid") {
-    instructions.push("Regenerate Pages workflow and deploy profiles with llm-wiki deploy github-pages init.");
-  }
-  if (state.quartz?.status === "missing_runtime") {
-    instructions.push("Run llm-wiki explore init before building Pages locally or in CI.");
-  }
-  if (state.quartz?.status === "missing_dependencies") {
-    instructions.push("Run cd quartz && npm install before building Pages locally or in CI.");
-  }
-  if (state.public_preflight?.status === "fail") {
-    instructions.push("Run llm-wiki explore sync --profile github-pages and llm-wiki lint --profile github-pages --strict, then fix public preflight errors.");
-  }
+  const instructions: string[] = options.includeStateRemediation === false ? [] : stateRemediationInstructions(state);
+  instructions.push(...publishInstructions());
   instructions.push("In GitHub, enable Pages with Source: GitHub Actions.");
 
   return [...new Set(instructions)];
+}
+
+function stateRemediationInstructions(
+  state: Partial<Pick<GitHubPagesCheckResult, "workflow" | "profiles" | "quartz" | "public_preflight">>,
+): string[] {
+  const instructions: string[] = [];
+
+  if (state.workflow?.status === "missing" || state.profiles?.status === "missing") {
+    instructions.push("Run llm-wiki deploy github-pages init.");
+  } else {
+    if (state.workflow?.status === "invalid") {
+      instructions.push("Regenerate the GitHub Pages workflow with llm-wiki deploy github-pages init.");
+    }
+
+    if (state.profiles?.status === "invalid") {
+      instructions.push("Regenerate GitHub Pages deploy profiles with llm-wiki deploy github-pages init.");
+    }
+  }
+
+  if (state.quartz?.status === "missing_runtime") {
+    instructions.push("Run llm-wiki explore init before building GitHub Pages output.");
+  } else if (state.quartz?.status === "missing_dependencies") {
+    instructions.push("Run cd quartz && npm install before building GitHub Pages output.");
+  }
+
+  if (state.public_preflight?.status === "fail") {
+    instructions.push("Run llm-wiki explore sync --profile github-pages and llm-wiki lint --profile github-pages --strict, then fix public preflight errors.");
+  }
+
+  return instructions;
+}
+
+function publishInstructions(): string[] {
+  return [
+    "Run llm-wiki deploy github-pages build-local to generate committed Pages output in quartz/public.",
+    "Run llm-wiki deploy github-pages check before publishing.",
+    "Commit quartz/public with the reviewed public source changes.",
+    "Open a pull request for review before merging Pages output.",
+  ];
 }
 
 async function writeTrackedTextFile(repoRoot: string, path: string, content: string): Promise<"created" | "updated" | "skipped"> {

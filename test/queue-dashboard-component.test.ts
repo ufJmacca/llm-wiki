@@ -15,6 +15,7 @@ type RenderedElement = {
 };
 
 type QueueDashboardFrontmatter = {
+  llm_wiki_upload_page_enabled?: boolean;
   llm_wiki_queue_total: number;
   llm_wiki_queue_queued: number;
   llm_wiki_queue_ingesting: number;
@@ -313,7 +314,7 @@ describe("LlmWikiQueueDashboard generated component", () => {
     });
   });
 
-  it("renders a complete zero state with upload and source queue links", async () => {
+  it("renders a complete zero state with upload and source queue links when upload page is enabled", async () => {
     await withTempWorkspace("llm-wiki-queue-dashboard-zero-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
@@ -323,6 +324,7 @@ describe("LlmWikiQueueDashboard generated component", () => {
 
       // Act
       const dashboard = await renderGeneratedDashboard(component, {
+        llm_wiki_upload_page_enabled: true,
         llm_wiki_queue_total: 0,
         llm_wiki_queue_queued: 0,
         llm_wiki_queue_ingesting: 0,
@@ -355,6 +357,41 @@ describe("LlmWikiQueueDashboard generated component", () => {
           },
         ]),
       );
+    });
+  });
+
+  it("omits the zero-state upload link when upload page is disabled", async () => {
+    await withTempWorkspace("llm-wiki-queue-dashboard-zero-disabled-upload-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await mkdir(wikiDir, { recursive: true });
+      await initializeQuartzRuntime(wikiDir);
+      const component = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiQueueDashboard.tsx");
+
+      // Act
+      const dashboard = await renderGeneratedDashboard(component, {
+        llm_wiki_upload_page_enabled: false,
+        llm_wiki_queue_total: 0,
+        llm_wiki_queue_queued: 0,
+        llm_wiki_queue_ingesting: 0,
+        llm_wiki_queue_blocked: 0,
+        llm_wiki_queue_completed: 0,
+        llm_wiki_queue_items: [],
+      });
+      const links = findAll(dashboard, (element) => element.tag === "a").map((link) => ({
+        href: link.props.href,
+        text: renderText(link),
+        classNames: flattenClassNames(link.props.class),
+      }));
+
+      // Assert
+      expect(links).toEqual([
+        {
+          href: "/resolved/_llm-wiki/review/source-queue",
+          text: "Open source queue",
+          classNames: ["internal"],
+        },
+      ]);
     });
   });
 });

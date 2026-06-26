@@ -160,6 +160,43 @@ describe("static output leak scanner", () => {
     },
   );
 
+  it.each([
+    {
+      marker: "llm_wiki_queue_dashboard",
+      path: "queue-dashboard.md",
+      content: "---\nllm_wiki_queue_dashboard: true\n---\n# Queue Dashboard\n",
+    },
+    {
+      marker: "llm_wiki_queue_items",
+      path: "queue-items.md",
+      content: "---\nllm_wiki_queue_items: []\n---\n# Queue Items\n",
+    },
+  ] as const)("detects generated queue metadata marker $marker as a raw queue leak", async ({ path, content }) => {
+    await withTempWorkspace("llm-wiki-static-leak-queue-metadata-", async (workspaceDir) => {
+      // Arrange
+      const staticPath = `quartz/public/${path}`;
+      await mkdir(resolve(workspaceDir, "quartz/public"), { recursive: true });
+      await writeFile(resolve(workspaceDir, staticPath), content, "utf8");
+
+      // Act
+      const scan = await scanStaticOutputLeaks(workspaceDir);
+
+      // Assert
+      expect(scan.ok).toBe(false);
+      expect(scan.scanned_roots).toEqual(["quartz/public"]);
+      expect(scan.findings).toEqual([
+        expect.objectContaining({
+          code: "STATIC_RAW_QUEUE_LEAK",
+          path: staticPath,
+          line: 2,
+          message: expect.stringContaining("raw queue metadata"),
+          hint: expect.stringContaining("GitHub Pages"),
+        }),
+      ]);
+      expectStableStaticLeakFinding(scan.findings[0]);
+    });
+  });
+
   it("does not flag generic public auth documentation as an upload auth leak", async () => {
     await withTempWorkspace("llm-wiki-static-leak-auth-docs-", async (workspaceDir) => {
       // Arrange

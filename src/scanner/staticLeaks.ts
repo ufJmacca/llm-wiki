@@ -74,7 +74,8 @@ const MARKER_RULES: readonly MarkerRule[] = [
   },
   {
     code: "STATIC_RAW_QUEUE_LEAK",
-    pattern: /\braw\/queue\/[^\s"'`)<]+|\bqueue_path\b|\boriginal_path\b/iu,
+    pattern:
+      /\braw\/queue\/[^\s"'`)<]+|\bqueue_path\b|\boriginal_path\b|\bllm_wiki_queue_dashboard\b|\bllm_wiki_queue_items\b/iu,
   },
   {
     code: "STATIC_PRIVATE_SOURCE_CARD_LEAK",

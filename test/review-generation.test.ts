@@ -634,6 +634,7 @@ function profileFixture(name: "public" | "review"): WikiProfile {
     exclude: [],
     includePrivate,
     requiredVisibility: includePrivate ? null : "public",
+    features: includePrivate ? { review_panel: true } : { upload: false },
   };
 }
 

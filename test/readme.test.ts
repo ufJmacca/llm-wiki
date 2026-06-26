@@ -119,6 +119,23 @@ describe("README GitHub Pages deploy documentation", () => {
       expect(readme).not.toContain(removedText);
     }
   });
+
+  it("documents the local review-to-PR publication path for GitHub Pages", async () => {
+    // Arrange
+    const requiredDocumentation = [
+      "GitHub Pages is static publication only: it never supports uploads, upload endpoint configuration, upload tokens, runtime daemon metadata, raw originals, private source cards, queue state, or generated review pages.",
+      "The supported publication flow is local/private upload, private queue review, ingest into curated Markdown, `llm-wiki deploy github-pages build-local`, `llm-wiki deploy github-pages check`, commit `quartz/public`, open a pull request, merge it, and let GitHub Pages serve the committed static files.",
+      "Do not commit raw upload artifacts, `_llm-wiki/runtime/local-daemon.json`, queue internals, or review-only Explorer pages to the Pages payload.",
+    ];
+
+    // Act
+    const readme = await readReadme();
+
+    // Assert
+    for (const expectedText of requiredDocumentation) {
+      expect(readme).toContain(expectedText);
+    }
+  });
 });
 
 describe("README local Explorer upload and review documentation", () => {
@@ -162,6 +179,26 @@ describe("README local Explorer upload and review documentation", () => {
     expect(readme).toContain("The standalone daemon and remote upload scaffold commands are not part of the v1 public CLI.");
     for (const removedText of removedPublicCommandDocs) {
       expect(readme).not.toContain(removedText);
+    }
+  });
+
+  it("marks legacy remote/serverless scaffold files as unsupported migration debris for GitHub Pages", async () => {
+    // Arrange
+    const requiredMigrationGuidance = [
+      "`upload/github/serverless/README.md`",
+      "`upload/github/serverless/functions/raw-upload.ts`",
+      "`upload/github/serverless/package.json`",
+      "`upload/github/serverless/wrangler.toml`",
+      "Treat existing `upload/github/serverless/*` files as unsupported migration debris for GitHub Pages.",
+      "They are not a Pages upload path and should not be wired into public or `github-pages` profiles.",
+    ];
+
+    // Act
+    const readme = await readReadme();
+
+    // Assert
+    for (const expectedText of requiredMigrationGuidance) {
+      expect(readme).toContain(expectedText);
     }
   });
 

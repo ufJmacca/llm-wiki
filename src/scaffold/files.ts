@@ -85,6 +85,24 @@ This repository is an LLM Wiki workspace with immutable raw sources and curated 
 - \`curated/\` stores LLM-maintained Markdown pages.
 - \`curated/index.md\` is the wiki map.
 - \`curated/log.md\` is the append-only operation ledger.
+
+## Local upload and review
+
+Run local upload with \`llm-wiki explore serve --profile local --with-daemon\`.
+
+Capture files, pasted text, or URLs through the local Explorer. Review private queued sources under \`raw/queue/\` and their private source cards before ingest.
+
+Ingest approved sources into curated Markdown with \`llm-wiki ingest <source_id>\`.
+
+## GitHub Pages publication
+
+Publish to GitHub Pages by running \`llm-wiki deploy github-pages build-local\`, running \`llm-wiki deploy github-pages check\`, committing \`quartz/public\`, opening a pull request, merging it, and letting Pages serve the committed static files.
+
+GitHub Pages never supports uploads, upload endpoint config, tokens, runtime daemon metadata, raw originals, private source cards, queue state, or review pages.
+
+Do not commit raw upload artifacts, \`_llm-wiki/runtime/local-daemon.json\`, queue internals, or review-only Explorer pages to the Pages payload.
+
+Treat existing \`upload/github/serverless/*\` files as unsupported migration debris for GitHub Pages.
 `;
 }
 

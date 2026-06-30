@@ -92,11 +92,13 @@ export async function serveQuartzExplorer(
     profile: string;
     host?: string;
     port?: number;
+    uploadDaemonActive?: boolean;
     onReady?: (result: QuartzServeReadyResult, warnings: string[]) => void;
     onSynced?: (result: QuartzSyncResult) => Promise<void>;
   },
 ): Promise<{ data: QuartzServeResult; warnings: string[] }> {
-  const syncResult = await syncQuartzContent(repoRoot, options.profile);
+  const syncOptions = { uploadDaemonActive: options.uploadDaemonActive === true };
+  const syncResult = await syncQuartzContent(repoRoot, options.profile, syncOptions);
   await assertQuartzDependenciesInstalled(repoRoot);
   await options.onSynced?.(syncResult.data);
 
@@ -107,7 +109,12 @@ export async function serveQuartzExplorer(
   const watchPaths = [...EXPLORER_WATCH_PATHS];
   const args = ["run", "serve", "--", "--port", String(port), "--wsPort", String(wsPort)];
   const env = quartzServeEnvironment(host);
-  const stopWatching = await startExplorerWatchers(repoRoot, syncResult.data.profile, options.onSynced);
+  const stopWatching = await startExplorerWatchers(
+    repoRoot,
+    syncResult.data.profile,
+    syncOptions,
+    options.onSynced,
+  );
   let stateRecorded = false;
   let recordedState: ExplorerState | null = null;
   const exitCleanup = {
@@ -730,6 +737,7 @@ export function syncSummary(
 async function startExplorerWatchers(
   repoRoot: string,
   profile: QuartzSyncResult["profile"],
+  syncOptions: { uploadDaemonActive?: boolean },
   onSynced?: (result: QuartzSyncResult) => Promise<void>,
 ): Promise<() => Promise<void>> {
   const watchers = new Map<string, FSWatcher>();
@@ -794,7 +802,10 @@ async function startExplorerWatchers(
       }
 
       syncInFlight = true;
-      syncPromise = syncQuartzContent(repoRoot, profile, { preserveContentRoot: true })
+      syncPromise = syncQuartzContent(repoRoot, profile, {
+        preserveContentRoot: true,
+        uploadDaemonActive: syncOptions.uploadDaemonActive === true,
+      })
         .then(async (syncResult) => {
           if (closed) {
             return;

@@ -198,6 +198,15 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
       await removeLocalDaemonRuntimeMetadata(resolvedRepo.value.rootDir);
     }
 
+    if (rawOptions.withDaemon === true && isPublicLikeProfile(profile)) {
+      throw new RuntimeCommandError({
+        code: "UPLOAD_DAEMON_PROFILE_FORBIDDEN",
+        message: `--with-daemon is forbidden for the ${profile} Explorer profile.`,
+        path: "--with-daemon",
+        hint: "Use --profile local or --profile review for private upload daemon serves.",
+      });
+    }
+
     if (rawOptions.withDaemon === true) {
       uploadDaemon = await startUploadDaemon({
         repoRoot: resolvedRepo.value.rootDir,
@@ -210,6 +219,7 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
       profile,
       host: typeof rawOptions.host === "string" ? rawOptions.host : DEFAULT_EXPLORER_HOST,
       port: normalizePort(rawOptions.port),
+      uploadDaemonActive: uploadDaemon !== undefined && isLocalReviewProfile(profile),
       onSynced: async () => {
         if (uploadDaemon === undefined || !isLocalReviewProfile(profile)) {
           return;

@@ -23,6 +23,7 @@ const QUARTZ_BUILD_ROOT_INDEX_PATH = "quartz/content/index.md" as const;
 const QUARTZ_BUILD_CURATED_INDEX_PATH = "quartz/content/curated/index.md" as const;
 const QUARTZ_LAYOUT_PATH = "quartz/quartz.layout.ts" as const;
 const QUARTZ_PUBLIC_CNAME_PATH = "quartz/public/CNAME" as const;
+const QUARTZ_PUBLIC_INDEX_PATH = "quartz/public/index.html" as const;
 const QUARTZ_CONTENT_OUTPUT_ROOT = "quartz/content" as const;
 const QUARTZ_PUBLIC_OUTPUT_ROOT = "quartz/public" as const;
 const QUARTZ_UPLOAD_FORM_IMPORT_PATTERN = /^import\s+LlmWikiUploadForm\s+from\s+["']\.\/components\/LlmWikiUploadForm["'];?[ \t]*\r?\n?/mu;
@@ -399,9 +400,14 @@ async function assertQuartzPublicArtifactExists(repoRoot: string): Promise<void>
   try {
     const state = await lstat(resolve(repoRoot, QUARTZ_PUBLIC_OUTPUT_ROOT));
     if (state.isDirectory()) {
+      await assertQuartzPublicHomepageExists(repoRoot);
       return;
     }
   } catch (error) {
+    if (error instanceof QuartzOperationError) {
+      throw error;
+    }
+
     if (!isNodeError(error) || error.code !== "ENOENT") {
       throw new QuartzOperationError({
         code: "QUARTZ_WRITE_FAILED",
@@ -417,6 +423,31 @@ async function assertQuartzPublicArtifactExists(repoRoot: string): Promise<void>
     message: "Quartz build did not produce the expected Pages output directory.",
     path: QUARTZ_PUBLIC_OUTPUT_ROOT,
     hint: "Ensure the Quartz build writes static Pages output to quartz/public before rerunning llm-wiki explore build.",
+  });
+}
+
+async function assertQuartzPublicHomepageExists(repoRoot: string): Promise<void> {
+  try {
+    const state = await lstat(resolve(repoRoot, QUARTZ_PUBLIC_INDEX_PATH));
+    if (state.isFile()) {
+      return;
+    }
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "ENOENT") {
+      throw new QuartzOperationError({
+        code: "QUARTZ_WRITE_FAILED",
+        message: "Failed to inspect Quartz public output homepage after build.",
+        path: QUARTZ_PUBLIC_INDEX_PATH,
+        hint: error instanceof Error ? error.message : "Fix filesystem permissions before rerunning Quartz build.",
+      });
+    }
+  }
+
+  throw new QuartzOperationError({
+    code: "PUBLIC_PROFILE_ARTIFACT_INCOMPLETE",
+    message: "Quartz build did not produce the expected Pages homepage.",
+    path: QUARTZ_PUBLIC_INDEX_PATH,
+    hint: "Ensure the Quartz build writes quartz/public/index.html before rerunning llm-wiki explore build.",
   });
 }
 

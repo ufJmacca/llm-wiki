@@ -162,6 +162,33 @@ describe("README local Explorer upload and review documentation", () => {
     }
   });
 
+  it("documents upload-triggered auto-ingest, queue batch/watch usage, and local-agent boundaries", async () => {
+    // Arrange
+    const requiredDocumentation = [
+      "llm-wiki explore serve --profile local --with-daemon --auto-ingest-uploads",
+      "llm-wiki queue ingest --auto",
+      "llm-wiki queue ingest --auto --limit 5",
+      "llm-wiki queue ingest --auto --source-id <source_id>",
+      "llm-wiki queue ingest --auto --watch",
+      "Upload-triggered and queue auto-ingest both resolve `.llm-wiki/config.yml:agent.default` and require that value to name a configured local agent under `agents.<name>`.",
+      "Provider-mode auto-ingest is deferred; `--provider <name>` remains an explicit per-command proposal mode and is not used by upload-triggered or queue auto-ingest.",
+      "If `agent.default` is missing or does not point at a configured local agent, upload capture can still succeed, the source stays `queued`, and the auto-ingest result reports the missing-agent problem.",
+      "`llm-wiki queue ingest --auto` fails before moving queue items to `ingesting` when no default local agent is configured.",
+      "If auto-ingest fails during agent execution, proposal extraction, validation, or application, the source is marked `blocked` and the captured raw upload is not rolled back.",
+      "Inspect blocked sources with `llm-wiki queue show <source_id>` and review pages. To retry automation, run `llm-wiki queue set-status <source_id> queued` and then `llm-wiki ingest <source_id> --auto`; after manual repairs, run `llm-wiki ingest <source_id> --validate`.",
+      "Duplicate uploads do not create a second ingest when the existing source is already `ingested`; if the duplicate is still `queued`, upload-triggered auto-ingest may attempt the existing queue item.",
+      "Auto-ingest never builds, commits curated files, snapshots, deploys, publishes, or enables uploads on GitHub Pages.",
+    ];
+
+    // Act
+    const readme = await readReadme();
+
+    // Assert
+    for (const expectedText of requiredDocumentation) {
+      expect(readme).toContain(expectedText);
+    }
+  });
+
   it("does not advertise removed standalone daemon or remote upload scaffold commands", async () => {
     // Arrange
     const removedPublicCommandDocs = [

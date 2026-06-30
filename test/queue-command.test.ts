@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { parse, stringify } from "yaml";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { queueIngestIsIncomplete } from "../src/commands/queue.js";
 import { parseLogEntries } from "../src/scanner/index.js";
 import { parseInitJson, readGeneratedFile, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
 
@@ -809,70 +810,108 @@ describe("queue command", () => {
     });
   });
 
-  it("bounds queue ingest --auto --watch result details while accumulating counts", async () => {
-    await withTempWorkspace("llm-wiki-queue-ingest-auto-watch-bounded-", async (workspaceDir) => {
+  it("keeps aggregate watch failures after bounded result details trim", () => {
+    const retainedResults: AutoIngestSourceResult[] = Array.from({ length: 25 }, (_item, index) => ({
+      source_id: `src_ingested_${index}`,
+      previous_status: "queued",
+      final_status: "ingested",
+      outcome: "ingested",
+      attempted: true,
+      agent: "codex",
+      applied_paths: [],
+      auto_ingest: null,
+      error: null,
+    }));
+    const trimmedFailure: AutoIngestSourceResult = {
+      source_id: "src_blocked",
+      previous_status: "queued",
+      final_status: "blocked",
+      outcome: "blocked",
+      attempted: true,
+      agent: "codex",
+      applied_paths: [],
+      auto_ingest: null,
+      error: {
+        code: "AGENT_COMMAND_FAILED",
+        message: "Agent command failed for codex.",
+        path: "raw/queue/src_blocked.json",
+        hint: "Fix the source and rerun queue ingest.",
+      },
+    };
+    const data = {
+      agent: "codex",
+      results: retainedResults,
+      counts: {
+        selected: retainedResults.length + 1,
+        attempted: retainedResults.length + 1,
+        ingested: retainedResults.length,
+        blocked: 1,
+        skipped: 0,
+        deferred: 0,
+      },
+    };
+
+    expect(data.results).toHaveLength(25);
+    expect(data.results.every((item) => item.outcome === "ingested")).toBe(true);
+    expect(data.counts).toMatchObject({
+      selected: 26,
+      attempted: 26,
+      ingested: 25,
+      blocked: 1,
+      skipped: 0,
+      deferred: 0,
+    });
+    expect(data.results.some((item) => item.source_id === trimmedFailure.source_id)).toBe(false);
+    expect(queueIngestIsIncomplete(data)).toBe(true);
+  });
+
+  it("stops source-id watch after the target is ingested", async () => {
+    await withTempWorkspace("llm-wiki-queue-ingest-auto-watch-source-id-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
-      const invalidSourceId = "not-a-source-id";
-      const beforeSigint = new Set(process.listeners("SIGINT"));
-      const beforeSigterm = new Set(process.listeners("SIGTERM"));
       await initializeWiki(wikiDir);
-      vi.useFakeTimers();
+      const otherSource = await captureTextSource(wikiDir, "Untouched Watch Source", "source should stay queued");
+      const targetSource = await captureTextSource(wikiDir, "Target Watch Source", "source should be ingested once");
+      await configureDefaultAgent(wikiDir, await createFakeCodex(workspaceDir));
 
-      try {
-        // Act
-        const watchResult = runCliBuffered([
-          "queue",
-          "ingest",
-          "--auto",
-          "--source-id",
-          invalidSourceId,
-          "--watch",
-          "--repo",
-          wikiDir,
-          "--json",
-        ]);
-        let addedSigintListeners = process.listeners("SIGINT").filter((listener) => !beforeSigint.has(listener));
-        for (let attempt = 0; attempt < 50 && addedSigintListeners.length === 0; attempt += 1) {
-          await vi.advanceTimersByTimeAsync(0);
-          addedSigintListeners = process.listeners("SIGINT").filter((listener) => !beforeSigint.has(listener));
-        }
-        expect(addedSigintListeners).toHaveLength(1);
+      // Act
+      const result = await runCliBuffered([
+        "queue",
+        "ingest",
+        "--auto",
+        "--source-id",
+        targetSource.source_id,
+        "--watch",
+        "--repo",
+        wikiDir,
+        "--json",
+      ]);
+      const payload = parseJsonSuccess<"queue ingest", QueueIngestData>(result.stdout);
+      const otherQueueResult = await runCliBuffered(["queue", "show", otherSource.source_id, "--repo", wikiDir, "--json"]);
+      const targetQueueResult = await runCliBuffered(["queue", "show", targetSource.source_id, "--repo", wikiDir, "--json"]);
+      const otherQueue = parseJsonSuccess<"queue show", QueueShowData>(otherQueueResult.stdout);
+      const targetQueue = parseJsonSuccess<"queue show", QueueShowData>(targetQueueResult.stdout);
 
-        for (let tick = 0; tick < 30; tick += 1) {
-          await vi.advanceTimersByTimeAsync(1_000);
-        }
-        addedSigintListeners[0]?.("SIGINT");
-        await vi.advanceTimersByTimeAsync(0);
-        const result = await watchResult;
-        const payload = parseJsonSuccess<"queue ingest", QueueIngestData>(result.stdout);
-
-        // Assert
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr).toEqual([]);
-        expect(payload.data.counts).toMatchObject({
-          selected: 31,
-          attempted: 0,
-          ingested: 0,
-          blocked: 0,
-          skipped: 31,
-          deferred: 0,
-        });
-        expect(payload.data.results).toHaveLength(25);
-        expect(payload.data.results.every((item) => item.source_id === invalidSourceId)).toBe(true);
-        expect(payload.data.results.every((item) => item.outcome === "skipped")).toBe(true);
-      } finally {
-        for (const listener of process.listeners("SIGINT")) {
-          if (!beforeSigint.has(listener)) {
-            process.off("SIGINT", listener);
-          }
-        }
-        for (const listener of process.listeners("SIGTERM")) {
-          if (!beforeSigterm.has(listener)) {
-            process.off("SIGTERM", listener);
-          }
-        }
-      }
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.counts).toMatchObject({
+        selected: 1,
+        attempted: 1,
+        ingested: 1,
+        blocked: 0,
+        skipped: 0,
+        deferred: 0,
+      });
+      expect(payload.data.results).toEqual([
+        expect.objectContaining({
+          source_id: targetSource.source_id,
+          outcome: "ingested",
+          final_status: "ingested",
+        }),
+      ]);
+      expect(otherQueue.data.queue_record.status).toBe("queued");
+      expect(targetQueue.data.queue_record.status).toBe("ingested");
     });
   });
 

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -123,6 +123,33 @@ async function releaseLockHolder(holder: LockHolderProcess, releasePath: string)
   if (holder.child.exitCode !== 0) {
     throw new Error(`Lock holder exited with ${holder.child.exitCode}. stdout: ${holder.stdout()} stderr: ${holder.stderr()}`);
   }
+}
+
+async function spawnExitedProcess(): Promise<number> {
+  const child = spawn(process.execPath, ["--eval", ""], {
+    stdio: "ignore",
+  });
+  if (child.pid === undefined) {
+    throw new Error("Expected exited process fixture to have a pid.");
+  }
+
+  const pid = child.pid;
+  const exitResult = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
+    child.once("exit", (code, signal) => {
+      resolveExit({ code, signal });
+    });
+  });
+  if (exitResult.code !== 0 || exitResult.signal !== null) {
+    throw new Error(`Expected exited process fixture to exit cleanly: ${JSON.stringify(exitResult)}`);
+  }
+
+  return pid;
+}
+
+async function ageLockPath(path: string): Promise<void> {
+  const staleTime = new Date(Date.now() - 5_000);
+
+  await utimes(path, staleTime, staleTime);
 }
 
 describe("ingest repository lock", () => {
@@ -301,6 +328,154 @@ describe("ingest repository lock", () => {
       }
 
       await expect(pathExists(resolve(repoRoot, LOCK_RELATIVE_PATH))).resolves.toBe(false);
+    });
+  });
+
+  it("reclaims a stale lock when the metadata process is no longer running", async () => {
+    await withTempWorkspace("llm-wiki-ingest-lock-stale-", async (workspaceDir) => {
+      // Arrange
+      const repoRoot = resolve(workspaceDir, "wiki");
+      const mutationSentinelPath = resolve(repoRoot, "mutation-sentinel.txt");
+      const stalePid = await spawnExitedProcess();
+      await mkdir(resolve(repoRoot, LOCK_RELATIVE_PATH), { recursive: true });
+      await writeFile(mutationSentinelPath, "unchanged", "utf8");
+      await writeFile(
+        resolve(repoRoot, LOCK_METADATA_RELATIVE_PATH),
+        `${JSON.stringify(
+          {
+            pid: stalePid,
+            started_at: new Date(Date.now() - 60_000).toISOString(),
+            label: "crashed holder",
+          },
+          null,
+          2,
+        )}\n`,
+        "utf8",
+      );
+      let callbackRan = false;
+
+      // Act
+      const observedMetadata = await withIngestLock(
+        repoRoot,
+        { label: "recovered holder", retryDelayMs: 5, timeoutMs: 20 },
+        async () => {
+          callbackRan = true;
+          await writeFile(mutationSentinelPath, "changed", "utf8");
+
+          return readLockMetadata(repoRoot);
+        },
+      );
+
+      // Assert
+      expect(callbackRan).toBe(true);
+      expect(observedMetadata).toMatchObject({
+        pid: process.pid,
+        label: "recovered holder",
+      });
+      await expect(readFile(mutationSentinelPath, "utf8")).resolves.toBe("changed");
+      await expect(pathExists(resolve(repoRoot, LOCK_RELATIVE_PATH))).resolves.toBe(false);
+    });
+  });
+
+  it("keeps a fresh metadata-less lock busy during the creation grace period", async () => {
+    await withTempWorkspace("llm-wiki-ingest-lock-fresh-unowned-", async (workspaceDir) => {
+      // Arrange
+      const repoRoot = resolve(workspaceDir, "wiki");
+      const mutationSentinelPath = resolve(repoRoot, "mutation-sentinel.txt");
+      await mkdir(resolve(repoRoot, LOCK_RELATIVE_PATH), { recursive: true });
+      await writeFile(mutationSentinelPath, "unchanged", "utf8");
+      let callbackRan = false;
+
+      // Act
+      const result = withIngestLock(
+        repoRoot,
+        { label: "fresh contender", retryDelayMs: 5, timeoutMs: 20 },
+        async () => {
+          callbackRan = true;
+          await writeFile(mutationSentinelPath, "changed", "utf8");
+        },
+      );
+
+      // Assert
+      await expect(result).rejects.toMatchObject({
+        code: "INGEST_LOCK_BUSY",
+        path: LOCK_RELATIVE_PATH,
+      });
+      await expect(result).rejects.toBeInstanceOf(RuntimeCommandError);
+      expect(callbackRan).toBe(false);
+      await expect(readFile(mutationSentinelPath, "utf8")).resolves.toBe("unchanged");
+      await expect(pathExists(resolve(repoRoot, LOCK_RELATIVE_PATH))).resolves.toBe(true);
+    });
+  });
+
+  it("reclaims a stale metadata-less lock after the creation grace period", async () => {
+    await withTempWorkspace("llm-wiki-ingest-lock-stale-unowned-", async (workspaceDir) => {
+      // Arrange
+      const repoRoot = resolve(workspaceDir, "wiki");
+      const lockPath = resolve(repoRoot, LOCK_RELATIVE_PATH);
+      const mutationSentinelPath = resolve(repoRoot, "mutation-sentinel.txt");
+      await mkdir(lockPath, { recursive: true });
+      await ageLockPath(lockPath);
+      await writeFile(mutationSentinelPath, "unchanged", "utf8");
+      let callbackRan = false;
+
+      // Act
+      const observedMetadata = await withIngestLock(
+        repoRoot,
+        { label: "recovered unowned holder", retryDelayMs: 5, timeoutMs: 20 },
+        async () => {
+          callbackRan = true;
+          await writeFile(mutationSentinelPath, "changed", "utf8");
+
+          return readLockMetadata(repoRoot);
+        },
+      );
+
+      // Assert
+      expect(callbackRan).toBe(true);
+      expect(observedMetadata).toMatchObject({
+        pid: process.pid,
+        label: "recovered unowned holder",
+      });
+      await expect(readFile(mutationSentinelPath, "utf8")).resolves.toBe("changed");
+      await expect(pathExists(lockPath)).resolves.toBe(false);
+    });
+  });
+
+  it("reclaims a stale lock with invalid metadata after the creation grace period", async () => {
+    await withTempWorkspace("llm-wiki-ingest-lock-stale-invalid-", async (workspaceDir) => {
+      // Arrange
+      const repoRoot = resolve(workspaceDir, "wiki");
+      const lockPath = resolve(repoRoot, LOCK_RELATIVE_PATH);
+      const metadataPath = resolve(repoRoot, LOCK_METADATA_RELATIVE_PATH);
+      const mutationSentinelPath = resolve(repoRoot, "mutation-sentinel.txt");
+      await mkdir(lockPath, { recursive: true });
+      await writeFile(metadataPath, "{", "utf8");
+      await ageLockPath(metadataPath);
+      await ageLockPath(lockPath);
+      await writeFile(mutationSentinelPath, "unchanged", "utf8");
+      let callbackRan = false;
+
+      // Act
+      const observedMetadata = await withIngestLock(
+        repoRoot,
+        { label: "recovered invalid holder", retryDelayMs: 5, timeoutMs: 20 },
+        async () => {
+          callbackRan = true;
+          await writeFile(mutationSentinelPath, "changed", "utf8");
+
+          return readLockMetadata(repoRoot);
+        },
+      );
+
+      // Assert
+      expect(callbackRan).toBe(true);
+      expect(observedMetadata).toMatchObject({
+        pid: process.pid,
+        label: "recovered invalid holder",
+      });
+      await expect(readFile(mutationSentinelPath, "utf8")).resolves.toBe("changed");
+      await expect(pathExists(lockPath)).resolves.toBe(false);
     });
   });
 

@@ -14,6 +14,7 @@ import {
   type RunAutoIngestSourceInput,
 } from "../autoIngest/index.js";
 import { RuntimeCommandError } from "../runtime/errors.js";
+import { INGEST_LOCK_RELATIVE_PATH, withIngestLock } from "../runtime/ingestLock.js";
 import { showQueueSource, type AutoIngestMetadata, type QueueStatus } from "../runtime/queue.js";
 import {
   capturePreparedUrlSource,
@@ -242,6 +243,8 @@ type UploadWorkSuccess = {
   commit: UploadCommitResult;
   autoIngest?: AutoIngestSourceResult;
 };
+
+type UploadCaptureCommitSuccess = Omit<UploadWorkSuccess, "autoIngest">;
 
 export async function startUploadDaemon(options: UploadDaemonOptions): Promise<UploadDaemon> {
   const hostResult = normalizeDaemonHost(options.host ?? DEFAULT_DAEMON_HOST);
@@ -502,6 +505,48 @@ async function captureAndCommitUpload(
   options: UploadRequestOptions,
   payload: PreparedUploadPayload,
 ): Promise<Result<UploadWorkSuccess, UploadDaemonError>> {
+  const captureCommit = options.commitUploads
+    ? await captureAndCommitUploadWithIngestLock(options, payload)
+    : await captureAndCommitPreparedUpload(options, payload);
+  if (!captureCommit.ok) {
+    return captureCommit;
+  }
+
+  return ok({
+    ...captureCommit.value,
+    autoIngest: await runUploadAutoIngest(options, captureCommit.value.capture, captureCommit.value.commit),
+  });
+}
+
+async function captureAndCommitUploadWithIngestLock(
+  options: UploadRequestOptions,
+  payload: PreparedUploadPayload,
+): Promise<Result<UploadCaptureCommitSuccess, UploadDaemonError>> {
+  try {
+    return await withIngestLock(
+      options.repoRoot,
+      { label: "upload-raw-commit" },
+      () => captureAndCommitPreparedUpload(options, payload),
+    );
+  } catch (error) {
+    if (error instanceof RuntimeCommandError && error.code === "INGEST_LOCK_BUSY") {
+      return err(new UploadDaemonError({
+        code: "UPLOAD_COMMIT_FAILED",
+        message: "Upload commit is waiting for another ingest worker.",
+        path: INGEST_LOCK_RELATIVE_PATH,
+        hint: "Wait for the active ingest worker to finish, then retry the upload or rerun without --commit-uploads.",
+        statusCode: 409,
+      }));
+    }
+
+    throw error;
+  }
+}
+
+async function captureAndCommitPreparedUpload(
+  options: UploadRequestOptions,
+  payload: PreparedUploadPayload,
+): Promise<Result<UploadCaptureCommitSuccess, UploadDaemonError>> {
   const includeRuntimeLogInCommit = await shouldStageRuntimeLogForRawCommit(options);
   const capture = await capturePreparedUpload(options, payload);
   if (!capture.ok) {
@@ -522,7 +567,6 @@ async function captureAndCommitUpload(
   return ok({
     capture: capture.value,
     commit,
-    autoIngest: await runUploadAutoIngest(options, capture.value, commit),
   });
 }
 

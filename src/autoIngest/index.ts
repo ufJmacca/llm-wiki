@@ -534,7 +534,7 @@ async function runIngestingSourceWithAgent(input: RunQueuedSourceInput): Promise
   }
 }
 
-async function selectQueuedCandidates(repoRoot: string, limit: number | undefined): Promise<QueueCandidate[]> {
+async function selectQueuedCandidates(repoRoot: string, limit?: number): Promise<QueueCandidate[]> {
   const listed = await listQueueRecordSummaries(repoRoot);
   if (!listed.ok) {
     throw queueRuntimeError(listed.error);
@@ -737,7 +737,7 @@ function addSourceResultToCounts(
 }
 
 function watchResultIsSessionFailure(result: AutoIngestSourceResult): boolean {
-  return result.outcome === "blocked" || result.outcome === "deferred";
+  return result.outcome === "blocked" || result.outcome === "deferred" || result.outcome === "skipped";
 }
 
 function normalizeLimit(limit: number | undefined, fallback: number): number {

@@ -1,7 +1,9 @@
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
@@ -17,6 +19,8 @@ import { transitionQueueStatus } from "../src/runtime/queue.js";
 import { parseLogEntries } from "../src/scanner/index.js";
 import { createWiki } from "../src/scaffold/createWiki.js";
 import { pathExists, readTreeSnapshot, withTempWorkspace } from "./helpers/init.js";
+
+const execFileAsync = promisify(execFile);
 
 type QueueStatus = "queued" | "ingesting" | "ingested" | "blocked";
 
@@ -273,6 +277,14 @@ async function createExecutable(workspaceDir: string, fileName: string, source: 
   await chmod(executablePath, 0o755);
 
   return executablePath;
+}
+
+async function commitWikiBaseline(wikiDir: string): Promise<void> {
+  await execFileAsync("git", ["-C", wikiDir, "init"]);
+  await execFileAsync("git", ["-C", wikiDir, "config", "user.email", "test@example.invalid"]);
+  await execFileAsync("git", ["-C", wikiDir, "config", "user.name", "Test User"]);
+  await execFileAsync("git", ["-C", wikiDir, "add", "--all"]);
+  await execFileAsync("git", ["-C", wikiDir, "commit", "-m", "test baseline"]);
 }
 
 async function writeSourceFixture(
@@ -838,6 +850,48 @@ describe("shared auto-ingest worker", () => {
         expect.stringContaining("- status: queued -> ingesting"),
         expect.stringContaining("- status: ingesting -> ingested"),
       ]);
+    });
+  });
+
+  it("isolates Git changed-file validation to each queued auto-ingest attempt", async () => {
+    await withTempWorkspace("llm-wiki-auto-ingest-git-baseline-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const executablePath = await createExecutable(workspaceDir, "codex-success", SUCCESS_AGENT_SOURCE);
+      await configureDefaultAgent(wikiDir, executablePath);
+      await commitWikiBaseline(wikiDir);
+      const firstSource = await writeSourceFixture(wikiDir, {
+        sourceId: sourceIdForSlug("gitfirst"),
+        capturedAt: TEST_TIE_CAPTURED_AT,
+      });
+      const secondSource = await writeSourceFixture(wikiDir, {
+        sourceId: sourceIdForSlug("gitsecond"),
+        capturedAt: TEST_CAPTURED_AT,
+      });
+
+      // Act
+      const result = await runAutoIngestBatch({
+        repoRoot: wikiDir,
+        now: () => new Date(TEST_NOW),
+      });
+
+      // Assert
+      expect(result.counts).toMatchObject({
+        selected: 2,
+        attempted: 2,
+        ingested: 2,
+        blocked: 0,
+      });
+      expect(result.results.map((sourceResult) => sourceResult.source_id)).toEqual([
+        firstSource.sourceId,
+        secondSource.sourceId,
+      ]);
+      expect(result.results.map((sourceResult) => sourceResult.outcome)).toEqual(["ingested", "ingested"]);
+      await expect(readQueueRecord(wikiDir, firstSource)).resolves.toMatchObject({ status: "ingested" });
+      await expect(readQueueRecord(wikiDir, secondSource)).resolves.toMatchObject({ status: "ingested" });
+      await expect(pathExists(resolve(wikiDir, `curated/sources/${firstSource.sourceId}.md`))).resolves.toBe(true);
+      await expect(pathExists(resolve(wikiDir, `curated/sources/${secondSource.sourceId}.md`))).resolves.toBe(true);
     });
   });
 

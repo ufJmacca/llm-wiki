@@ -3,11 +3,13 @@ import { buildIngestTask } from "../agentTasks/ingest.js";
 import {
   applyProposalsWithValidation,
   createIngestProposalPolicy,
+  normalizeFileProposals,
   validateProposalsOnTemporaryRepo,
 } from "../proposals/index.js";
 import type { LocalAgentConfig } from "../runtime/config.js";
 import { RuntimeCommandError } from "../runtime/errors.js";
 import { validateIngestReadiness, type IngestValidationIssue } from "../validation/ingest.js";
+import { listGitChangedFiles } from "../utils/git.js";
 
 export type RunLocalAgentIngestCoreInput<Completion = void> = {
   repoRoot: string;
@@ -61,21 +63,29 @@ export async function runLocalAgentIngestCore<Completion = void>(
     policy: AGENT_INGEST_PROPOSAL_POLICY,
   });
 
+  const currentAttemptPaths = normalizeFileProposals(result.proposals, AGENT_INGEST_PROPOSAL_POLICY)
+    .map((proposal) => proposal.path);
   await validateProposalsOnTemporaryRepo(
     input.repoRoot,
     result.proposals,
     AGENT_INGEST_PROPOSAL_POLICY,
     async (tempRepoRoot) => {
-      await assertIngestReadiness(tempRepoRoot, input.sourceId);
+      await assertIngestReadiness(tempRepoRoot, input.sourceId, {
+        currentAttemptPaths,
+      });
     },
   );
 
+  const changedFilesBaseline = await listGitChangedFiles(input.repoRoot, ["curated"]);
   const { appliedPaths, validation: completion } = await applyProposalsWithValidation(
     input.repoRoot,
     result.proposals,
     AGENT_INGEST_PROPOSAL_POLICY,
     async () => {
-      await assertIngestReadiness(input.repoRoot, input.sourceId);
+      await assertIngestReadiness(input.repoRoot, input.sourceId, {
+        changedFilesBaseline,
+        currentAttemptPaths,
+      });
 
       return input.completeAppliedIngest === undefined
         ? (undefined as Completion)
@@ -94,8 +104,12 @@ export async function runLocalAgentIngestCore<Completion = void>(
   };
 }
 
-async function assertIngestReadiness(repoRoot: string, sourceId: string): Promise<void> {
-  const validation = await validateIngestReadiness(repoRoot, sourceId);
+async function assertIngestReadiness(
+  repoRoot: string,
+  sourceId: string,
+  options: Parameters<typeof validateIngestReadiness>[2] = {},
+): Promise<void> {
+  const validation = await validateIngestReadiness(repoRoot, sourceId, options);
   if (!validation.passed) {
     throw new IngestValidationFailedError(validation.issues);
   }

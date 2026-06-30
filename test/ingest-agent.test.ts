@@ -507,7 +507,7 @@ describe("ingest local agent automation", () => {
           issues: [],
         },
         queue: {
-          previous_status: "ingesting",
+          previous_status: "queued",
           status: "ingested",
         },
       });

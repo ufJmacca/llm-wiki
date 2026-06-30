@@ -23,7 +23,13 @@ import {
 } from "../profiles/index.js";
 import { gitCommandEnv } from "../utils/git.js";
 import { validateTextFileWriteInsideRoot, writeTextFileInsideRoot, type ScaffoldEntry } from "../utils/fs.js";
-import { buildReviewDataModel, filterReviewScanForProfile, type ReviewCategory, type ReviewDataModel } from "./reviewData.js";
+import {
+  buildReviewDataModel,
+  filterReviewScanForProfile,
+  type ReviewCategory,
+  type ReviewDataModel,
+  type ReviewQueueAutoIngestData,
+} from "./reviewData.js";
 
 export { buildReviewDataModel, type ReviewDataModel } from "./reviewData.js";
 
@@ -2989,10 +2995,20 @@ type QueueDashboardItem = {
   source_id: string
   source_kind: string
   queue_status: string
+  auto_ingest: QueueDashboardAutoIngest | null
   visibility: string
   source_card_path: string
   source_card_materialized: boolean
   queue_path: string
+}
+
+type QueueDashboardAutoIngest = {
+  enabled: boolean
+  attempt_count: number
+  last_attempt_at: string
+  last_result: string
+  last_error_code: string | null
+  last_error_message: string | null
 }
 
 function numberValue(value: unknown): number {
@@ -3005,6 +3021,26 @@ function stringValue(value: unknown): string {
 
 function booleanValue(value: unknown): boolean {
   return value === true
+}
+
+function nullableStringValue(value: unknown): string | null {
+  return typeof value === "string" ? value : null
+}
+
+function autoIngestValue(value: unknown): QueueDashboardAutoIngest | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null
+  }
+
+  const record = value as Record<string, unknown>
+  return {
+    enabled: booleanValue(record.enabled),
+    attempt_count: numberValue(record.attempt_count),
+    last_attempt_at: stringValue(record.last_attempt_at),
+    last_result: stringValue(record.last_result),
+    last_error_code: nullableStringValue(record.last_error_code),
+    last_error_message: nullableStringValue(record.last_error_message),
+  }
 }
 
 function queueItems(value: unknown): QueueDashboardItem[] {
@@ -3029,6 +3065,7 @@ function queueItems(value: unknown): QueueDashboardItem[] {
       source_id: sourceId,
       source_kind: stringValue(record.source_kind),
       queue_status: stringValue(record.queue_status) || stringValue(record.status),
+      auto_ingest: autoIngestValue(record.auto_ingest),
       visibility: stringValue(record.visibility),
       source_card_path: stringValue(record.source_card_path),
       source_card_materialized: booleanValue(record.source_card_materialized),
@@ -3039,6 +3076,29 @@ function queueItems(value: unknown): QueueDashboardItem[] {
 
 function slugFromMarkdownPath(path: string): FullSlug {
   return path.replace(/^quartz\\/content\\//u, "").replace(/\\.md$/u, "") as FullSlug
+}
+
+function autoIngestSummary(autoIngest: QueueDashboardAutoIngest | null): string {
+  if (autoIngest === null) {
+    return "Not attempted"
+  }
+
+  const result = autoIngest.last_result || "attempted"
+  const code = autoIngest.last_error_code
+  const message = autoIngest.last_error_message
+  if (code !== null && message !== null) {
+    return result + " - " + code + ": " + message
+  }
+
+  if (code !== null) {
+    return result + " - " + code
+  }
+
+  if (message !== null) {
+    return result + ": " + message
+  }
+
+  return result
 }
 
 const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
@@ -3088,6 +3148,7 @@ const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
                 <th>Source ID</th>
                 <th>Kind</th>
                 <th>Queue status</th>
+                <th>Auto ingest</th>
                 <th>Visibility</th>
                 <th>Source card</th>
                 <th>Queue path</th>
@@ -3100,6 +3161,7 @@ const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
                   <td><code>{item.source_id}</code></td>
                   <td>{item.source_kind || "unknown"}</td>
                   <td>{item.queue_status || "unknown"}</td>
+                  <td>{autoIngestSummary(item.auto_ingest)}</td>
                   <td>{item.visibility || "unknown"}</td>
                   <td>
                     {item.source_card_path === "" ? (
@@ -4202,6 +4264,7 @@ function sourceQueueContent(reviewData: ReviewDataModel, options: { includeUploa
       item.visibility ?? "",
       item.source_card_path ?? "",
       item.queue_path,
+      autoIngestMarkdownSummary(item.auto_ingest),
       item.original_path ?? "",
     ].map((value) => escapeTableCell(String(value))).join(" | "),
   );
@@ -4219,8 +4282,8 @@ function sourceQueueContent(reviewData: ReviewDataModel, options: { includeUploa
 | Blocked | ${reviewData.queue.counts.blocked} |
 | Ingested | ${reviewData.queue.counts.completed} |
 
-| Source ID | Title | Status | Kind | Visibility | Source card | Queue file | Original |
-|---|---|---|---|---|---|---|---|
+| Source ID | Title | Status | Kind | Visibility | Source card | Queue file | Auto ingest | Original |
+|---|---|---|---|---|---|---|---|---|
 ${rows.map((row) => `| ${row} |`).join("\n")}
 
 ## Source Badge Data
@@ -4247,10 +4310,32 @@ function queueDashboardFrontmatterFields(reviewData: ReviewDataModel, options: {
       source_card_path: item.source_card_path,
       source_card_materialized: item.source_card_materialized,
       queue_path: item.queue_path,
+      ...(item.auto_ingest === undefined ? {} : { auto_ingest: item.auto_ingest }),
     })),
   };
 
   return stringify(frontmatter).trimEnd().split("\n");
+}
+
+function autoIngestMarkdownSummary(autoIngest: ReviewQueueAutoIngestData | undefined): string {
+  if (autoIngest === undefined) {
+    return "Not attempted";
+  }
+
+  const result = autoIngest.last_result || "attempted";
+  if (autoIngest.last_error_code !== null && autoIngest.last_error_message !== null) {
+    return `${result} - ${autoIngest.last_error_code}: ${autoIngest.last_error_message}`;
+  }
+
+  if (autoIngest.last_error_code !== null) {
+    return `${result} - ${autoIngest.last_error_code}`;
+  }
+
+  if (autoIngest.last_error_message !== null) {
+    return `${result}: ${autoIngest.last_error_message}`;
+  }
+
+  return result;
 }
 
 function reviewCategoryContent(options: {

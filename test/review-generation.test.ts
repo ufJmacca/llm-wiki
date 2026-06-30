@@ -130,6 +130,290 @@ describe("review data model", () => {
     });
   });
 
+  it("includes safe auto-ingest attempt metadata without leaking queue-private extras", async () => {
+    await withTempWorkspace("llm-wiki-review-data-auto-ingest-metadata-", async (repoRoot) => {
+      // Arrange
+      const source = sourceFixture(
+        "src_2026_06_23_blocked_auto_777777",
+        "Blocked Auto Source",
+        "blocked",
+        "text",
+        "2026-06-23T08:00:00.000Z",
+        "2026-06-23T08:05:00.000Z",
+      );
+      const autoIngest = {
+        enabled: true,
+        attempt_count: 1,
+        last_attempt_at: "2026-06-23T08:04:00.000Z",
+        last_result: "blocked",
+        last_error_code: "INGEST_VALIDATION_FAILED",
+        last_error_message:
+          "Validation failed while checking source text: PRIVATE RAW UPLOAD BODY api_key=sk-review-leak token=upload-token-secret",
+      };
+      const safeAutoIngest = {
+        ...autoIngest,
+        last_error_message:
+          "Validation failed while checking source text: [raw upload content redacted] api_key=[redacted] token=[redacted]",
+      };
+      await writeSourceFixture(repoRoot, source, {
+        queue: {
+          auto_ingest: autoIngest,
+          raw_body: "PRIVATE RAW UPLOAD BODY api_key=sk-review-leak",
+          upload_token: "upload-token-secret",
+        },
+      });
+      const scan = await scanWikiRepository(repoRoot);
+
+      // Act
+      const reviewData = buildReviewDataModel(scan, {
+        generatedAt,
+        lintResult: emptyLintResult(),
+      });
+      const serializedQueue = JSON.stringify(reviewData.queue);
+
+      // Assert
+      expect(reviewData.queue.counts).toEqual({
+        total: 1,
+        queued: 0,
+        ingesting: 0,
+        blocked: 1,
+        completed: 0,
+      });
+      expect(reviewData.queue.items).toEqual([
+        expect.objectContaining({
+          source_id: source.sourceId,
+          status: "blocked",
+          auto_ingest: safeAutoIngest,
+        }),
+      ]);
+      expect(serializedQueue).toContain("INGEST_VALIDATION_FAILED");
+      expect(serializedQueue).toContain("[raw upload content redacted]");
+      expect(serializedQueue).not.toContain("PRIVATE RAW UPLOAD BODY");
+      expect(serializedQueue).not.toContain("sk-review-leak");
+      expect(serializedQueue).not.toContain("upload-token-secret");
+    });
+  });
+
+  it("omits malformed auto-ingest metadata without dropping queue items", async () => {
+    await withTempWorkspace("llm-wiki-review-data-malformed-auto-ingest-", async (repoRoot) => {
+      // Arrange
+      const nullMetadata = sourceFixture(
+        "src_2026_06_23_null_auto_777771",
+        "Null Auto Source",
+        "queued",
+        "text",
+        "2026-06-23T08:00:00.000Z",
+      );
+      const incompleteMetadata = sourceFixture(
+        "src_2026_06_23_incomplete_auto_777772",
+        "Incomplete Auto Source",
+        "blocked",
+        "url",
+        "2026-06-23T08:05:00.000Z",
+      );
+      const negativeAttemptCount = sourceFixture(
+        "src_2026_06_23_negative_auto_777773",
+        "Negative Auto Source",
+        "blocked",
+        "text",
+        "2026-06-23T08:10:00.000Z",
+      );
+      const fractionalAttemptCount = sourceFixture(
+        "src_2026_06_23_fractional_auto_777774",
+        "Fractional Auto Source",
+        "blocked",
+        "text",
+        "2026-06-23T08:15:00.000Z",
+      );
+      await writeSourceFixture(repoRoot, nullMetadata, {
+        queue: { auto_ingest: null },
+      });
+      await writeSourceFixture(repoRoot, incompleteMetadata, {
+        queue: {
+          auto_ingest: {
+            enabled: true,
+            attempt_count: 1,
+            last_attempt_at: "2026-06-23T08:04:00.000Z",
+            last_result: "blocked",
+            last_error_code: "INGEST_VALIDATION_FAILED",
+          },
+        },
+      });
+      await writeSourceFixture(repoRoot, negativeAttemptCount, {
+        queue: {
+          auto_ingest: {
+            enabled: true,
+            attempt_count: -1,
+            last_attempt_at: "2026-06-23T08:09:00.000Z",
+            last_result: "blocked",
+            last_error_code: "INGEST_VALIDATION_FAILED",
+            last_error_message: "Validation failed.",
+          },
+        },
+      });
+      await writeSourceFixture(repoRoot, fractionalAttemptCount, {
+        queue: {
+          auto_ingest: {
+            enabled: true,
+            attempt_count: 1.5,
+            last_attempt_at: "2026-06-23T08:14:00.000Z",
+            last_result: "blocked",
+            last_error_code: "INGEST_VALIDATION_FAILED",
+            last_error_message: "Validation failed.",
+          },
+        },
+      });
+      const scan = await scanWikiRepository(repoRoot);
+
+      // Act
+      const reviewData = buildReviewDataModel(scan, {
+        generatedAt,
+        lintResult: emptyLintResult(),
+      });
+      const itemsById = new Map(reviewData.queue.items.map((item) => [item.source_id, item]));
+
+      // Assert
+      expect(reviewData.queue.counts).toEqual({
+        total: 4,
+        queued: 1,
+        ingesting: 0,
+        blocked: 3,
+        completed: 0,
+      });
+      expect(itemsById.get(nullMetadata.sourceId)).toEqual(
+        expect.objectContaining({
+          source_id: nullMetadata.sourceId,
+          status: "queued",
+        }),
+      );
+      expect(itemsById.get(incompleteMetadata.sourceId)).toEqual(
+        expect.objectContaining({
+          source_id: incompleteMetadata.sourceId,
+          status: "blocked",
+        }),
+      );
+      expect(itemsById.get(nullMetadata.sourceId)?.auto_ingest).toBeUndefined();
+      expect(itemsById.get(incompleteMetadata.sourceId)?.auto_ingest).toBeUndefined();
+      expect(itemsById.get(negativeAttemptCount.sourceId)?.auto_ingest).toBeUndefined();
+      expect(itemsById.get(fractionalAttemptCount.sourceId)?.auto_ingest).toBeUndefined();
+    });
+  });
+
+  it("redacts underscored private field names from auto-ingest error metadata", async () => {
+    await withTempWorkspace("llm-wiki-review-data-underscored-redaction-", async (repoRoot) => {
+      // Arrange
+      const source = sourceFixture(
+        "src_2026_06_23_underscored_auto_777773",
+        "Underscored Auto Source",
+        "blocked",
+        "text",
+        "2026-06-23T08:00:00.000Z",
+      );
+      const autoIngest = {
+        enabled: true,
+        attempt_count: 1,
+        last_attempt_at: "2026-06-23T08:04:00.000Z",
+        last_result: "blocked",
+        last_error_code: "INGEST_VALIDATION_FAILED",
+        last_error_message:
+          "Validation failed: raw_body=\"PRIVATE RAW UPLOAD BODY api_key=sk-review-leak\"; upload_token=upload-token-secret; retry manually.",
+      };
+      await writeSourceFixture(repoRoot, source, {
+        queue: { auto_ingest: autoIngest },
+      });
+      const scan = await scanWikiRepository(repoRoot);
+
+      // Act
+      const reviewData = buildReviewDataModel(scan, {
+        generatedAt,
+        lintResult: emptyLintResult(),
+      });
+      const serializedQueue = JSON.stringify(reviewData.queue);
+
+      // Assert
+      expect(reviewData.queue.items).toEqual([
+        expect.objectContaining({
+          source_id: source.sourceId,
+          auto_ingest: {
+            ...autoIngest,
+            last_error_message:
+              "Validation failed: raw_body: [raw upload content redacted]; upload_token=[redacted]; retry manually.",
+          },
+        }),
+      ]);
+      expect(serializedQueue).not.toContain("PRIVATE RAW UPLOAD BODY");
+      expect(serializedQueue).not.toContain("sk-review-leak");
+      expect(serializedQueue).not.toContain("upload-token-secret");
+    });
+  });
+
+  it("redacts unquoted raw body values past punctuation in auto-ingest error metadata", async () => {
+    await withTempWorkspace("llm-wiki-review-data-unquoted-body-redaction-", async (repoRoot) => {
+      // Arrange
+      const rawBodySource = sourceFixture(
+        "src_2026_06_23_unquoted_raw_auto_777775",
+        "Unquoted Raw Body Source",
+        "blocked",
+        "text",
+        "2026-06-23T08:00:00.000Z",
+      );
+      const uploadBodySource = sourceFixture(
+        "src_2026_06_23_unquoted_upload_auto_777776",
+        "Unquoted Upload Body Source",
+        "blocked",
+        "text",
+        "2026-06-23T08:05:00.000Z",
+      );
+      const rawBodyAutoIngest = {
+        enabled: true,
+        attempt_count: 1,
+        last_attempt_at: "2026-06-23T08:04:00.000Z",
+        last_result: "blocked",
+        last_error_code: "INGEST_VALIDATION_FAILED",
+        last_error_message:
+          "Validation failed: raw_body=First private sentence. Second private sentence; api_key=sk-review-leak; retry manually.",
+      };
+      const uploadBodyAutoIngest = {
+        enabled: true,
+        attempt_count: 1,
+        last_attempt_at: "2026-06-23T08:09:00.000Z",
+        last_result: "blocked",
+        last_error_code: "INGEST_VALIDATION_FAILED",
+        last_error_message:
+          "Validation failed: upload_body=Upload private sentence. More private text; upload_token=upload-token-secret; retry manually.",
+      };
+      await writeSourceFixture(repoRoot, rawBodySource, {
+        queue: { auto_ingest: rawBodyAutoIngest },
+      });
+      await writeSourceFixture(repoRoot, uploadBodySource, {
+        queue: { auto_ingest: uploadBodyAutoIngest },
+      });
+      const scan = await scanWikiRepository(repoRoot);
+
+      // Act
+      const reviewData = buildReviewDataModel(scan, {
+        generatedAt,
+        lintResult: emptyLintResult(),
+      });
+      const serializedQueue = JSON.stringify(reviewData.queue);
+      const itemsById = new Map(reviewData.queue.items.map((item) => [item.source_id, item]));
+
+      // Assert
+      expect(itemsById.get(rawBodySource.sourceId)?.auto_ingest?.last_error_message).toBe(
+        "Validation failed: raw_body: [raw upload content redacted]",
+      );
+      expect(itemsById.get(uploadBodySource.sourceId)?.auto_ingest?.last_error_message).toBe(
+        "Validation failed: upload_body: [raw upload content redacted]",
+      );
+      expect(serializedQueue).not.toContain("First private sentence");
+      expect(serializedQueue).not.toContain("Second private sentence");
+      expect(serializedQueue).not.toContain("Upload private sentence");
+      expect(serializedQueue).not.toContain("More private text");
+      expect(serializedQueue).not.toContain("sk-review-leak");
+      expect(serializedQueue).not.toContain("upload-token-secret");
+    });
+  });
+
   it("derives joined review dashboard data from queue JSON, source cards, frontmatter, logs, lint, profiles, and links", async () => {
     await withTempWorkspace("llm-wiki-review-data-", async (repoRoot) => {
       // Arrange

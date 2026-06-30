@@ -158,6 +158,7 @@ function formatHumanDaemonReady(envelope: RuntimeSuccessEnvelope<"daemon", Uploa
     "LLM Wiki upload daemon serving",
     `URL: ${envelope.data.url}`,
     `Upload endpoint: ${envelope.data.url}${envelope.data.upload_path}`,
+    `Upload session ID: ${envelope.data.upload_session_id}`,
     `Upload token header: x-llm-wiki-upload-token: ${envelope.data.upload_token}`,
     `Commit uploads: ${envelope.data.commit_uploads ? "enabled" : "disabled"}`,
   ].join("\n");

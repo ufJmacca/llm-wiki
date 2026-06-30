@@ -8,7 +8,14 @@ import { describe, expect, it, vi } from "vitest";
 
 import { startUploadDaemon, UPLOAD_TOKEN_HEADER, type UploadCommitter, type UploadDaemon } from "../src/daemon/index.js";
 import { syncQuartzContent } from "../src/quartz/index.js";
-import { parseInitJson, pathExists, readGeneratedFile, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
+import {
+  parseInitJson,
+  pathExists,
+  readGeneratedFile,
+  readTreeSnapshot,
+  runCliBuffered,
+  withTempWorkspace,
+} from "./helpers/init.js";
 
 type UploadSuccessEnvelope = {
   ok: true;
@@ -248,6 +255,32 @@ async function closeServer(server: Server): Promise<void> {
 }
 
 describe("local upload daemon", () => {
+  it("generates a distinct non-secret upload session ID for each daemon run", async () => {
+    await withTempWorkspace("llm-wiki-daemon-session-id-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      let firstDaemon: UploadDaemon | undefined;
+      let secondDaemon: UploadDaemon | undefined;
+
+      try {
+        // Act
+        firstDaemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+        secondDaemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+
+        // Assert
+        expect(firstDaemon.uploadSessionId).toMatch(/^upl_[a-f0-9]{16}$/);
+        expect(secondDaemon.uploadSessionId).toMatch(/^upl_[a-f0-9]{16}$/);
+        expect(firstDaemon.uploadSessionId).not.toBe(secondDaemon.uploadSessionId);
+        expect(firstDaemon.uploadSessionId).not.toBe(firstDaemon.uploadToken);
+        expect(secondDaemon.uploadSessionId).not.toBe(secondDaemon.uploadToken);
+      } finally {
+        await secondDaemon?.close();
+        await firstDaemon?.close();
+      }
+    });
+  });
+
   it("binds to 127.0.0.1 by default and captures multipart file uploads as private source artifacts", async () => {
     await withTempWorkspace("llm-wiki-daemon-file-", async (workspaceDir) => {
       // Arrange
@@ -266,6 +299,8 @@ describe("local upload daemon", () => {
 
         // Assert
         expect(daemon.host).toBe("127.0.0.1");
+        expect(daemon.uploadSessionId).toMatch(/^upl_[a-f0-9]{16}$/);
+        expect(daemon.uploadSessionId).not.toBe(daemon.uploadToken);
         expect(upload.status).toBe(201);
         expect(upload.body).toMatchObject({
           ok: true,
@@ -295,6 +330,10 @@ describe("local upload daemon", () => {
           source_id: upload.body.data.source_id,
           title: "Meeting Notes",
           source_kind: "file",
+          origin: "local-upload:Meeting Notes.md",
+          uploader: "local",
+          upload_session_id: daemon.uploadSessionId,
+          uploaded_via: "local-explorer",
           visibility: "private",
           status: "queued",
           path: upload.body.data.source_card_path,
@@ -304,6 +343,10 @@ describe("local upload daemon", () => {
           source_id: upload.body.data.source_id,
           title: "Meeting Notes",
           source_kind: "file",
+          origin: "local-upload:Meeting Notes.md",
+          uploader: "local",
+          upload_session_id: daemon.uploadSessionId,
+          uploaded_via: "local-explorer",
           visibility: "private",
           status: "queued",
         });
@@ -460,7 +503,11 @@ describe("local upload daemon", () => {
 
         // Act
         const firstUpload = await uploadForm(daemon, form);
+        const beforeDuplicate = await readTreeSnapshot(wikiDir);
         const secondUpload = await uploadForm(daemon, form);
+        const afterDuplicate = await readTreeSnapshot(wikiDir);
+        const sourceCard = parseSourceCardFrontmatter(await readGeneratedFile(wikiDir, firstUpload.body.data.source_card_path));
+        const queueItem = JSON.parse(await readGeneratedFile(wikiDir, firstUpload.body.data.queue_path));
 
         // Assert
         expect(firstUpload.status).toBe(201);
@@ -482,6 +529,19 @@ describe("local upload daemon", () => {
           queue_path: firstUpload.body.data.queue_path,
         });
         expect(secondUpload.body.data.created_paths).toEqual([]);
+        expect(sourceCard).toMatchObject({
+          origin: "local-upload:text",
+          uploader: "local",
+          upload_session_id: daemon.uploadSessionId,
+          uploaded_via: "local-explorer",
+        });
+        expect(queueItem).toMatchObject({
+          origin: "local-upload:text",
+          uploader: "local",
+          upload_session_id: daemon.uploadSessionId,
+          uploaded_via: "local-explorer",
+        });
+        expect(afterDuplicate).toEqual(beforeDuplicate);
         expect((await readGeneratedFile(wikiDir, firstUpload.body.data.original_path)).replaceAll("\r\n", "\n")).toBe(text);
         await expectExplorerUploadProvenance(wikiDir, firstUpload, "text");
       } finally {
@@ -630,9 +690,20 @@ describe("local upload daemon", () => {
           // Act
           const upload = await uploadForm(daemon, form);
           const queueItem = JSON.parse(await readGeneratedFile(wikiDir, upload.body.data.queue_path)) as {
+            origin: string;
             origin_url: string;
             source_kind: string;
+            uploader: string;
+            upload_session_id: string;
+            uploaded_via: string;
           };
+          const sourceCard = parseSourceCardFrontmatter<{
+            origin: string;
+            origin_url: string;
+            uploader: string;
+            upload_session_id: string;
+            uploaded_via: string;
+          }>(await readGeneratedFile(wikiDir, upload.body.data.source_card_path));
 
           // Assert
           expect(upload.status).toBe(201);
@@ -644,7 +715,18 @@ describe("local upload daemon", () => {
           });
           expect(queueItem).toMatchObject({
             source_kind: "url",
+            origin: "local-upload:url",
             origin_url: url,
+            uploader: "local",
+            upload_session_id: daemon.uploadSessionId,
+            uploaded_via: "local-explorer",
+          });
+          expect(sourceCard).toMatchObject({
+            origin: "local-upload:url",
+            origin_url: url,
+            uploader: "local",
+            upload_session_id: daemon.uploadSessionId,
+            uploaded_via: "local-explorer",
           });
           expect(await readGeneratedFile(wikiDir, upload.body.data.original_path)).toBe("Remote upload body.\n");
           await expectExplorerUploadProvenance(wikiDir, upload, "url");

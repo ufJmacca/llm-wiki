@@ -46,23 +46,6 @@ type UploadFailureEnvelope = {
   }>;
 };
 
-type DaemonFailureEnvelope = {
-  ok: false;
-  command: "daemon";
-  repo: string;
-  error: {
-    code: string;
-    message: string;
-    hint: string;
-  };
-  issues: Array<{
-    severity: "error";
-    code: string;
-    path: string;
-    hint: string;
-  }>;
-};
-
 async function initializeWiki(targetDir: string): Promise<void> {
   const result = await runCliBuffered(["init", targetDir, "--no-git", "--json"]);
 
@@ -168,10 +151,20 @@ function parseSourceCardFrontmatter<T>(content: string): T {
   return parse(frontmatter?.[1] ?? "") as T;
 }
 
-function parseDaemonFailure(stdout: string[]): DaemonFailureEnvelope {
-  expect(stdout).toHaveLength(1);
+async function expectExplorerUploadProvenance(
+  wikiDir: string,
+  upload: { body: UploadSuccessEnvelope },
+  sourceKind: "file" | "text" | "url",
+): Promise<void> {
+  const expectedCommand = `llm-wiki explore serve --with-daemon upload ${sourceKind}`;
+  const sourceCard = await readGeneratedFile(wikiDir, upload.body.data.source_card_path);
+  const runtimeLog = await readGeneratedFile(wikiDir, "curated/log.md");
 
-  return JSON.parse(stdout[0]) as DaemonFailureEnvelope;
+  expect(sourceCard).not.toContain("llm-wiki daemon");
+  expect(runtimeLog).not.toContain("llm-wiki daemon");
+  expect(runtimeLog).toContain(upload.body.data.source_id);
+  expect(runtimeLog).toContain(expectedCommand);
+  expect(runtimeLog).toContain(`- raw_source: ${upload.body.data.source_card_path}`);
 }
 
 async function withTextServer(body: string, run: (url: string) => Promise<void>): Promise<void> {
@@ -314,6 +307,7 @@ describe("local upload daemon", () => {
           visibility: "private",
           status: "queued",
         });
+        await expectExplorerUploadProvenance(wikiDir, upload, "file");
         expect(rawOriginalResponse.status).toBe(404);
       } finally {
         await daemon.close();
@@ -489,6 +483,7 @@ describe("local upload daemon", () => {
         });
         expect(secondUpload.body.data.created_paths).toEqual([]);
         expect((await readGeneratedFile(wikiDir, firstUpload.body.data.original_path)).replaceAll("\r\n", "\n")).toBe(text);
+        await expectExplorerUploadProvenance(wikiDir, firstUpload, "text");
       } finally {
         await daemon.close();
       }
@@ -652,6 +647,7 @@ describe("local upload daemon", () => {
             origin_url: url,
           });
           expect(await readGeneratedFile(wikiDir, upload.body.data.original_path)).toBe("Remote upload body.\n");
+          await expectExplorerUploadProvenance(wikiDir, upload, "url");
         } finally {
           await daemon.close();
         }
@@ -1150,8 +1146,8 @@ describe("local upload daemon", () => {
     });
   });
 
-  it("refuses non-local host values for the MVP daemon command", async () => {
-    await withTempWorkspace("llm-wiki-daemon-host-refusal-", async (workspaceDir) => {
+  it("removes the standalone daemon command from the public CLI", async () => {
+    await withTempWorkspace("llm-wiki-daemon-command-removed-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
       await initializeWiki(wikiDir);
@@ -1165,25 +1161,11 @@ describe("local upload daemon", () => {
         "0.0.0.0",
         "--json",
       ]);
-      const payload = parseDaemonFailure(result.stdout);
 
       // Assert
-      expect(result.exitCode).toBe(1);
-      expect(result.stderr).toEqual([]);
-      expect(payload).toMatchObject({
-        ok: false,
-        command: "daemon",
-        repo: wikiDir,
-        error: {
-          code: "DAEMON_HOST_NOT_LOCAL",
-          hint: "Use 127.0.0.1, localhost, or ::1 for the MVP local upload daemon.",
-        },
-      });
-      expect(payload.issues[0]).toMatchObject({
-        severity: "error",
-        code: "DAEMON_HOST_NOT_LOCAL",
-        path: "--host",
-      });
+      expect(result.exitCode).toBeGreaterThan(0);
+      expect(result.stdout).toEqual([]);
+      expect(result.stderr.join("\n")).toContain("unknown command 'daemon'");
     });
   });
 });

@@ -7,7 +7,6 @@ import { Command, CommanderError } from "commander";
 import { registerAddCommand } from "./commands/add.js";
 import { registerAddTextCommand } from "./commands/addText.js";
 import { registerAddUrlCommand } from "./commands/addUrl.js";
-import { registerDaemonCommand } from "./commands/daemon.js";
 import { registerDeployCommand } from "./commands/deploy.js";
 import { registerExploreCommand } from "./commands/explore.js";
 import { registerIngestCommand } from "./commands/ingest.js";
@@ -21,7 +20,6 @@ import { registerQueueCommand } from "./commands/queue.js";
 import { registerSearchCommand } from "./commands/search.js";
 import { registerSnapshotCommand } from "./commands/snapshot.js";
 import { registerStatusCommand } from "./commands/status.js";
-import { registerUploadCommand } from "./commands/upload.js";
 
 export type CliIo = {
   stdout: (message: string) => void;
@@ -45,6 +43,11 @@ export async function runCli(args = process.argv.slice(2), io = defaultIo): Prom
   if (args.includes("--version") || args.includes("-v")) {
     io.stdout(`llm-wiki ${VERSION}`);
     return 0;
+  }
+
+  if (args[0] === "daemon" || args[0] === "upload") {
+    io.stderr(`error: unknown command '${args[0]}'`);
+    return 1;
   }
 
   const program = createProgram(io);
@@ -80,7 +83,6 @@ function createProgram(io: CliIo): Command {
   registerAddCommand(program, io);
   registerAddTextCommand(program, io);
   registerAddUrlCommand(program, io);
-  registerDaemonCommand(program, io);
   registerDeployCommand(program, io);
   registerExploreCommand(program, io);
   registerIngestCommand(program, io);
@@ -93,7 +95,6 @@ function createProgram(io: CliIo): Command {
   registerNavCommand(program, io);
   registerQueryCommand(program, io);
   registerSnapshotCommand(program, io);
-  registerUploadCommand(program, io);
 
   return program;
 }

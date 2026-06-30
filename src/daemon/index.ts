@@ -570,7 +570,7 @@ async function capturePreparedUpload(
       title: payload.title,
       fileName: payload.fileName,
       content: payload.content,
-      command: "llm-wiki daemon upload file",
+      command: "llm-wiki explore serve --with-daemon upload file",
     }));
   }
 
@@ -579,14 +579,14 @@ async function capturePreparedUpload(
       repoRoot,
       title: payload.title,
       text: payload.text,
-      command: "llm-wiki daemon upload text",
+      command: "llm-wiki explore serve --with-daemon upload text",
     }));
   }
 
   return mapCaptureResult(await capturePreparedUrlSource({
     repoRoot,
     source: payload.source,
-    command: "llm-wiki daemon upload url",
+    command: "llm-wiki explore serve --with-daemon upload url",
   }));
 }
 

@@ -76,6 +76,8 @@ const VALID_CURATED_TYPES = new Set([...VALID_MARKDOWN_TYPES].filter((type) => t
 const VALID_SOURCE_KINDS = new Set(["file", "text", "url"]);
 const VALID_SOURCE_STATUSES = new Set(["queued", "ingesting", "ingested", "blocked"]);
 const VALID_VISIBILITIES = new Set(["private", "public"]);
+const AUTO_INGEST_METADATA_HINT =
+  "Use auto_ingest.enabled, attempt_count, last_attempt_at, last_result, last_error_code, and last_error_message with last_error fields set to strings or null.";
 const INDEXABLE_CURATED_DIRECTORIES = ["curated/concepts/", "curated/entities/", "curated/topics/", "curated/questions/", "curated/comparisons/"];
 const GENERATED_INDEX_LIST_ROUTE_PREFIXES = ["concepts/", "entities/", "topics/", "questions/", "comparisons/"];
 const GENERATED_INDEX_LIST_SECTIONS = new Set(["Concepts", "Entities", "Topics", "Questions", "Comparisons"]);
@@ -429,6 +431,18 @@ function sourceCardIssues(scan: RepoScan): LintIssue[] {
         fixable: false,
       });
     }
+
+    const invalidAutoIngestFields = invalidAutoIngestMetadataFields(card.scan.frontmatter.auto_ingest);
+    if (invalidAutoIngestFields.length > 0) {
+      issues.push({
+        rule_id: "source_card_malformed",
+        severity: "error",
+        path: card.path,
+        message: `Source card has malformed auto_ingest metadata (${invalidAutoIngestFields.join(", ")}): ${card.path}.`,
+        fix_hint: AUTO_INGEST_METADATA_HINT,
+        fixable: false,
+      });
+    }
   }
 
   return issues;
@@ -485,6 +499,18 @@ function queueSourceIssues(scan: RepoScan): LintIssue[] {
         path: queueFile.path,
         message: `Raw source queue item must remain visibility: private: ${queueFile.path}.`,
         fix_hint: "Keep raw source queue metadata private and publish reviewed curated summaries instead.",
+        fixable: false,
+      });
+    }
+
+    const invalidAutoIngestFields = invalidAutoIngestMetadataFields(queueFile.item.auto_ingest);
+    if (invalidAutoIngestFields.length > 0) {
+      issues.push({
+        rule_id: "queue_item_malformed",
+        severity: "error",
+        path: queueFile.path,
+        message: `Queue item has malformed auto_ingest metadata (${invalidAutoIngestFields.join(", ")}) for ${queueFile.item.source_id}.`,
+        fix_hint: AUTO_INGEST_METADATA_HINT,
         fixable: false,
       });
     }
@@ -606,7 +632,17 @@ function firstQueueSourceCardMismatch(item: QueueItem, card: SourceCard): string
     ["visibility", item.visibility, frontmatter.visibility],
   ];
 
-  return fields.find(([, queueValue, cardValue]) => comparableValue(queueValue) !== comparableValue(cardValue))?.[0] ?? null;
+  const scalarMismatch =
+    fields.find(([, queueValue, cardValue]) => comparableValue(queueValue) !== comparableValue(cardValue))?.[0] ?? null;
+  if (scalarMismatch !== null) {
+    return scalarMismatch;
+  }
+
+  if (comparableAutoIngestValue(item.auto_ingest) !== comparableAutoIngestValue(frontmatter.auto_ingest)) {
+    return "auto_ingest";
+  }
+
+  return null;
 }
 
 function comparableValue(value: unknown): string {
@@ -623,6 +659,97 @@ function comparableValue(value: unknown): string {
   }
 
   return JSON.stringify(value) ?? String(value);
+}
+
+type ComparableAutoIngestMetadata = {
+  enabled: boolean;
+  attempt_count: number;
+  last_attempt_at: string;
+  last_result: string;
+  last_error_code: string | null;
+  last_error_message: string | null;
+};
+
+function comparableAutoIngestValue(value: unknown): string {
+  const normalized = normalizeComparableAutoIngestMetadata(value);
+  if (normalized === undefined) {
+    return "";
+  }
+
+  if (normalized === null) {
+    return comparableValue(value);
+  }
+
+  return JSON.stringify(normalized);
+}
+
+function normalizeComparableAutoIngestMetadata(value: unknown): ComparableAutoIngestMetadata | undefined | null {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (invalidAutoIngestMetadataFields(value).length > 0) {
+    return null;
+  }
+
+  const { enabled, attempt_count, last_attempt_at, last_result, last_error_code, last_error_message } =
+    value as ComparableAutoIngestMetadata;
+
+  return {
+    enabled,
+    attempt_count,
+    last_attempt_at,
+    last_result,
+    last_error_code,
+    last_error_message,
+  };
+}
+
+function invalidAutoIngestMetadataFields(value: unknown): string[] {
+  if (value === undefined) {
+    return [];
+  }
+
+  if (!isRecord(value)) {
+    return ["auto_ingest"];
+  }
+
+  const invalidFields: string[] = [];
+  const { enabled, attempt_count, last_attempt_at, last_result, last_error_code, last_error_message } = value;
+
+  if (typeof enabled !== "boolean") {
+    invalidFields.push("enabled");
+  }
+
+  if (typeof attempt_count !== "number" || !Number.isInteger(attempt_count) || attempt_count < 0) {
+    invalidFields.push("attempt_count");
+  }
+
+  if (typeof last_attempt_at !== "string") {
+    invalidFields.push("last_attempt_at");
+  }
+
+  if (typeof last_result !== "string") {
+    invalidFields.push("last_result");
+  }
+
+  if (!isNullableString(last_error_code)) {
+    invalidFields.push("last_error_code");
+  }
+
+  if (!isNullableString(last_error_message)) {
+    invalidFields.push("last_error_message");
+  }
+
+  return invalidFields;
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return typeof value === "string" || value === null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function rawHashIssues(scan: RepoScan): LintIssue[] {

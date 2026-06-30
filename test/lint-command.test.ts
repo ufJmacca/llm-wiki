@@ -713,6 +713,133 @@ visibility: private
     });
   });
 
+  it("compares queue/source-card auto_ingest metadata by normalized supported fields", async () => {
+    await withTempWorkspace("llm-wiki-lint-auto-ingest-order-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      const queueRecord = JSON.parse(await readGeneratedFile(wikiDir, source.queue_path)) as Record<string, unknown>;
+      const lastAttemptAt = "2026-06-17T11:30:00.000Z";
+      await writeFile(
+        resolve(wikiDir, source.queue_path),
+        `${JSON.stringify(
+          {
+            ...queueRecord,
+            auto_ingest: {
+              enabled: true,
+              attempt_count: 1,
+              last_attempt_at: lastAttemptAt,
+              last_result: "blocked",
+              last_error_code: "VALIDATION_FAILED",
+              last_error_message: "Proposal validation failed.",
+            },
+          },
+          null,
+          2,
+        )}\n`,
+        "utf8",
+      );
+      await writeFile(
+        resolve(wikiDir, source.source_card_path),
+        (await readGeneratedFile(wikiDir, source.source_card_path)).replace(
+          /^status: queued$/m,
+          [
+            "status: queued",
+            "auto_ingest:",
+            "  last_error_message: Proposal validation failed.",
+            "  last_error_code: VALIDATION_FAILED",
+            "  last_result: blocked",
+            `  last_attempt_at: "${lastAttemptAt}"`,
+            "  attempt_count: 1",
+            "  enabled: true",
+          ].join("\n"),
+        ),
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--json"]);
+      const payload = parseLintSuccess(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.issues).not.toContainEqual(
+        expect.objectContaining({
+          rule_id: "queue_source_card_mismatch",
+          path: source.queue_path,
+        }),
+      );
+    });
+  });
+
+  it("reports malformed matching queue/source-card auto_ingest metadata", async () => {
+    await withTempWorkspace("llm-wiki-lint-auto-ingest-malformed-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureSource(wikiDir, workspaceDir);
+      const queueRecord = JSON.parse(await readGeneratedFile(wikiDir, source.queue_path)) as Record<string, unknown>;
+      const lastAttemptAt = "2026-06-17T11:30:00.000Z";
+      const malformedAutoIngest = {
+        enabled: true,
+        attempt_count: 1,
+        last_attempt_at: lastAttemptAt,
+        last_result: "blocked",
+        last_error_message: 42,
+      };
+      await writeFile(
+        resolve(wikiDir, source.queue_path),
+        `${JSON.stringify({ ...queueRecord, auto_ingest: malformedAutoIngest }, null, 2)}\n`,
+        "utf8",
+      );
+      await writeFile(
+        resolve(wikiDir, source.source_card_path),
+        (await readGeneratedFile(wikiDir, source.source_card_path)).replace(
+          /^status: queued$/m,
+          [
+            "status: queued",
+            "auto_ingest:",
+            "  enabled: true",
+            "  attempt_count: 1",
+            `  last_attempt_at: "${lastAttemptAt}"`,
+            "  last_result: blocked",
+            "  last_error_message: 42",
+          ].join("\n"),
+        ),
+        "utf8",
+      );
+
+      // Act
+      const result = await runCliBuffered(["lint", "--repo", wikiDir, "--json"]);
+      const payload = parseLintFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expectStableIssueRecords(payload.issues);
+      expect(issueByRuleAndPath(payload.issues, "queue_item_malformed", source.queue_path)).toMatchObject({
+        severity: "error",
+        message: expect.stringContaining("last_error_code, last_error_message"),
+        fix_hint: expect.stringContaining("last_error_code"),
+        fixable: false,
+      });
+      expect(issueByRuleAndPath(payload.issues, "source_card_malformed", source.source_card_path)).toMatchObject({
+        severity: "error",
+        message: expect.stringContaining("last_error_code, last_error_message"),
+        fix_hint: expect.stringContaining("last_error_message"),
+        fixable: false,
+      });
+      expect(payload.issues).not.toContainEqual(
+        expect.objectContaining({
+          rule_id: "queue_source_card_mismatch",
+          path: source.queue_path,
+        }),
+      );
+    });
+  });
+
   it("reports queue items missing original_path as malformed queue JSON", async () => {
     await withTempWorkspace("llm-wiki-lint-queue-missing-original-path-", async (workspaceDir) => {
       // Arrange

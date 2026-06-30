@@ -6,6 +6,7 @@ import {
   checkLocalAgentAvailability,
   LocalAgentExecutionError,
 } from "../agents/index.js";
+import { runAutoIngestSource, type AutoIngestSourceResult } from "../autoIngest/index.js";
 import type { CliIo } from "../cli.js";
 import { buildIngestTask, type IngestTask } from "../agentTasks/ingest.js";
 import { IngestValidationFailedError, runLocalAgentIngestCore } from "../ingest/localAgentCore.js";
@@ -262,6 +263,10 @@ async function executeAgentIngest(
   sourceId: string,
   rawOptions: RawIngestOptions,
 ): Promise<IngestAgentData> {
+  if (rawOptions.auto === true) {
+    return executeDefaultAutoIngest(repoRoot, sourceId);
+  }
+
   const agent = await resolveLocalAgentConfig(repoRoot, rawOptions);
   const preflightTask = await buildIngestTask({
     repoRoot,
@@ -312,6 +317,36 @@ async function executeAgentIngest(
 
     throw error;
   }
+}
+
+async function executeDefaultAutoIngest(repoRoot: string, sourceId: string): Promise<IngestAgentData> {
+  const result = await runAutoIngestSource({
+    repoRoot,
+    sourceId,
+    command: `llm-wiki ingest ${sourceId} --auto`,
+  });
+
+  if (result.outcome !== "ingested") {
+    throw autoIngestRuntimeError(result);
+  }
+
+  return {
+    mode: "agent",
+    agent: result.agent ?? "default",
+    source: {
+      source_id: sourceId,
+      status: "ingested",
+    },
+    applied_paths: result.applied_paths,
+    validation: {
+      passed: true,
+      issues: [],
+    },
+    queue: {
+      previous_status: result.previous_status ?? "queued",
+      status: "ingested",
+    },
+  };
 }
 
 async function executeProviderIngest(
@@ -724,6 +759,17 @@ function queueRuntimeError(code: string, message: string, hint: string, path: st
     message,
     hint,
     path,
+  });
+}
+
+function autoIngestRuntimeError(result: AutoIngestSourceResult): RuntimeCommandError {
+  const error = result.error;
+
+  return new RuntimeCommandError({
+    code: error?.code ?? "AUTO_INGEST_FAILED",
+    message: error?.message ?? `Auto-ingest ${result.outcome} for ${result.source_id}.`,
+    hint: error?.hint ?? "Review the source queue status and rerun auto-ingest when it is queued.",
+    path: error?.path ?? `raw/queue/${result.source_id}.json`,
   });
 }
 

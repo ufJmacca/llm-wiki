@@ -76,6 +76,15 @@ export type QueueSetStatusResult = {
   log_path: "curated/log.md";
 };
 
+export type AutoIngestMetadata = {
+  enabled: boolean;
+  attempt_count: number;
+  last_attempt_at: string;
+  last_result: string;
+  last_error_code: string | null;
+  last_error_message: string | null;
+};
+
 export type QueueRecord = {
   source_id: string;
   title: string;
@@ -90,6 +99,7 @@ export type QueueRecord = {
   path: string;
   original_path: string;
   updated_at?: string;
+  auto_ingest?: AutoIngestMetadata;
   queue_path: string;
   [key: string]: unknown;
 };
@@ -106,7 +116,21 @@ export type SourceCardFrontmatter = {
   status: QueueStatus;
   visibility: QueueVisibility;
   updated_at?: string;
+  auto_ingest?: AutoIngestMetadata;
   [key: string]: unknown;
+};
+
+export type QueueTransitionAutoIngestOptions = {
+  enabled: boolean;
+  result: string;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+};
+
+export type QueueTransitionOptions = {
+  now?: Date;
+  command?: string;
+  autoIngest?: QueueTransitionAutoIngestOptions;
 };
 
 type QueueFileRecord = {
@@ -190,6 +214,15 @@ export async function setQueueStatus(
   nextStatusText: string,
   options: { now?: Date; command?: string } = {},
 ): Promise<Result<QueueSetStatusResult, QueueCommandError>> {
+  return transitionQueueStatus(repoRoot, sourceId, nextStatusText, options);
+}
+
+export async function transitionQueueStatus(
+  repoRoot: string,
+  sourceId: string,
+  nextStatusText: string,
+  options: QueueTransitionOptions = {},
+): Promise<Result<QueueSetStatusResult, QueueCommandError>> {
   const nextStatus = parseQueueStatus(nextStatusText);
   if (nextStatus === null) {
     return err({
@@ -225,11 +258,18 @@ export async function setQueueStatus(
     ...shown.value.queue_record,
     status: nextStatus,
     updated_at: updatedAt,
+    ...nextAutoIngestField(shown.value.queue_record.auto_ingest, nextStatus, updatedAt, options.autoIngest),
   };
   const nextSourceCardFrontmatter: SourceCardFrontmatter = {
     ...shown.value.source_card.frontmatter,
     status: nextStatus,
     updated_at: updatedAt,
+    ...nextAutoIngestField(
+      shown.value.source_card.frontmatter.auto_ingest,
+      nextStatus,
+      updatedAt,
+      options.autoIngest,
+    ),
   };
 
   const sourceCardContent = await readTextFileInsideRoot(repoRoot, shown.value.source_card.path);
@@ -325,6 +365,31 @@ function countQueueItems(items: readonly QueueListItem[]): QueueListResult["coun
   }
 
   return counts;
+}
+
+function nextAutoIngestField(
+  current: AutoIngestMetadata | undefined,
+  nextStatus: QueueStatus,
+  updatedAt: string,
+  options: QueueTransitionAutoIngestOptions | undefined,
+): { auto_ingest: AutoIngestMetadata } | Record<string, never> {
+  if (options === undefined) {
+    return {};
+  }
+
+  const transitionStartsAttempt = nextStatus === "ingesting";
+  const lastAttemptAt = transitionStartsAttempt || current === undefined ? updatedAt : current.last_attempt_at;
+
+  return {
+    auto_ingest: {
+      enabled: options.enabled,
+      attempt_count: (current?.attempt_count ?? 0) + (transitionStartsAttempt ? 1 : 0),
+      last_attempt_at: lastAttemptAt,
+      last_result: options.result,
+      last_error_code: options.errorCode ?? null,
+      last_error_message: options.errorMessage ?? null,
+    },
+  };
 }
 
 async function findQueueRecord(
@@ -435,6 +500,7 @@ function normalizeQueueRecord(
   const kind = parseSourceKind(item.kind);
   const sourceKind = parseSourceKind(item.source_kind);
   const visibility = parseVisibility(item.visibility);
+  const autoIngest = normalizeAutoIngestMetadata(item.auto_ingest);
 
   if (status === null || kind === null || sourceKind === null || visibility === null) {
     return err({
@@ -442,6 +508,15 @@ function normalizeQueueRecord(
       message: `Queue item has unsupported field values in ${queuePath}.`,
       path: queuePath,
       hint: "Use supported kind/source_kind, status, and visibility values in the queue JSON.",
+    });
+  }
+
+  if (!autoIngest.ok) {
+    return err({
+      code: "QUEUE_ITEM_INVALID",
+      message: `Queue item has invalid auto_ingest metadata in ${queuePath}.`,
+      path: queuePath,
+      hint: "Use auto_ingest.enabled, attempt_count, last_attempt_at, last_result, last_error_code, and last_error_message.",
     });
   }
 
@@ -469,6 +544,7 @@ function normalizeQueueRecord(
     path: String(item.path),
     original_path: String(item.original_path),
     ...(typeof item.updated_at === "string" ? { updated_at: item.updated_at } : {}),
+    ...(autoIngest.value === undefined ? {} : { auto_ingest: autoIngest.value }),
     queue_path: queuePath,
   });
 }
@@ -548,6 +624,7 @@ function normalizeSourceCardFrontmatter(
   const status = parseQueueStatus(frontmatter.status);
   const sourceKind = parseSourceKind(frontmatter.source_kind);
   const visibility = parseVisibility(frontmatter.visibility);
+  const autoIngest = normalizeAutoIngestMetadata(frontmatter.auto_ingest);
 
   if (
     frontmatter.type !== "raw_source" ||
@@ -568,6 +645,15 @@ function normalizeSourceCardFrontmatter(
     });
   }
 
+  if (!autoIngest.ok) {
+    return err({
+      code: "QUEUE_SOURCE_CARD_INVALID",
+      message: `Source card frontmatter has invalid auto_ingest metadata in ${path}.`,
+      path,
+      hint: "Use auto_ingest.enabled, attempt_count, last_attempt_at, last_result, last_error_code, and last_error_message.",
+    });
+  }
+
   return ok({
     ...frontmatter,
     type: "raw_source",
@@ -583,6 +669,7 @@ function normalizeSourceCardFrontmatter(
     status,
     visibility,
     ...(typeof frontmatter.updated_at === "string" ? { updated_at: frontmatter.updated_at } : {}),
+    ...(autoIngest.value === undefined ? {} : { auto_ingest: autoIngest.value }),
   });
 }
 
@@ -595,7 +682,16 @@ function findQueueSourceCardMismatch(record: QueueRecord, frontmatter: SourceCar
     ["visibility", record.visibility, frontmatter.visibility],
   ];
 
-  return comparisons.find(([, left, right]) => left !== right)?.[0] ?? null;
+  const scalarMismatch = comparisons.find(([, left, right]) => left !== right)?.[0] ?? null;
+  if (scalarMismatch !== null) {
+    return scalarMismatch;
+  }
+
+  if (!autoIngestMetadataEqual(record.auto_ingest, frontmatter.auto_ingest)) {
+    return "auto_ingest";
+  }
+
+  return null;
 }
 
 async function findSourceCardBySourceId(
@@ -899,6 +995,71 @@ function parseSourceKind(value: unknown): QueueSourceKind | null {
 
 function parseVisibility(value: unknown): QueueVisibility | null {
   return value === "private" || value === "public" ? value : null;
+}
+
+function normalizeAutoIngestMetadata(value: unknown): Result<AutoIngestMetadata | undefined, "invalid"> {
+  if (value === undefined) {
+    return ok(undefined);
+  }
+
+  if (!isRecord(value)) {
+    return err("invalid");
+  }
+
+  const enabled = value.enabled;
+  const attemptCount = value.attempt_count;
+  const lastAttemptAt = value.last_attempt_at;
+  const lastResult = value.last_result;
+  const lastErrorCode = value.last_error_code;
+  const lastErrorMessage = value.last_error_message;
+
+  if (
+    typeof enabled !== "boolean" ||
+    typeof attemptCount !== "number" ||
+    !Number.isInteger(attemptCount) ||
+    attemptCount < 0 ||
+    typeof lastAttemptAt !== "string" ||
+    typeof lastResult !== "string" ||
+    !isNullableString(lastErrorCode) ||
+    !isNullableString(lastErrorMessage)
+  ) {
+    return err("invalid");
+  }
+
+  return ok({
+    enabled,
+    attempt_count: attemptCount,
+    last_attempt_at: lastAttemptAt,
+    last_result: lastResult,
+    last_error_code: lastErrorCode,
+    last_error_message: lastErrorMessage,
+  });
+}
+
+function autoIngestMetadataEqual(
+  left: AutoIngestMetadata | undefined,
+  right: AutoIngestMetadata | undefined,
+): boolean {
+  if (left === undefined || right === undefined) {
+    return left === right;
+  }
+
+  return (
+    left.enabled === right.enabled &&
+    left.attempt_count === right.attempt_count &&
+    left.last_attempt_at === right.last_attempt_at &&
+    left.last_result === right.last_result &&
+    left.last_error_code === right.last_error_code &&
+    left.last_error_message === right.last_error_message
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
 }
 
 function validateSourceId(sourceId: string): Result<void, QueueCommandError> {

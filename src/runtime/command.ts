@@ -2,9 +2,11 @@ import { CommanderError, type Command } from "commander";
 
 import type { CliIo } from "../cli.js";
 import {
+  buildRuntimePartialFailureEnvelope,
   buildRuntimeCommandFailureEnvelope,
   buildRuntimeFailureEnvelope,
   buildRuntimeSuccessEnvelope,
+  type RuntimeIssue,
   type RuntimeSuccessEnvelope,
 } from "./envelope.js";
 import { RuntimeCommandError } from "./errors.js";
@@ -27,10 +29,21 @@ export type RuntimeCommandContext = {
   options: RuntimeCommandOptions;
 };
 
-export type RuntimeCommandResult<Data> = {
+export type RuntimeCommandSuccessResult<Data> = {
   data: Data;
   warnings?: string[];
 };
+
+export type RuntimeCommandPartialFailureResult<Data> = {
+  data: Data;
+  warnings?: string[];
+  error: RuntimeCommandError;
+  issues?: RuntimeIssue[];
+};
+
+export type RuntimeCommandResult<Data> =
+  | RuntimeCommandSuccessResult<Data>
+  | RuntimeCommandPartialFailureResult<Data>;
 
 export type RuntimeCommandConfig<CommandName extends string, Data> = {
   command: CommandName;
@@ -90,6 +103,42 @@ export async function runRuntimeCommand<CommandName extends string, Data>(
 
     throw new CommanderError(1, `llm-wiki.${config.command}`, envelope.error.message);
   }
+  if (isPartialFailureResult(commandResult)) {
+    const issues = commandResult.issues ?? [
+      {
+        severity: "error" as const,
+        code: commandResult.error.code,
+        message: commandResult.error.message,
+        path: commandResult.error.path,
+        hint: commandResult.error.hint,
+      },
+    ];
+    const envelope = buildRuntimePartialFailureEnvelope(
+      config.command,
+      resolvedRepo.value.rootDir,
+      commandResult.data,
+      commandResult.error,
+      issues,
+      commandResult.warnings ?? [],
+    );
+
+    if (options.json) {
+      config.io.stdout(JSON.stringify(envelope));
+    } else {
+      if (!options.quiet) {
+        config.io.stdout(config.formatHuman(buildRuntimeSuccessEnvelope(
+          config.command,
+          resolvedRepo.value.rootDir,
+          commandResult.data,
+          commandResult.warnings ?? [],
+        )));
+      }
+      config.io.stderr(`Error: ${envelope.error.message}\nHint: ${envelope.error.hint}`);
+    }
+
+    throw new CommanderError(1, `llm-wiki.${config.command}`, envelope.error.message);
+  }
+
   const envelope = buildRuntimeSuccessEnvelope(
     config.command,
     resolvedRepo.value.rootDir,
@@ -117,4 +166,10 @@ function normalizeRuntimeOptions(rawOptions: RawRuntimeCommandOptions): RuntimeC
     json: rawOptions.json === true,
     quiet: rawOptions.quiet === true,
   };
+}
+
+function isPartialFailureResult<Data>(
+  result: RuntimeCommandResult<Data>,
+): result is RuntimeCommandPartialFailureResult<Data> {
+  return "error" in result;
 }

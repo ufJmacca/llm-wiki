@@ -1,25 +1,52 @@
 import { CommanderError, type Command } from "commander";
 
+import {
+  runAutoIngestBatch,
+  runAutoIngestSource,
+  type AutoIngestBatchResult,
+  type AutoIngestSourceResult,
+} from "../autoIngest/index.js";
 import type { CliIo } from "../cli.js";
 import { addRuntimeOptions, runRuntimeCommand, type RawRuntimeCommandOptions } from "../runtime/command.js";
+import { type RuntimeIssue } from "../runtime/envelope.js";
+import { RuntimeCommandError } from "../runtime/errors.js";
 import {
   listQueue,
   setQueueStatus,
   showQueueSource,
-  type QueueCommandError,
   type QueueListResult,
   type QueueSetStatusResult,
   type QueueShowResult,
 } from "../runtime/queue.js";
+
+type QueueIngestData = Omit<AutoIngestBatchResult, "agent"> & {
+  agent: string | null;
+};
+
+type RawQueueCommandOptions = RawRuntimeCommandOptions & {
+  auto?: unknown;
+  limit?: unknown;
+  sourceId?: unknown;
+};
+
+type QueueCliCommandError = {
+  code: string;
+  message: string;
+  path: string;
+  hint: string;
+};
 
 export function registerQueueCommand(program: Command, io: CliIo): void {
   const queueCommand = addRuntimeOptions(
     program
       .command("queue")
       .description("List and manage raw source queue items")
-      .argument("[action]", "optional action: show or set-status")
+      .argument("[action]", "optional action: ingest, show or set-status")
       .argument("[source_id]", "source ID for show or set-status")
-      .argument("[status]", "next status for set-status"),
+      .argument("[status]", "next status for set-status")
+      .option("--auto", "run queue ingest with the configured default local agent", false)
+      .option("--limit <n>", "maximum number of queued sources to auto-ingest")
+      .option("--source-id <source_id>", "specific source ID for queue ingest"),
   );
 
   queueCommand.action(async (
@@ -29,6 +56,10 @@ export function registerQueueCommand(program: Command, io: CliIo): void {
     rawOptions: RawRuntimeCommandOptions | Command,
   ) => {
     const runtimeOptions = normalizeCommanderOptions(rawOptions);
+
+    if (action === undefined || action === "show" || action === "set-status") {
+      rejectQueueIngestOptionsOutsideIngest(action, runtimeOptions, io);
+    }
 
     if (action === undefined) {
       await runRuntimeCommand({
@@ -104,6 +135,56 @@ export function registerQueueCommand(program: Command, io: CliIo): void {
       return;
     }
 
+    if (action === "ingest") {
+      const target = resolveQueueIngestTarget(sourceId, status, runtimeOptions, io);
+      if (runtimeOptions.auto !== true) {
+        throwQueueCommandError(
+          io,
+          "queue ingest",
+          "",
+          {
+            code: "QUEUE_INGEST_AUTO_REQUIRED",
+            message: "queue ingest requires --auto.",
+            path: "--auto",
+            hint: "Run llm-wiki queue ingest --auto to process queued sources with the configured default agent.",
+          },
+          runtimeOptions.json === true,
+        );
+      }
+
+      const limit = parseQueueIngestLimit(runtimeOptions.limit, runtimeOptions, io);
+      rejectQueueIngestTargetLimit(target, limit, runtimeOptions, io);
+
+      await runRuntimeCommand({
+        command: "queue ingest",
+        rawOptions: runtimeOptions,
+        io,
+        run: async ({ repo }) => {
+          const data = target === undefined
+            ? await runQueueIngestBatch(repo.rootDir, limit)
+            : batchDataFromSourceResult(await runAutoIngestSource({
+                repoRoot: repo.rootDir,
+                sourceId: target,
+                command: `llm-wiki queue ingest --auto --source-id ${target}`,
+              }));
+
+          if (queueIngestIsIncomplete(data)) {
+            return {
+              data,
+              error: queueIngestIncompleteError(data),
+              issues: queueIngestIssues(data),
+            };
+          }
+
+          return {
+            data,
+          };
+        },
+        formatHuman: (envelope) => formatHumanQueueIngest(envelope.data),
+      });
+      return;
+    }
+
     throwQueueCommandError(
       io,
       "queue",
@@ -112,23 +193,251 @@ export function registerQueueCommand(program: Command, io: CliIo): void {
         code: "QUEUE_ACTION_INVALID",
         message: `Unknown queue action: ${action}`,
         path: "action",
-        hint: "Use llm-wiki queue, llm-wiki queue show <source_id>, or llm-wiki queue set-status <source_id> <status>.",
+        hint: "Use llm-wiki queue, llm-wiki queue ingest --auto, llm-wiki queue show <source_id>, or llm-wiki queue set-status <source_id> <status>.",
       },
       runtimeOptions.json === true,
     );
   });
 }
 
-function normalizeCommanderOptions(rawOptions: RawRuntimeCommandOptions | Command): RawRuntimeCommandOptions {
+function normalizeCommanderOptions(rawOptions: RawRuntimeCommandOptions | Command): RawQueueCommandOptions {
   if (isCommanderCommand(rawOptions)) {
-    return rawOptions.opts() as RawRuntimeCommandOptions;
+    return rawOptions.opts() as RawQueueCommandOptions;
   }
 
-  return rawOptions;
+  return rawOptions as RawQueueCommandOptions;
 }
 
 function isCommanderCommand(value: RawRuntimeCommandOptions | Command): value is Command {
   return typeof (value as { opts?: unknown }).opts === "function";
+}
+
+function rejectQueueIngestOptionsOutsideIngest(
+  action: string | undefined,
+  rawOptions: RawQueueCommandOptions,
+  io: CliIo,
+): void {
+  const option = firstQueueIngestOnlyOption(rawOptions);
+  if (option === undefined) {
+    return;
+  }
+
+  throwQueueCommandError(
+    io,
+    queueCommandName(action),
+    "",
+    {
+      code: "QUEUE_INGEST_OPTION_INVALID",
+      message: `${option} can only be used with queue ingest.`,
+      path: option,
+      hint: "Run llm-wiki queue ingest --auto, or remove ingest-only options from queue list, show, and set-status commands.",
+    },
+    rawOptions.json === true,
+  );
+}
+
+function firstQueueIngestOnlyOption(rawOptions: RawQueueCommandOptions): "--auto" | "--limit" | "--source-id" | undefined {
+  if (rawOptions.auto === true) {
+    return "--auto";
+  }
+
+  if (rawOptions.limit !== undefined) {
+    return "--limit";
+  }
+
+  if (rawOptions.sourceId !== undefined) {
+    return "--source-id";
+  }
+
+  return undefined;
+}
+
+function queueCommandName(action: string | undefined): "queue" | "queue show" | "queue set-status" {
+  if (action === "show") {
+    return "queue show";
+  }
+
+  if (action === "set-status") {
+    return "queue set-status";
+  }
+
+  return "queue";
+}
+
+async function runQueueIngestBatch(repoRoot: string, limit: number | undefined): Promise<QueueIngestData> {
+  const result = await runAutoIngestBatch({
+    repoRoot,
+    ...(limit === undefined ? {} : { limit }),
+    command: limit === undefined ? "llm-wiki queue ingest --auto" : `llm-wiki queue ingest --auto --limit ${limit}`,
+  });
+
+  return result;
+}
+
+function resolveQueueIngestTarget(
+  positionalSourceId: string | undefined,
+  positionalStatus: string | undefined,
+  rawOptions: RawQueueCommandOptions,
+  io: CliIo,
+): string | undefined {
+  const optionSourceId = typeof rawOptions.sourceId === "string" ? rawOptions.sourceId : undefined;
+  if (positionalSourceId !== undefined || positionalStatus !== undefined) {
+    throwQueueCommandError(
+      io,
+      "queue ingest",
+      "",
+      {
+        code: "QUEUE_INGEST_ARGUMENT_INVALID",
+        message: "queue ingest accepts a source target only through --source-id.",
+        path: "source_id",
+        hint: "Run llm-wiki queue ingest --auto --source-id <source_id>.",
+      },
+      rawOptions.json === true,
+    );
+  }
+
+  return optionSourceId;
+}
+
+function parseQueueIngestLimit(
+  rawLimit: unknown,
+  rawOptions: RawQueueCommandOptions,
+  io: CliIo,
+): number | undefined {
+  if (rawLimit === undefined) {
+    return undefined;
+  }
+
+  const limitText = String(rawLimit);
+  if (!/^\d+$/.test(limitText)) {
+    throwQueueCommandError(
+      io,
+      "queue ingest",
+      "",
+      {
+        code: "QUEUE_INGEST_LIMIT_INVALID",
+        message: `Invalid queue ingest limit: ${limitText}`,
+        path: "--limit",
+        hint: "Pass --limit <n> as a non-negative integer.",
+      },
+      rawOptions.json === true,
+    );
+  }
+
+  const limit = Number(limitText);
+  if (!Number.isSafeInteger(limit)) {
+    throwQueueCommandError(
+      io,
+      "queue ingest",
+      "",
+      {
+        code: "QUEUE_INGEST_LIMIT_INVALID",
+        message: `Invalid queue ingest limit: ${limitText}`,
+        path: "--limit",
+        hint: "Pass --limit <n> as a non-negative integer.",
+      },
+      rawOptions.json === true,
+    );
+  }
+
+  return limit;
+}
+
+function rejectQueueIngestTargetLimit(
+  target: string | undefined,
+  limit: number | undefined,
+  rawOptions: RawQueueCommandOptions,
+  io: CliIo,
+): void {
+  if (target === undefined || limit === undefined) {
+    return;
+  }
+
+  throwQueueCommandError(
+    io,
+    "queue ingest",
+    "",
+    {
+      code: "QUEUE_INGEST_ARGUMENT_INVALID",
+      message: "queue ingest cannot combine --source-id and --limit.",
+      path: "--limit",
+      hint: "Run llm-wiki queue ingest --auto --source-id <source_id> or omit --source-id when using --limit.",
+    },
+    rawOptions.json === true,
+  );
+}
+
+function batchDataFromSourceResult(result: AutoIngestSourceResult): QueueIngestData {
+  const results = [result];
+
+  return {
+    agent: result.agent,
+    results,
+    counts: countQueueIngestResults(1, results),
+  };
+}
+
+function countQueueIngestResults(
+  selected: number,
+  results: readonly AutoIngestSourceResult[],
+): QueueIngestData["counts"] {
+  const counts: QueueIngestData["counts"] = {
+    selected,
+    attempted: 0,
+    ingested: 0,
+    blocked: 0,
+    skipped: 0,
+    deferred: 0,
+  };
+
+  for (const result of results) {
+    if (result.attempted) {
+      counts.attempted += 1;
+    }
+
+    if (result.outcome === "ingested") {
+      counts.ingested += 1;
+    } else if (result.outcome === "blocked") {
+      counts.blocked += 1;
+    } else if (result.outcome === "skipped") {
+      counts.skipped += 1;
+    } else {
+      counts.deferred += 1;
+    }
+  }
+
+  return counts;
+}
+
+function queueIngestIsIncomplete(data: QueueIngestData): boolean {
+  return data.results.some((result) => result.outcome !== "ingested");
+}
+
+function queueIngestIncompleteError(data: QueueIngestData): RuntimeCommandError {
+  const incompleteCount = data.results.filter((result) => result.outcome !== "ingested").length;
+
+  return new RuntimeCommandError({
+    code: "QUEUE_INGEST_INCOMPLETE",
+    message: `Queue auto-ingest completed with ${incompleteCount} incomplete result${incompleteCount === 1 ? "" : "s"}.`,
+    path: "raw/queue",
+    hint: "Review the per-source results, fix blocked or deferred sources, then rerun llm-wiki queue ingest --auto.",
+  });
+}
+
+function queueIngestIssues(data: QueueIngestData): RuntimeIssue[] {
+  return data.results
+    .filter((result) => result.outcome !== "ingested")
+    .map((result) => {
+      const error = result.error;
+
+      return {
+        severity: "error",
+        code: error?.code ?? "QUEUE_INGEST_INCOMPLETE",
+        message: error?.message ?? `Queue auto-ingest ${result.outcome} for ${result.source_id}.`,
+        path: error?.path ?? `raw/queue/${result.source_id}.json`,
+        hint: error?.hint ?? "Review this source queue state before retrying auto-ingest.",
+      };
+    });
 }
 
 function formatHumanQueueList(data: QueueListResult): string {
@@ -183,11 +492,44 @@ function formatHumanQueueSetStatus(data: QueueSetStatusResult): string {
   ].join("\n");
 }
 
+function formatHumanQueueIngest(data: QueueIngestData): string {
+  const lines = [
+    "Queue auto-ingest results",
+    `Agent: ${data.agent ?? "(not resolved)"}`,
+    `Selected: ${data.counts.selected}`,
+    `Attempted: ${data.counts.attempted}`,
+    `Counts: ingested ${data.counts.ingested}, blocked ${data.counts.blocked}, skipped ${data.counts.skipped}, deferred ${data.counts.deferred}`,
+  ];
+
+  if (data.results.length === 0) {
+    lines.push("", "No eligible queued sources.");
+    return lines.join("\n");
+  }
+
+  for (const result of data.results) {
+    lines.push(
+      "",
+      `${result.source_id} | ${result.outcome} | ${result.attempted ? "attempted" : "not attempted"}`,
+      `Status: ${result.previous_status ?? "(missing)"} -> ${result.final_status ?? "(missing)"}`,
+    );
+
+    if (result.applied_paths.length > 0) {
+      lines.push(`Applied: ${result.applied_paths.join(", ")}`);
+    }
+
+    if (result.error !== null) {
+      lines.push(`Error: ${result.error.code}: ${result.error.message}`, `Hint: ${result.error.hint}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 function throwQueueCommandError(
   io: CliIo,
-  command: "queue" | "queue show" | "queue set-status",
+  command: "queue" | "queue ingest" | "queue show" | "queue set-status",
   repo: string,
-  error: QueueCommandError,
+  error: QueueCliCommandError,
   json: boolean,
 ): never {
   if (json) {

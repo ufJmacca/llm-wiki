@@ -272,6 +272,27 @@ function successfulCodexSource(source: SourceCaptureData["source"]): string {
 }
 
 describe("ingest local agent automation", () => {
+  it("keeps the extracted local agent core independent from queue and runtime log ownership", async () => {
+    // Arrange
+    const corePath = resolve(process.cwd(), "src/ingest/localAgentCore.ts");
+    const forbiddenCalls = [
+      "setQueueStatus",
+      "ensureIngesting",
+      "markBlockedIfIngesting",
+      "validateAndCompleteIngest",
+    ];
+
+    // Act
+    const coreSource = await readFile(corePath, "utf8");
+
+    // Assert
+    expect(coreSource).toContain("runLocalAgentIngestCore");
+    expect(coreSource).not.toMatch(/from ["']\.\.\/runtime\/(?:queue|log)\.js["']/);
+    for (const forbiddenCall of forbiddenCalls) {
+      expect(coreSource).not.toMatch(new RegExp(`\\b${forbiddenCall}\\b`));
+    }
+  });
+
   it("rejects --create-branch with local agent ingest before queue changes", async () => {
     await withTempWorkspace("llm-wiki-ingest-agent-create-branch-conflict-", async (workspaceDir) => {
       // Arrange

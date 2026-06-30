@@ -5,20 +5,15 @@ import { CommanderError, type Command } from "commander";
 import {
   checkLocalAgentAvailability,
   LocalAgentExecutionError,
-  runLocalAgentInTemporaryWorkspace,
 } from "../agents/index.js";
 import type { CliIo } from "../cli.js";
 import { buildIngestTask, type IngestTask } from "../agentTasks/ingest.js";
+import { IngestValidationFailedError, runLocalAgentIngestCore } from "../ingest/localAgentCore.js";
 import {
   applyProviderProposalsWithValidation,
   requestProviderFileProposals,
   validateProposalsOnTemporaryRepo as validateProviderProposalsOnTemporaryRepo,
 } from "../providers/index.js";
-import {
-  applyProposalsWithValidation,
-  createIngestProposalPolicy,
-  validateProposalsOnTemporaryRepo,
-} from "../proposals/index.js";
 import {
   loadDefaultLocalAgentConfig,
   loadLocalAgentConfig,
@@ -128,17 +123,6 @@ type IngestStateSnapshot = {
   queueContent: string;
   logContent: string;
 };
-
-const AGENT_INGEST_PROPOSAL_POLICY = createIngestProposalPolicy({
-  rejectionCode: "AGENT_PROPOSAL_REJECTED",
-  writeFailedCode: "AGENT_PROPOSAL_WRITE_FAILED",
-  rejectedPathHint: "Agent proposals may only write Markdown files under curated/.",
-  duplicatePathHint: "Return one file proposal per path.",
-  writeRejectedHint: "Agent file proposals must target safe Markdown files inside curated/.",
-  writeFailedHint: "Fix filesystem permissions or unsafe proposal paths, then rerun local agent mode.",
-  pathRejectedMessage: (path) => `Agent proposal path is not allowed: ${path}.`,
-  duplicatePathMessage: (path) => `Agent proposed the same path more than once: ${path}.`,
-});
 
 export function registerIngestCommand(program: Command, io: CliIo): void {
   addRuntimeOptions(
@@ -297,46 +281,14 @@ async function executeAgentIngest(
   await ensureIngesting(repoRoot, sourceId, agentIngestCommand(sourceId, agent.name, rawOptions));
 
   try {
-    const task = await buildIngestTask({
+    const result = await runLocalAgentIngestCore({
       repoRoot,
       sourceId,
-      previousStatus: preflightTask.value.source.status,
-      promptMode: "local-agent",
-    });
-    if (!task.ok) {
-      throw new RuntimeCommandError({
-        code: task.error.code,
-        message: task.error.message,
-        hint: task.error.hint,
-        path: task.error.path,
-      });
-    }
-
-    const result = await runLocalAgentInTemporaryWorkspace({
-      repoRoot,
       agent,
-      taskPrompt: task.value.task.prompt,
-      policy: AGENT_INGEST_PROPOSAL_POLICY,
-    });
-
-    await validateProposalsOnTemporaryRepo(
-      repoRoot,
-      result.proposals,
-      AGENT_INGEST_PROPOSAL_POLICY,
-      async (tempRepoRoot) => {
-        const validation = await validateIngestReadiness(tempRepoRoot, sourceId);
-        if (!validation.passed) {
-          throw new IngestValidationFailedError(validation.issues);
-        }
+      completeAppliedIngest: async () => {
+        return markIngested(repoRoot, sourceId);
       },
-    );
-
-    const { appliedPaths, validation: completed } = await applyProposalsWithValidation(
-      repoRoot,
-      result.proposals,
-      AGENT_INGEST_PROPOSAL_POLICY,
-      async () => validateAndCompleteIngest(repoRoot, sourceId),
-    );
+    });
 
     return {
       mode: "agent",
@@ -345,12 +297,12 @@ async function executeAgentIngest(
         source_id: sourceId,
         status: "ingested",
       },
-      applied_paths: appliedPaths,
+      applied_paths: result.appliedPaths,
       validation: {
         passed: true,
         issues: [],
       },
-      queue: completed.queue,
+      queue: result.completion,
     };
   } catch (error) {
     await markBlockedIfIngesting(repoRoot, sourceId, agentIngestCommand(sourceId, agent.name, rawOptions));
@@ -854,16 +806,6 @@ function publicProviderData(provider: HttpProviderConfig): IngestProviderData["p
     name: provider.name,
     model: provider.model,
   };
-}
-
-class IngestValidationFailedError extends Error {
-  readonly issues: IngestValidationIssue[];
-
-  constructor(issues: IngestValidationIssue[]) {
-    super("Ingest validation failed.");
-    this.name = "IngestValidationFailedError";
-    this.issues = issues;
-  }
 }
 
 function throwValidationFailure(

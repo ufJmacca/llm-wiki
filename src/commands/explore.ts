@@ -55,6 +55,7 @@ type RawExploreServeOptions = RawRuntimeCommandOptions & {
   withDaemon?: unknown;
   daemonPort?: unknown;
   commitUploads?: unknown;
+  autoIngestUploads?: unknown;
 };
 
 type RawExploreBuildOptions = RawRuntimeCommandOptions & {
@@ -115,7 +116,8 @@ export function registerExploreCommand(program: Command, io: CliIo): void {
       .option("--port <port>", "port for the local Explorer server", String(DEFAULT_EXPLORER_PORT))
       .option("--with-daemon", "start the local raw upload daemon with Explorer", false)
       .option("--daemon-port <port>", "port for the local upload daemon", String(DEFAULT_DAEMON_PORT))
-      .option("--commit-uploads", "commit uploaded source artifacts after capture", false),
+      .option("--commit-uploads", "commit uploaded source artifacts after capture", false)
+      .option("--auto-ingest-uploads", "allow local daemon uploads to advertise auto-ingest availability", false),
   ).action(async (rawOptions: RawExploreServeOptions) => {
     await runExploreServeCommand(rawOptions, io);
   });
@@ -193,9 +195,28 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
   let uploadDaemon: Awaited<ReturnType<typeof startUploadDaemon>> | undefined;
   let daemonMetadataWritten = false;
   const profile = typeof rawOptions.profile === "string" ? rawOptions.profile : "local";
+  const autoIngestUploads = rawOptions.autoIngestUploads === true;
   try {
     if (isPublicLikeProfile(profile)) {
       await removeLocalDaemonRuntimeMetadata(resolvedRepo.value.rootDir);
+    }
+
+    if (autoIngestUploads && rawOptions.withDaemon !== true) {
+      throw new RuntimeCommandError({
+        code: "AUTO_INGEST_UPLOADS_REQUIRES_DAEMON",
+        message: "--auto-ingest-uploads requires --with-daemon.",
+        path: "--auto-ingest-uploads",
+        hint: "Run llm-wiki explore serve --profile local --with-daemon --auto-ingest-uploads.",
+      });
+    }
+
+    if (autoIngestUploads && isPublicLikeProfile(profile)) {
+      throw new RuntimeCommandError({
+        code: "AUTO_INGEST_UPLOADS_PROFILE_FORBIDDEN",
+        message: `--auto-ingest-uploads is forbidden for the ${profile} Explorer profile.`,
+        path: "--auto-ingest-uploads",
+        hint: "Use --profile local or --profile review for private auto-ingest upload serves.",
+      });
     }
 
     if (rawOptions.withDaemon === true && isPublicLikeProfile(profile)) {
@@ -212,6 +233,14 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
         repoRoot: resolvedRepo.value.rootDir,
         port: normalizeDaemonPort(rawOptions.daemonPort),
         commitUploads: rawOptions.commitUploads === true,
+        ...(autoIngestUploads
+          ? {
+              autoIngest: {
+                enabled: true,
+                command: "llm-wiki explore serve --with-daemon --auto-ingest-uploads upload",
+              } as const,
+            }
+          : {}),
       });
     }
 
@@ -233,7 +262,7 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
           upload_token: uploadDaemon.uploadToken,
           upload_session_id: uploadDaemon.uploadSessionId,
           commit_uploads: uploadDaemon.commitUploads,
-          auto_ingest_available: false,
+          auto_ingest_available: autoIngestUploads,
         });
         daemonMetadataWritten = true;
       },

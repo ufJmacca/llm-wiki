@@ -86,7 +86,7 @@ export function buildRuntimeCommandFailureEnvelope<Command extends string>(
       message: error.message,
       hint: error.hint,
     },
-    issues: [
+    issues: error.issues ?? [
       {
         severity: "error",
         code: error.code,

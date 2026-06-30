@@ -6,7 +6,7 @@ import {
   checkLocalAgentAvailability,
   LocalAgentExecutionError,
 } from "../agents/index.js";
-import { runAutoIngestSource, type AutoIngestSourceResult } from "../autoIngest/index.js";
+import { resumeAutoIngestSource, runAutoIngestSource, type AutoIngestSourceResult } from "../autoIngest/index.js";
 import type { CliIo } from "../cli.js";
 import { buildIngestTask, type IngestTask } from "../agentTasks/ingest.js";
 import { IngestValidationFailedError, runLocalAgentIngestCore } from "../ingest/localAgentCore.js";
@@ -27,6 +27,7 @@ import {
 import { addRuntimeOptions, type RawRuntimeCommandOptions, type RuntimeCommandOptions } from "../runtime/command.js";
 import { buildRuntimeFailureEnvelope, buildRuntimeSuccessEnvelope, type RuntimeIssue } from "../runtime/envelope.js";
 import { RuntimeCommandError } from "../runtime/errors.js";
+import { withIngestLock } from "../runtime/ingestLock.js";
 import { resolveWikiRoot } from "../runtime/repo.js";
 import { setQueueStatus, showQueueSource, type QueueStatus } from "../runtime/queue.js";
 import { validateIngestReadiness, type IngestValidationIssue } from "../validation/ingest.js";
@@ -189,6 +190,15 @@ async function runIngestCommand(sourceId: string, rawOptions: RawIngestOptions, 
           hint: "Fix the source queue or repository files, then rerun llm-wiki ingest.",
           path: sourceId,
         });
+    const issues = commandError.issues ?? [
+      {
+        severity: "error" as const,
+        code: commandError.code,
+        message: commandError.message,
+        path: commandError.path,
+        hint: commandError.hint,
+      },
+    ];
     const envelope = {
       ok: false as const,
       command: "ingest" as const,
@@ -198,21 +208,16 @@ async function runIngestCommand(sourceId: string, rawOptions: RawIngestOptions, 
         message: commandError.message,
         hint: commandError.hint,
       },
-      issues: [
-        {
-          severity: "error" as const,
-          code: commandError.code,
-          message: commandError.message,
-          path: commandError.path,
-          hint: commandError.hint,
-        },
-      ],
+      issues,
     };
 
     if (options.json) {
       io.stdout(JSON.stringify(envelope));
     } else {
       io.stderr(`Error: ${envelope.error.message}`);
+      if (!options.quiet && commandError.code === "INGEST_VALIDATION_FAILED" && issues.length > 0) {
+        io.stdout(formatHumanValidationIssues(issues));
+      }
     }
 
     throw new CommanderError(1, "llm-wiki.ingest", envelope.error.message);
@@ -264,9 +269,26 @@ async function executeAgentIngest(
   rawOptions: RawIngestOptions,
 ): Promise<IngestAgentData> {
   if (rawOptions.auto === true) {
+    const current = await showQueueSource(repoRoot, sourceId);
+    if (!current.ok) {
+      throw queueRuntimeError(current.error.code, current.error.message, current.error.hint, current.error.path);
+    }
+
+    if (current.value.queue_record.status === "ingesting") {
+      return executeLockedIngestingAutoIngest(repoRoot, sourceId, rawOptions);
+    }
+
     return executeDefaultAutoIngest(repoRoot, sourceId);
   }
 
+  return executeLocalAgentIngest(repoRoot, sourceId, rawOptions);
+}
+
+async function executeLocalAgentIngest(
+  repoRoot: string,
+  sourceId: string,
+  rawOptions: RawIngestOptions,
+): Promise<IngestAgentData> {
   const agent = await resolveLocalAgentConfig(repoRoot, rawOptions);
   const preflightTask = await buildIngestTask({
     repoRoot,
@@ -283,40 +305,84 @@ async function executeAgentIngest(
 
   ensureIngestTaskCanStart(preflightTask.value);
   await assertLocalAgentCommandAvailable(agent, repoRoot);
-  await ensureIngesting(repoRoot, sourceId, agentIngestCommand(sourceId, agent.name, rawOptions));
+  const command = agentIngestCommand(sourceId, agent.name, rawOptions);
 
-  try {
-    const result = await runLocalAgentIngestCore({
-      repoRoot,
-      sourceId,
-      agent,
-      completeAppliedIngest: async () => {
-        return markIngested(repoRoot, sourceId);
-      },
-    });
+  return withIngestLock(
+    repoRoot,
+    {
+      label: `agent-ingest:${sourceId}`,
+    },
+    async () => {
+      await ensureIngesting(repoRoot, sourceId, command);
 
-    return {
-      mode: "agent",
-      agent: agent.name,
-      source: {
-        source_id: sourceId,
-        status: "ingested",
-      },
-      applied_paths: result.appliedPaths,
-      validation: {
-        passed: true,
-        issues: [],
-      },
-      queue: result.completion,
-    };
-  } catch (error) {
-    await markBlockedIfIngesting(repoRoot, sourceId, agentIngestCommand(sourceId, agent.name, rawOptions));
-    if (error instanceof LocalAgentExecutionError) {
-      throw localAgentExecutionRuntimeError(error);
-    }
+      try {
+        const result = await runLocalAgentIngestCore({
+          repoRoot,
+          sourceId,
+          agent,
+          completeAppliedIngest: async () => {
+            return markIngested(repoRoot, sourceId);
+          },
+        });
 
-    throw error;
+        return {
+          mode: "agent",
+          agent: agent.name,
+          source: {
+            source_id: sourceId,
+            status: "ingested",
+          },
+          applied_paths: result.appliedPaths,
+          validation: {
+            passed: true,
+            issues: [],
+          },
+          queue: result.completion,
+        };
+      } catch (error) {
+        await markBlockedIfIngesting(repoRoot, sourceId, command);
+        if (error instanceof LocalAgentExecutionError) {
+          throw localAgentExecutionRuntimeError(error);
+        }
+
+        throw error;
+      }
+    },
+  );
+}
+
+async function executeLockedIngestingAutoIngest(
+  repoRoot: string,
+  sourceId: string,
+  rawOptions: RawIngestOptions,
+): Promise<IngestAgentData> {
+  const result = await resumeAutoIngestSource({
+    repoRoot,
+    sourceId,
+    command: agentIngestCommand(sourceId, "default", rawOptions),
+  });
+
+  if (result.outcome !== "ingested") {
+    throw autoIngestRuntimeError(result);
   }
+
+  return {
+    mode: "agent",
+    agent: result.agent ?? "default",
+    source: {
+      source_id: sourceId,
+      status: "ingested",
+    },
+    applied_paths: result.applied_paths,
+    validation: {
+      passed: true,
+      issues: [],
+    },
+    queue: {
+      previous_status: result.previous_status ?? "ingesting",
+      status: "ingested",
+    },
+  };
 }
 
 async function executeDefaultAutoIngest(repoRoot: string, sourceId: string): Promise<IngestAgentData> {
@@ -770,6 +836,7 @@ function autoIngestRuntimeError(result: AutoIngestSourceResult): RuntimeCommandE
     message: error?.message ?? `Auto-ingest ${result.outcome} for ${result.source_id}.`,
     hint: error?.hint ?? "Review the source queue status and rerun auto-ingest when it is queued.",
     path: error?.path ?? `raw/queue/${result.source_id}.json`,
+    issues: error?.issues,
   });
 }
 

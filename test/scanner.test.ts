@@ -109,6 +109,18 @@ describe("static output leak scanner", () => {
             expectedLine: 1,
           },
           {
+            path: "auto-ingest-attempt.json",
+            content: "{\"auto_ingest\":{\"enabled\":true,\"last_result\":\"blocked\"}}\n",
+            expectedCode: "STATIC_AUTO_INGEST_METADATA_LEAK",
+            expectedLine: 1,
+          },
+          {
+            path: "auto-ingest-runtime.json",
+            content: "{\"auto_ingest_available\":true}\n",
+            expectedCode: "STATIC_AUTO_INGEST_METADATA_LEAK",
+            expectedLine: 1,
+          },
+          {
             path: "source-card.md",
             content: "---\ntype: raw_source\nvisibility: private\nstatus: queued\n---\n# Source Card\n",
             expectedCode: "STATIC_PRIVATE_SOURCE_CARD_LEAK",

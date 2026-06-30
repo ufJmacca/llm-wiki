@@ -46,6 +46,7 @@ const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const CORS_ALLOWED_METHODS = "POST, OPTIONS";
 const CORS_ALLOWED_HEADERS = `${UPLOAD_TOKEN_HEADER}, content-type`;
 const repoUploadQueues = new Map<string, Promise<void>>();
+const RUNTIME_LOG_COMMIT_PATH = "curated/log.md";
 
 export type UploadDaemon = {
   host: string;
@@ -501,12 +502,13 @@ async function captureAndCommitUpload(
   options: UploadRequestOptions,
   payload: PreparedUploadPayload,
 ): Promise<Result<UploadWorkSuccess, UploadDaemonError>> {
+  const includeRuntimeLogInCommit = await shouldStageRuntimeLogForRawCommit(options);
   const capture = await capturePreparedUpload(options, payload);
   if (!capture.ok) {
     return err(capture.error);
   }
 
-  const commit = await commitCapturedUpload(options, capture.value);
+  const commit = await commitCapturedUpload(options, capture.value, includeRuntimeLogInCommit);
   if (!commit.ok) {
     return err(new UploadDaemonError({
       code: "UPLOAD_COMMIT_FAILED",
@@ -1063,6 +1065,7 @@ function toUploadCaptureError(error: SourceCaptureError): UploadDaemonError {
 async function commitCapturedUpload(
   options: Pick<UploadRequestOptions, "repoRoot" | "commitUploads" | "commitUpload" | "pendingUploadCommits">,
   capture: SourceCaptureSuccess,
+  includeRuntimeLog: boolean,
 ): Promise<UploadCommitResult> {
   if (!options.commitUploads) {
     return {
@@ -1072,7 +1075,7 @@ async function commitCapturedUpload(
   }
 
   const paths = capture.status === "added"
-    ? uploadCommitPaths(capture)
+    ? uploadCommitPaths(capture, includeRuntimeLog)
     : options.pendingUploadCommits.get(capture.source.source_id);
   if (paths === undefined || paths.length === 0) {
     return {
@@ -1095,8 +1098,65 @@ async function commitCapturedUpload(
   return commit;
 }
 
-function uploadCommitPaths(capture: SourceCaptureSuccess): string[] {
-  return [...new Set([...capture.created_paths, "curated/log.md"])];
+function uploadCommitPaths(capture: SourceCaptureSuccess, includeRuntimeLog: boolean): string[] {
+  return [
+    ...new Set([
+      ...capture.created_paths,
+      ...(includeRuntimeLog ? [RUNTIME_LOG_COMMIT_PATH] : []),
+    ]),
+  ];
+}
+
+async function shouldStageRuntimeLogForRawCommit(
+  options: Pick<UploadRequestOptions, "repoRoot" | "commitUploads">,
+): Promise<boolean> {
+  if (!options.commitUploads) {
+    return false;
+  }
+
+  if (!(await gitCommandSucceeds(options.repoRoot, ["rev-parse", "--is-inside-work-tree"]))) {
+    return true;
+  }
+
+  const unstagedClean = await gitQuietDiffClean(
+    options.repoRoot,
+    ["diff", "--quiet", "--", RUNTIME_LOG_COMMIT_PATH],
+  );
+  const stagedClean = await gitQuietDiffClean(
+    options.repoRoot,
+    ["diff", "--cached", "--quiet", "--", RUNTIME_LOG_COMMIT_PATH],
+  );
+
+  return unstagedClean && stagedClean;
+}
+
+async function gitCommandSucceeds(repoRoot: string, args: string[]): Promise<boolean> {
+  try {
+    await execFileAsync("git", args, { cwd: repoRoot, env: gitCommandEnv() });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function gitQuietDiffClean(repoRoot: string, args: string[]): Promise<boolean> {
+  try {
+    await execFileAsync("git", args, { cwd: repoRoot, env: gitCommandEnv() });
+    return true;
+  } catch (error) {
+    if (isExecExitCode(error, 1)) {
+      return false;
+    }
+
+    return true;
+  }
+}
+
+function isExecExitCode(error: unknown, code: number): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && (error as { code?: unknown }).code === code;
 }
 
 async function commitUploadWithGit(request: UploadCommitRequest): Promise<UploadCommitResult> {

@@ -1,5 +1,5 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { lstat, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { RuntimeCommandError } from "./errors.js";
@@ -28,36 +28,37 @@ export async function withIngestLock<T>(
   options: IngestLockOptions,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const lockPath = resolve(repoRoot, INGEST_LOCK_RELATIVE_PATH);
   await acquireIngestLock(repoRoot, options);
 
   try {
     return await fn();
   } finally {
-    await rm(lockPath, { force: true, recursive: true });
+    await removeIngestLock(repoRoot);
   }
 }
 
 async function acquireIngestLock(repoRoot: string, options: IngestLockOptions): Promise<void> {
   const lockPath = resolve(repoRoot, INGEST_LOCK_RELATIVE_PATH);
-  const lockParentPath = resolve(lockPath, "..");
   const timeoutMs = normalizeDuration(options.timeoutMs, DEFAULT_TIMEOUT_MS);
   const retryDelayMs = normalizeDuration(options.retryDelayMs, DEFAULT_RETRY_DELAY_MS);
   const deadline = Date.now() + timeoutMs;
 
-  await mkdir(lockParentPath, { recursive: true });
+  await ensureLockParentDirectory(repoRoot);
 
   while (true) {
     try {
       await mkdir(lockPath);
-      await writeMetadata(lockPath, options);
+      await assertExistingLockPathSafe(repoRoot, INGEST_LOCK_RELATIVE_PATH, "directory");
+      await writeMetadata(repoRoot, lockPath, options);
       return;
     } catch (error) {
       if (!isNodeError(error) || error.code !== "EEXIST") {
-        if (!isNodeError(error) || error.code !== "ENOENT") {
-          await rm(lockPath, { force: true, recursive: true });
-        }
         throw error;
+      }
+
+      const existingLock = await readExistingLockPathSafety(repoRoot, INGEST_LOCK_RELATIVE_PATH, "directory");
+      if (!existingLock.exists) {
+        continue;
       }
 
       if (Date.now() >= deadline) {
@@ -69,7 +70,7 @@ async function acquireIngestLock(repoRoot: string, options: IngestLockOptions): 
   }
 }
 
-async function writeMetadata(lockPath: string, options: IngestLockOptions): Promise<void> {
+async function writeMetadata(repoRoot: string, lockPath: string, options: IngestLockOptions): Promise<void> {
   const metadata: IngestLockMetadata = {
     pid: process.pid,
     started_at: (options.now?.() ?? new Date()).toISOString(),
@@ -79,9 +80,133 @@ async function writeMetadata(lockPath: string, options: IngestLockOptions): Prom
   try {
     await writeFile(resolve(lockPath, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
   } catch (error) {
-    await rm(lockPath, { force: true, recursive: true });
+    await removeIngestLock(repoRoot);
     throw error;
   }
+}
+
+async function ensureLockParentDirectory(repoRoot: string): Promise<void> {
+  const rootPath = resolve(repoRoot);
+  const rootRealPath = await realpath(rootPath);
+  const segments = INGEST_LOCK_RELATIVE_PATH.split("/").slice(0, -1);
+  let currentPath = rootPath;
+  let currentRelativePath = "";
+
+  for (const segment of segments) {
+    currentPath = resolve(currentPath, segment);
+    currentRelativePath = currentRelativePath === "" ? segment : `${currentRelativePath}/${segment}`;
+    assertPathInsideRoot(rootPath, currentPath, currentRelativePath);
+
+    try {
+      await mkdir(currentPath);
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== "EEXIST") {
+        throw error;
+      }
+    }
+
+    await assertPathSegmentSafe(rootRealPath, currentPath, currentRelativePath, "directory");
+  }
+}
+
+async function removeIngestLock(repoRoot: string): Promise<void> {
+  const safe = await readExistingLockPathSafety(repoRoot, INGEST_LOCK_RELATIVE_PATH, "directory");
+  if (!safe.exists) {
+    return;
+  }
+
+  await rm(resolve(repoRoot, INGEST_LOCK_RELATIVE_PATH), { force: true, recursive: true });
+}
+
+async function assertExistingLockPathSafe(
+  repoRoot: string,
+  relativePath: string,
+  expectedKind: "directory" | "file",
+): Promise<void> {
+  const safe = await readExistingLockPathSafety(repoRoot, relativePath, expectedKind);
+  if (!safe.exists) {
+    throw lockPathUnsafe(relativePath, `Ingest lock path does not exist: ${relativePath}`);
+  }
+}
+
+async function readExistingLockPathSafety(
+  repoRoot: string,
+  relativePath: string,
+  expectedKind: "directory" | "file",
+): Promise<{ exists: boolean }> {
+  const rootPath = resolve(repoRoot);
+  const rootRealPath = await realpath(rootPath);
+  const segments = relativePath.split("/");
+  let currentPath = rootPath;
+  let currentRelativePath = "";
+
+  for (const segment of segments) {
+    currentPath = resolve(currentPath, segment);
+    currentRelativePath = currentRelativePath === "" ? segment : `${currentRelativePath}/${segment}`;
+    assertPathInsideRoot(rootPath, currentPath, currentRelativePath);
+
+    try {
+      const isLastSegment = currentRelativePath === relativePath;
+      await assertPathSegmentSafe(
+        rootRealPath,
+        currentPath,
+        currentRelativePath,
+        isLastSegment ? expectedKind : "directory",
+      );
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") {
+        return { exists: false };
+      }
+
+      throw error;
+    }
+  }
+
+  return { exists: true };
+}
+
+async function assertPathSegmentSafe(
+  rootRealPath: string,
+  absolutePath: string,
+  relativePath: string,
+  expectedKind: "directory" | "file",
+): Promise<void> {
+  const pathStat = await lstat(absolutePath);
+  if (pathStat.isSymbolicLink()) {
+    throw lockPathUnsafe(relativePath, `Ingest lock path must not include symlinks: ${relativePath}`);
+  }
+
+  const isExpectedKind = expectedKind === "directory" ? pathStat.isDirectory() : pathStat.isFile();
+  if (!isExpectedKind) {
+    throw lockPathUnsafe(relativePath, `Ingest lock path is not a safe ${expectedKind}: ${relativePath}`);
+  }
+
+  const resolvedPath = await realpath(absolutePath);
+  if (!isInsideRealPath(rootRealPath, resolvedPath)) {
+    throw lockPathUnsafe(relativePath, `Ingest lock path resolves outside the wiki repository: ${relativePath}`);
+  }
+}
+
+function assertPathInsideRoot(rootPath: string, absolutePath: string, relativePath: string): void {
+  const relativeToRoot = relative(rootPath, absolutePath);
+  if (relativeToRoot === "" || relativeToRoot.startsWith("..") || isAbsolute(relativeToRoot)) {
+    throw lockPathUnsafe(relativePath, `Ingest lock path must stay inside the wiki repository: ${relativePath}`);
+  }
+}
+
+function isInsideRealPath(rootRealPath: string, resolvedPath: string): boolean {
+  const relativePath = relative(rootRealPath, resolvedPath);
+
+  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+}
+
+function lockPathUnsafe(path: string, message: string): RuntimeCommandError {
+  return new RuntimeCommandError({
+    code: "INGEST_LOCK_PATH_UNSAFE",
+    message,
+    path,
+    hint: "Ingest lock writes must stay inside the wiki repository and must not follow symlinks.",
+  });
 }
 
 function lockBusyError(): RuntimeCommandError {

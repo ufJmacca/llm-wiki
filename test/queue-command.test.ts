@@ -202,6 +202,135 @@ function formatSourceCardFixture(fields: {
 }
 
 describe("queue command", () => {
+  it.each([
+    {
+      name: "queue --auto",
+      command: "queue",
+      option: "--auto",
+      args: (wikiDir: string, _sourceId: string) => ["queue", "--auto", "--repo", wikiDir, "--json"],
+    },
+    {
+      name: "queue --limit",
+      command: "queue",
+      option: "--limit",
+      args: (wikiDir: string, _sourceId: string) => ["queue", "--limit", "1", "--repo", wikiDir, "--json"],
+    },
+    {
+      name: "queue --source-id",
+      command: "queue",
+      option: "--source-id",
+      args: (wikiDir: string, sourceId: string) => ["queue", "--source-id", sourceId, "--repo", wikiDir, "--json"],
+    },
+    {
+      name: "queue show --auto",
+      command: "queue show",
+      option: "--auto",
+      args: (wikiDir: string, sourceId: string) => ["queue", "show", sourceId, "--auto", "--repo", wikiDir, "--json"],
+    },
+    {
+      name: "queue show --limit",
+      command: "queue show",
+      option: "--limit",
+      args: (wikiDir: string, sourceId: string) => [
+        "queue",
+        "show",
+        sourceId,
+        "--limit",
+        "1",
+        "--repo",
+        wikiDir,
+        "--json",
+      ],
+    },
+    {
+      name: "queue show --source-id",
+      command: "queue show",
+      option: "--source-id",
+      args: (wikiDir: string, sourceId: string) => [
+        "queue",
+        "show",
+        sourceId,
+        "--source-id",
+        sourceId,
+        "--repo",
+        wikiDir,
+        "--json",
+      ],
+    },
+    {
+      name: "queue set-status --auto",
+      command: "queue set-status",
+      option: "--auto",
+      args: (wikiDir: string, sourceId: string) => [
+        "queue",
+        "set-status",
+        sourceId,
+        "ingesting",
+        "--auto",
+        "--repo",
+        wikiDir,
+        "--json",
+      ],
+    },
+    {
+      name: "queue set-status --limit",
+      command: "queue set-status",
+      option: "--limit",
+      args: (wikiDir: string, sourceId: string) => [
+        "queue",
+        "set-status",
+        sourceId,
+        "ingesting",
+        "--limit",
+        "1",
+        "--repo",
+        wikiDir,
+        "--json",
+      ],
+    },
+    {
+      name: "queue set-status --source-id",
+      command: "queue set-status",
+      option: "--source-id",
+      args: (wikiDir: string, sourceId: string) => [
+        "queue",
+        "set-status",
+        sourceId,
+        "ingesting",
+        "--source-id",
+        sourceId,
+        "--repo",
+        wikiDir,
+        "--json",
+      ],
+    },
+  ])("rejects ingest-only option $name outside queue ingest", async ({ args, command, option }) => {
+    await withTempWorkspace("llm-wiki-queue-ingest-only-options-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureTextSource(wikiDir, "Ingest Flag Guard", "alpha");
+
+      // Act
+      const result = await runCliBuffered(args(wikiDir, source.source_id));
+      const payload = parseJsonFailure<typeof command>(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload).toMatchObject({
+        ok: false,
+        command,
+        error: {
+          code: "QUEUE_INGEST_OPTION_INVALID",
+        },
+      });
+      expect(payload.issues[0]).toMatchObject({
+        path: option,
+      });
+    });
+  });
+
   it("lists queued sources in stable JSON with source paths, updated time, and status counts", async () => {
     await withTempWorkspace("llm-wiki-queue-list-json-", async (workspaceDir) => {
       // Arrange

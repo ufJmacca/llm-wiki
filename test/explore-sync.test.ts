@@ -503,10 +503,43 @@ describe("explore sync command", () => {
         "2026-06-23T09:15:00.000Z",
         "2026-06-23T10:10:00.000Z",
       );
+      const successfulAutoIngest = {
+        enabled: true,
+        attempt_count: 1,
+        last_attempt_at: "2026-06-23T10:09:00.000Z",
+        last_result: "ingested",
+        last_error_code: null,
+        last_error_message: null,
+      };
+      const blockedAutoIngest = {
+        enabled: true,
+        attempt_count: 2,
+        last_attempt_at: "2026-06-23T10:04:00.000Z",
+        last_result: "blocked",
+        last_error_code: "INGEST_VALIDATION_FAILED",
+        last_error_message:
+          "Validation failed while checking source text: PRIVATE RAW UPLOAD BODY api_key=sk-sync-leak token=sync-upload-token",
+      };
+      const safeBlockedAutoIngest = {
+        ...blockedAutoIngest,
+        last_error_message:
+          "Validation failed while checking source text: [raw upload content redacted] api_key=[redacted] token=[redacted]",
+      };
 
-      for (const source of [queued, ingesting, blocked, ingested]) {
-        await writeReviewSourceFixture(wikiDir, source);
-      }
+      await writeReviewSourceFixture(wikiDir, queued);
+      await writeReviewSourceFixture(wikiDir, ingesting);
+      await writeReviewSourceFixture(wikiDir, blocked, {
+        queue: {
+          auto_ingest: blockedAutoIngest,
+          raw_body: "PRIVATE RAW UPLOAD BODY api_key=sk-sync-leak",
+          upload_token: "sync-upload-token",
+        },
+        sourceCard: { auto_ingest: blockedAutoIngest },
+      });
+      await writeReviewSourceFixture(wikiDir, ingested, {
+        queue: { auto_ingest: successfulAutoIngest },
+        sourceCard: { auto_ingest: successfulAutoIngest },
+      });
       await writeCuratedPage(
         wikiDir,
         `curated/sources/${ingested.sourceId}.md`,
@@ -613,7 +646,14 @@ describe("explore sync command", () => {
         ].join("\n"),
       );
       await runCliBuffered(["lint", "--repo", wikiDir, "--fix", "--json"]);
-      await writeReviewSourceFixture(wikiDir, blocked, { sourceCard: { visibility: "public" } });
+      await writeReviewSourceFixture(wikiDir, blocked, {
+        queue: {
+          auto_ingest: blockedAutoIngest,
+          raw_body: "PRIVATE RAW UPLOAD BODY api_key=sk-sync-leak",
+          upload_token: "sync-upload-token",
+        },
+        sourceCard: { visibility: "public", auto_ingest: blockedAutoIngest },
+      });
 
       // Act
       const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "review", "--json"]);
@@ -706,6 +746,7 @@ describe("explore sync command", () => {
             visibility: "private",
             source_card_path: ingested.sourceCardPath,
             queue_path: ingested.queuePath,
+            auto_ingest: successfulAutoIngest,
           }),
           expect.objectContaining({
             title: "Sync Blocked",
@@ -715,6 +756,7 @@ describe("explore sync command", () => {
             visibility: "public",
             source_card_path: blocked.sourceCardPath,
             queue_path: blocked.queuePath,
+            auto_ingest: safeBlockedAutoIngest,
           }),
           expect.objectContaining({
             title: "Sync Ingesting",
@@ -768,11 +810,21 @@ describe("explore sync command", () => {
       expect(profileSummary).toContain("| Queue items | 4 |");
       expect(profileSummary).toContain("| Raw source cards | 4 |");
       expect(sourceQueue).toContain("| Total | 4 |");
-      expect(sourceQueue).toContain(`| ${blocked.sourceId} | Sync Blocked | blocked | url | public | ${blocked.sourceCardPath} | ${blocked.queuePath} | ${blocked.originalPath} |`);
+      expect(sourceQueue).toContain(`| ${ingested.sourceId} | Sync Ingested | ingested | text | private | ${ingested.sourceCardPath} | ${ingested.queuePath} | ingested | ${ingested.originalPath} |`);
+      expect(sourceQueue).toContain(`| ${blocked.sourceId} | Sync Blocked | blocked | url | public | ${blocked.sourceCardPath} | ${blocked.queuePath} | blocked - INGEST_VALIDATION_FAILED: ${safeBlockedAutoIngest.last_error_message} | ${blocked.originalPath} |`);
+      expect(JSON.stringify(sourceQueueFrontmatter)).toContain("[raw upload content redacted]");
+      expect(sourceQueue).toContain("[raw upload content redacted]");
+      expect(JSON.stringify(sourceQueueFrontmatter)).not.toContain("PRIVATE RAW UPLOAD BODY");
+      expect(sourceQueue).not.toContain("PRIVATE RAW UPLOAD BODY");
+      expect(JSON.stringify(sourceQueueFrontmatter)).not.toContain("sk-sync-leak");
+      expect(sourceQueue).not.toContain("sk-sync-leak");
+      expect(JSON.stringify(sourceQueueFrontmatter)).not.toContain("sync-upload-token");
+      expect(sourceQueue).not.toContain("sync-upload-token");
       expect(parseReviewJsonItemBlocks(sourceQueue)[0] ?? []).toContainEqual(
         expect.objectContaining({
           source_id: blocked.sourceId,
           title: "Sync Blocked",
+          auto_ingest: safeBlockedAutoIngest,
           source: expect.objectContaining({
             source_id: blocked.sourceId,
             title: "Sync Blocked",

@@ -63,7 +63,7 @@ export function registerQueueCommand(program: Command, io: CliIo): void {
     action: string | undefined,
     sourceId: string | undefined,
     status: string | undefined,
-    rawOptions: RawRuntimeCommandOptions | Command,
+    rawOptions: RawQueueCommandOptions | Command,
   ) => {
     const runtimeOptions = normalizeCommanderOptions(rawOptions);
 
@@ -224,7 +224,7 @@ function normalizeCommanderOptions(rawOptions: RawRuntimeCommandOptions | Comman
   return rawOptions as RawQueueCommandOptions;
 }
 
-function isCommanderCommand(value: RawRuntimeCommandOptions | Command): value is Command {
+function isCommanderCommand(value: RawQueueCommandOptions | Command): value is Command {
   return typeof (value as { opts?: unknown }).opts === "function";
 }
 
@@ -658,6 +658,12 @@ function formatHumanQueueIngest(data: QueueIngestData): string {
 
     if (result.error !== null) {
       lines.push(`Error: ${result.error.code}: ${result.error.message}`, `Hint: ${result.error.hint}`);
+      if (result.error.issues !== undefined && result.error.issues.length > 0) {
+        lines.push(
+          "Issues:",
+          ...result.error.issues.map((issue) => `- ${issue.code} (${issue.path}): ${issue.message}`),
+        );
+      }
     }
   }
 

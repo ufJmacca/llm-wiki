@@ -315,6 +315,7 @@ export async function syncQuartzContent(
   const selection = selectMarkdownForProfile(profile, scan.markdown, scan.rawOriginals);
   const warnings = await ensureQuartzContentIgnored(repoRoot);
   if (publicLike) {
+    await removeLocalDaemonRuntimeMetadata(repoRoot);
     await assertPublicSyncIsSafe(repoRoot, scan, profile, selection.markdown, selection.matchedMarkdown, {
       lintResult: options.lintResult,
       ignorePreviousPrivateQuartzContent: !preserveContentRoot,
@@ -428,6 +429,16 @@ export async function writeLocalDaemonRuntimeMetadata(
 }
 
 export async function removeLocalDaemonRuntimeMetadata(repoRoot: string): Promise<void> {
+  const validation = await validateTextFileWriteInsideRoot(repoRoot, QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH);
+  if (!validation.ok) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to remove local daemon runtime metadata.",
+      path: QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH,
+      hint: validation.error.hint,
+    });
+  }
+
   try {
     await rm(resolve(repoRoot, QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH), { force: true });
   } catch (error) {
@@ -3737,6 +3748,7 @@ function uploadFormComponentContent(): string {
       const result = autoIngestResult(autoIngest);
       const finalStatus = autoIngestFinalStatus(autoIngest, result);
       if (result === "ingested" || finalStatus === "ingested") return "";
+      if (finalStatus === "blocked") return "llm-wiki queue set-status " + data.source_id + " queued && llm-wiki ingest " + data.source_id + " --auto";
       return "llm-wiki ingest " + data.source_id + " --auto";
     };
     const successStatusMessage = (data) => {

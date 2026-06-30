@@ -357,6 +357,71 @@ describe("queue runtime status updates", () => {
     });
   });
 
+  it("initializes missing auto-ingest attempt count when a resumed source reaches a terminal status", async () => {
+    await withTempWorkspace("llm-wiki-queue-transition-auto-resumed-missing-metadata-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const ingestedSourceId = "src_2026_06_17_auto_000000000012";
+      const blockedSourceId = "src_2026_06_17_auto_000000000013";
+      await initializeWiki(wikiDir);
+      const ingestedFixture = await writeQueueFixture(wikiDir, ingestedSourceId, { status: "ingesting" });
+      const blockedFixture = await writeQueueFixture(wikiDir, blockedSourceId, { status: "ingesting" });
+      const { transitionQueueStatus } = await import("../src/runtime/queue.js");
+
+      // Act
+      const ingestedResult = await transitionQueueStatus(wikiDir, ingestedSourceId, "ingested", {
+        now: new Date("2026-06-17T12:35:00.000Z"),
+        command: "test resumed auto ingest success",
+        autoIngest: {
+          enabled: true,
+          result: "ingested",
+          errorCode: null,
+          errorMessage: null,
+        },
+      });
+      const blockedResult = await transitionQueueStatus(wikiDir, blockedSourceId, "blocked", {
+        now: new Date("2026-06-17T12:36:00.000Z"),
+        command: "test resumed auto ingest failure",
+        autoIngest: {
+          enabled: true,
+          result: "blocked",
+          errorCode: "AGENT_COMMAND_FAILED",
+          errorMessage: "Agent command failed.",
+        },
+      });
+
+      // Assert
+      expect(ingestedResult).toMatchObject({ ok: true, value: { status: "ingested" } });
+      expect(blockedResult).toMatchObject({ ok: true, value: { status: "blocked" } });
+      expect(JSON.parse(await readFile(ingestedFixture.queuePath, "utf8")).auto_ingest).toEqual({
+        enabled: true,
+        attempt_count: 1,
+        last_attempt_at: "2026-06-17T12:35:00.000Z",
+        last_result: "ingested",
+        last_error_code: null,
+        last_error_message: null,
+      });
+      expect(
+        parseSourceCardFrontmatter<{ auto_ingest: AutoIngestMetadata }>(
+          await readFile(ingestedFixture.sourceCardPath, "utf8"),
+        ).auto_ingest,
+      ).toEqual(JSON.parse(await readFile(ingestedFixture.queuePath, "utf8")).auto_ingest);
+      expect(JSON.parse(await readFile(blockedFixture.queuePath, "utf8")).auto_ingest).toEqual({
+        enabled: true,
+        attempt_count: 1,
+        last_attempt_at: "2026-06-17T12:36:00.000Z",
+        last_result: "blocked",
+        last_error_code: "AGENT_COMMAND_FAILED",
+        last_error_message: "Agent command failed.",
+      });
+      expect(
+        parseSourceCardFrontmatter<{ auto_ingest: AutoIngestMetadata }>(
+          await readFile(blockedFixture.sourceCardPath, "utf8"),
+        ).auto_ingest,
+      ).toEqual(JSON.parse(await readFile(blockedFixture.queuePath, "utf8")).auto_ingest);
+    });
+  });
+
   it("leaves manual setQueueStatus JSON compatible without adding auto-ingest metadata", async () => {
     await withTempWorkspace("llm-wiki-queue-transition-manual-compatible-", async (workspaceDir) => {
       // Arrange

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -149,6 +149,32 @@ describe("ingest repository lock", () => {
       });
       expect(new Date(observedMetadata[0].started_at).toISOString()).toBe(observedMetadata[0].started_at);
       await expect(pathExists(resolve(repoRoot, LOCK_RELATIVE_PATH))).resolves.toBe(false);
+    });
+  });
+
+  it.skipIf(process.platform === "win32")("refuses a symlinked lock directory before creating the lock", async () => {
+    await withTempWorkspace("llm-wiki-ingest-lock-symlinked-parent-", async (workspaceDir) => {
+      // Arrange
+      const repoRoot = resolve(workspaceDir, "wiki");
+      const outsideLocksDir = resolve(workspaceDir, "outside-locks");
+      await mkdir(resolve(repoRoot, ".llm-wiki/cache"), { recursive: true });
+      await mkdir(outsideLocksDir, { recursive: true });
+      await symlink(outsideLocksDir, resolve(repoRoot, ".llm-wiki/cache/locks"), "dir");
+      let callbackRan = false;
+
+      // Act
+      const result = withIngestLock(repoRoot, { label: "symlinked lock" }, async () => {
+        callbackRan = true;
+      });
+
+      // Assert
+      await expect(result).rejects.toMatchObject({
+        code: "INGEST_LOCK_PATH_UNSAFE",
+        path: ".llm-wiki/cache/locks",
+      });
+      await expect(result).rejects.toBeInstanceOf(RuntimeCommandError);
+      expect(callbackRan).toBe(false);
+      await expect(pathExists(resolve(outsideLocksDir, "ingest.lock"))).resolves.toBe(false);
     });
   });
 

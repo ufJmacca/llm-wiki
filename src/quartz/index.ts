@@ -3656,7 +3656,44 @@ function uploadFormComponentContent(): string {
         ["Browser guidance", browserGuidance],
       ]);
     };
+    const objectValue = (value) => value !== null && typeof value === "object" ? value : null;
+    const stringValue = (value) => typeof value === "string" ? value : "";
+    const autoIngestData = (data) => objectValue(data.auto_ingest);
+    const autoIngestResult = (autoIngest) => stringValue(autoIngest?.outcome) || stringValue(autoIngest?.status);
+    const autoIngestFinalStatus = (autoIngest, result) => {
+      const finalStatus = stringValue(autoIngest?.final_status);
+      if (finalStatus !== "") return finalStatus;
+      return ["queued", "ingesting", "ingested", "blocked"].includes(result) ? result : "";
+    };
+    const autoIngestError = (autoIngest) => objectValue(autoIngest?.error);
+    const autoIngestGuidance = (autoIngest) => {
+      const error = autoIngestError(autoIngest);
+      return stringValue(error?.hint) || stringValue(error?.message);
+    };
+    const manualRetryCommand = (data, autoIngest) => {
+      if (!data.source_id || autoIngest === null) return "";
+      const result = autoIngestResult(autoIngest);
+      const finalStatus = autoIngestFinalStatus(autoIngest, result);
+      if (result === "ingested" || finalStatus === "ingested") return "";
+      return "llm-wiki ingest " + data.source_id + " --auto";
+    };
     const successStatusMessage = (data) => {
+      const autoIngest = autoIngestData(data);
+      if (autoIngest !== null) {
+        const result = autoIngestResult(autoIngest);
+        const finalStatus = autoIngestFinalStatus(autoIngest, result);
+        if (result === "ingested") return "Auto-ingest completed.";
+        if (result === "blocked") return "Auto-ingest blocked.";
+        if (result === "deferred") return "Auto-ingest deferred.";
+        if (result === "skipped") {
+          return finalStatus === "queued" ? "Auto-ingest skipped; upload remains queued." : "Auto-ingest skipped.";
+        }
+        if (result === "queued") return "Auto-ingest did not start; upload remains queued.";
+        if (finalStatus === "ingested") return "Auto-ingest completed.";
+        if (finalStatus === "blocked") return "Auto-ingest blocked.";
+        if (finalStatus === "queued") return "Auto-ingest did not start; upload remains queued.";
+        if (result !== "") return "Auto-ingest result: " + result + ".";
+      }
       const uploadStatus = typeof data.status === "string" ? data.status : "";
       const queueStatus = typeof data.queue_status === "string" ? data.queue_status : "";
       if (uploadStatus === "duplicate") {
@@ -3767,6 +3804,12 @@ function uploadFormComponentContent(): string {
         }
 
         const data = body.data || {};
+        const autoIngest = autoIngestData(data);
+        const autoIngestResultValue = autoIngest === null ? "" : autoIngestResult(autoIngest);
+        const autoIngestFinalStatusValue = autoIngest === null
+          ? ""
+          : autoIngestFinalStatus(autoIngest, autoIngestResultValue);
+        const autoIngestErrorValue = autoIngestError(autoIngest);
         setStatus(successStatusMessage(data));
         showDetails([
           ["Upload status", data.status],
@@ -3777,7 +3820,13 @@ function uploadFormComponentContent(): string {
           ["Source card", data.source_card_path],
           ["Original", data.original_path],
           ["Ingest", data.source_id ? "llm-wiki ingest " + data.source_id : ""],
-          ["Auto ingest", daemon.auto_ingest_available === true && data.source_id ? "llm-wiki ingest " + data.source_id + " --auto" : ""],
+          ["Auto ingest", daemon.auto_ingest_available === true && data.source_id && autoIngest === null ? "llm-wiki ingest " + data.source_id + " --auto" : ""],
+          ["Auto-ingest result", autoIngestResultValue],
+          ["Auto-ingest final status", autoIngestFinalStatusValue],
+          ["Auto-ingest agent", autoIngest === null ? "" : autoIngest.agent],
+          ["Auto-ingest error code", autoIngestErrorValue?.code],
+          ["Auto-ingest guidance", autoIngestGuidance(autoIngest)],
+          ["Manual retry", manualRetryCommand(data, autoIngest)],
         ]);
       } catch (error) {
         showError({ code: "DAEMON_UNAVAILABLE", message: error instanceof Error ? error.message : String(error) }, "Upload daemon unavailable.");

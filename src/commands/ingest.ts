@@ -343,7 +343,7 @@ async function executeDefaultAutoIngest(repoRoot: string, sourceId: string): Pro
       issues: [],
     },
     queue: {
-      previous_status: result.previous_status ?? "queued",
+      previous_status: "ingesting",
       status: "ingested",
     },
   };

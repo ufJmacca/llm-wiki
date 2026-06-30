@@ -1,13 +1,16 @@
 import { createServer, type Server } from "node:http";
-import { readFile, readdir } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { resolve } from "node:path";
 
 import { parse } from "yaml";
 import { describe, expect, it, vi } from "vitest";
 
+import type { AutoIngestSourceResult } from "../src/autoIngest/index.js";
 import { startUploadDaemon, UPLOAD_TOKEN_HEADER, type UploadCommitter, type UploadDaemon } from "../src/daemon/index.js";
 import { syncQuartzContent } from "../src/quartz/index.js";
+import { showQueueSource, transitionQueueStatus, type AutoIngestMetadata, type QueueStatus } from "../src/runtime/queue.js";
+import { parseLogEntries } from "../src/scanner/index.js";
 import {
   parseInitJson,
   pathExists,
@@ -35,6 +38,7 @@ type UploadSuccessEnvelope = {
       attempted: boolean;
       ok: boolean;
     };
+    auto_ingest?: AutoIngestSourceResult;
   };
 };
 
@@ -56,12 +60,108 @@ type UploadFailureEnvelope = {
 
 const ONE_MIB = 1024 * 1024;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
+const TEST_AUTO_INGEST_NOW = "2999-06-30T10:00:00.000Z";
+const UPLOAD_SUCCESS_AGENT_SOURCE = [
+  `#!${process.execPath}`,
+  "const fs = require('node:fs');",
+  "const path = require('node:path');",
+  "const cwd = process.cwd();",
+  "const prompt = fs.readFileSync(0, 'utf8') || process.argv[process.argv.length - 1] || '';",
+  "const sourceId = prompt.match(/Source ID: (src_[^\\n]+)/)?.[1];",
+  "if (!sourceId) {",
+  "  console.error('missing source id');",
+  "  process.exit(2);",
+  "}",
+  "if (!prompt.includes('Queue status: ingesting')) {",
+  "  console.error('prompt was not rebuilt after queued -> ingesting');",
+  "  process.exit(3);",
+  "}",
+  "const title = 'Daemon Auto Ingest ' + sourceId;",
+  "const summary = [",
+  "  '---',",
+  "  'type: source_summary',",
+  "  'title: ' + JSON.stringify(title),",
+  "  'visibility: private',",
+  "  'source_ids:',",
+  "  '  - ' + sourceId,",
+  "  'source_id: ' + sourceId,",
+  "  '---',",
+  "  '',",
+  "  '# ' + title,",
+  "  '',",
+  "  'The daemon upload exercised the real shared worker.',",
+  "  '',",
+  "].join('\\n');",
+  "const index = [",
+  "  '---',",
+  "  'type: index',",
+  "  'title: Index',",
+  "  'visibility: private',",
+  "  'source_ids: []',",
+  "  '---',",
+  "  '',",
+  "  '# Index',",
+  "  '',",
+  "  '- [[sources/' + sourceId + '|' + title + ']]',",
+  "  '',",
+  "].join('\\n');",
+  "const existingLog = fs.readFileSync(path.join(cwd, 'curated/log.md'), 'utf8').trimEnd();",
+  "const logEntry = [",
+  "  '## [2999-06-30T09:59:00.000Z] ingest | ' + sourceId + ' | Agent ingest completed',",
+  "  '',",
+  "  '- actor: codex',",
+  "  '- command: \"llm-wiki ingest ' + sourceId + ' --auto\"',",
+  "  '- git_branch:',",
+  "  '- git_commit:',",
+  "  '- raw_source:',",
+  "  '- created:',",
+  "  '  - curated/sources/' + sourceId + '.md',",
+  "  '- updated:',",
+  "  '  - curated/index.md',",
+  "  '- contradictions:',",
+  "  '- follow_ups:',",
+  "  '',",
+  "].join('\\n');",
+  "fs.mkdirSync(path.join(cwd, 'curated/sources'), { recursive: true });",
+  "fs.writeFileSync(path.join(cwd, 'curated/sources', sourceId + '.md'), summary, 'utf8');",
+  "fs.writeFileSync(path.join(cwd, 'curated/index.md'), index, 'utf8');",
+  "fs.writeFileSync(path.join(cwd, 'curated/log.md'), existingLog + '\\n\\n' + logEntry, 'utf8');",
+  "",
+].join("\n");
 
 async function initializeWiki(targetDir: string): Promise<void> {
   const result = await runCliBuffered(["init", targetDir, "--no-git", "--json"]);
 
   expect(result.exitCode).toBe(0);
   parseInitJson(result.stdout);
+}
+
+async function configureDefaultLocalAgent(wikiDir: string, command: string): Promise<void> {
+  const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+  const config = await readFile(configPath, "utf8");
+  await writeFile(
+    configPath,
+    [
+      config.replace("default: generic", "default: codex").trimEnd(),
+      "agents:",
+      "  codex:",
+      "    type: local-exec",
+      `    command: ${JSON.stringify(command)}`,
+      "    timeout_seconds: 10",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+}
+
+async function createExecutable(workspaceDir: string, fileName: string, source: string): Promise<string> {
+  const binDir = resolve(workspaceDir, "bin");
+  const executablePath = resolve(binDir, fileName);
+  await mkdir(binDir, { recursive: true });
+  await writeFile(executablePath, source, "utf8");
+  await chmod(executablePath, 0o755);
+
+  return executablePath;
 }
 
 async function uploadForm(daemon: UploadDaemon, form: FormData): Promise<{ status: number; body: UploadSuccessEnvelope }> {
@@ -170,6 +270,133 @@ function urlUploadForm(url: string, title?: string): FormData {
   form.set("url", url);
 
   return form;
+}
+
+async function readQueueRecord(wikiDir: string, queuePath: string): Promise<{
+  status: QueueStatus;
+  auto_ingest?: AutoIngestMetadata;
+}> {
+  return JSON.parse(await readGeneratedFile(wikiDir, queuePath)) as {
+    status: QueueStatus;
+    auto_ingest?: AutoIngestMetadata;
+  };
+}
+
+async function transitionForTest(
+  wikiDir: string,
+  sourceId: string,
+  nextStatus: "ingesting" | "ingested" | "blocked",
+): Promise<void> {
+  const result = await transitionQueueStatus(wikiDir, sourceId, nextStatus, {
+    now: new Date("2999-06-30T12:00:00.000Z"),
+    command: `test transition ${sourceId} ${nextStatus}`,
+  });
+
+  expect(result.ok).toBe(true);
+}
+
+async function markDuplicateFixtureStatus(
+  wikiDir: string,
+  sourceId: string,
+  status: "ingesting" | "ingested" | "blocked",
+): Promise<void> {
+  await transitionForTest(wikiDir, sourceId, "ingesting");
+  if (status !== "ingesting") {
+    await transitionForTest(wikiDir, sourceId, status);
+  }
+}
+
+async function markAutoIngestedForTest(wikiDir: string, sourceId: string): Promise<AutoIngestMetadata> {
+  const started = await transitionQueueStatus(wikiDir, sourceId, "ingesting", {
+    now: new Date("2999-06-30T12:00:00.000Z"),
+    command: `auto-ingest test ${sourceId}`,
+    autoIngest: {
+      enabled: true,
+      result: "ingesting",
+      errorCode: null,
+      errorMessage: null,
+    },
+  });
+  expect(started.ok).toBe(true);
+
+  const completed = await transitionQueueStatus(wikiDir, sourceId, "ingested", {
+    now: new Date("2999-06-30T12:01:00.000Z"),
+    command: `auto-ingest test ${sourceId}`,
+    autoIngest: {
+      enabled: true,
+      result: "ingested",
+      errorCode: null,
+      errorMessage: null,
+    },
+  });
+  expect(completed.ok).toBe(true);
+
+  const shown = await showQueueSource(wikiDir, sourceId);
+  expect(shown.ok).toBe(true);
+  if (!shown.ok || shown.value.queue_record.auto_ingest === undefined) {
+    throw new Error(`Expected auto-ingest metadata for ${sourceId}.`);
+  }
+
+  return shown.value.queue_record.auto_ingest;
+}
+
+async function markAutoBlockedForTest(
+  wikiDir: string,
+  sourceId: string,
+  code: string,
+  message: string,
+): Promise<AutoIngestMetadata> {
+  const started = await transitionQueueStatus(wikiDir, sourceId, "ingesting", {
+    now: new Date("2999-06-30T12:00:00.000Z"),
+    command: `auto-ingest test ${sourceId}`,
+    autoIngest: {
+      enabled: true,
+      result: "ingesting",
+      errorCode: null,
+      errorMessage: null,
+    },
+  });
+  expect(started.ok).toBe(true);
+
+  const blocked = await transitionQueueStatus(wikiDir, sourceId, "blocked", {
+    now: new Date("2999-06-30T12:01:00.000Z"),
+    command: `auto-ingest test ${sourceId}`,
+    autoIngest: {
+      enabled: true,
+      result: "blocked",
+      errorCode: code,
+      errorMessage: message,
+    },
+  });
+  expect(blocked.ok).toBe(true);
+
+  const shown = await showQueueSource(wikiDir, sourceId);
+  expect(shown.ok).toBe(true);
+  if (!shown.ok || shown.value.queue_record.auto_ingest === undefined) {
+    throw new Error(`Expected blocked auto-ingest metadata for ${sourceId}.`);
+  }
+
+  return shown.value.queue_record.auto_ingest;
+}
+
+async function successfulAutoIngestResult(wikiDir: string, sourceId: string): Promise<AutoIngestSourceResult> {
+  const metadata = await markAutoIngestedForTest(wikiDir, sourceId);
+
+  return {
+    source_id: sourceId,
+    previous_status: "queued",
+    final_status: "ingested",
+    outcome: "ingested",
+    attempted: true,
+    agent: "test-agent",
+    applied_paths: [
+      `curated/sources/${sourceId}.md`,
+      "curated/index.md",
+      "curated/log.md",
+    ],
+    auto_ingest: metadata,
+    error: null,
+  };
 }
 
 function expectSafeFailureEnvelope(
@@ -594,6 +821,8 @@ describe("local upload daemon", () => {
         // Assert
         expect(firstUpload.status).toBe(201);
         expect(secondUpload.status).toBe(200);
+        expect(firstUpload.body.data).not.toHaveProperty("auto_ingest");
+        expect(secondUpload.body.data).not.toHaveProperty("auto_ingest");
         expect(firstUpload.body.data).toMatchObject({
           status: "added",
           title: "Upload Note",
@@ -627,6 +856,557 @@ describe("local upload daemon", () => {
         expect(afterDuplicate).toEqual(beforeDuplicate);
         expect((await readGeneratedFile(wikiDir, firstUpload.body.data.original_path)).replaceAll("\r\n", "\n")).toBe(text);
         await expectExplorerUploadProvenance(wikiDir, firstUpload, "text");
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("runs upload auto-ingest after raw commit for text, file, and URL captures without committing curated output", async () => {
+    await withTempWorkspace("llm-wiki-daemon-auto-ingest-success-", async (workspaceDir) => {
+      await withTextServer("Auto-ingest remote upload body.\n", async (url) => {
+        // Arrange
+        const wikiDir = resolve(workspaceDir, "wiki");
+        const events: string[] = [];
+        const commitUpload = vi.fn<UploadCommitter>(async (request) => {
+          events.push(`commit:${request.source_id}`);
+
+          return {
+            attempted: true,
+            ok: true,
+            committed_paths: request.paths,
+          };
+        });
+        const autoIngest = vi.fn(async (request: {
+          repoRoot: string;
+          source_id: string;
+          capture: { status: "added" | "duplicate" };
+          commit: { attempted: boolean; ok: boolean };
+        }) => {
+          events.push(`auto:${request.source_id}`);
+          expect(request.repoRoot).toBe(wikiDir);
+          expect(request.capture.status).toBe("added");
+          expect(request.commit).toMatchObject({
+            attempted: true,
+            ok: true,
+          });
+
+          return successfulAutoIngestResult(wikiDir, request.source_id);
+        });
+        await initializeWiki(wikiDir);
+        const daemon = await startUploadDaemon({
+          repoRoot: wikiDir,
+          port: 0,
+          commitUploads: true,
+          commitUpload,
+          autoIngest: {
+            enabled: true,
+            run: autoIngest,
+          },
+        });
+
+        try {
+          const uploads = [
+            () => uploadForm(daemon, textUploadForm("Auto Text", "Auto-ingest text upload body.\n")),
+            () => uploadForm(daemon, fileUploadForm("auto-file.md", "# Auto File\n", "text/markdown")),
+            () => uploadForm(daemon, urlUploadForm(url, "Auto URL")),
+          ];
+
+          // Act
+          const results = [];
+          for (const upload of uploads) {
+            results.push(await upload());
+          }
+
+          // Assert
+          expect(results).toHaveLength(3);
+          expect(commitUpload).toHaveBeenCalledTimes(3);
+          expect(autoIngest).toHaveBeenCalledTimes(3);
+          expect(events).toEqual(results.flatMap((upload) => [
+            `commit:${upload.body.data.source_id}`,
+            `auto:${upload.body.data.source_id}`,
+          ]));
+          for (const upload of results) {
+            expect(upload.status).toBe(201);
+            expect(upload.body.data).toMatchObject({
+              status: "added",
+              queue_status: "ingested",
+              commit: {
+                attempted: true,
+                ok: true,
+              },
+              auto_ingest: {
+                source_id: upload.body.data.source_id,
+                previous_status: "queued",
+                final_status: "ingested",
+                outcome: "ingested",
+                attempted: true,
+                agent: "test-agent",
+                error: null,
+              },
+            });
+            await expect(readQueueRecord(wikiDir, upload.body.data.queue_path)).resolves.toMatchObject({
+              status: "ingested",
+              auto_ingest: upload.body.data.auto_ingest?.auto_ingest,
+            });
+          }
+          for (const call of commitUpload.mock.calls) {
+            const request = call[0];
+            expect(request.paths).toEqual(expect.arrayContaining(["curated/log.md"]));
+            expect(request.paths).not.toContain("curated/index.md");
+            expect(request.paths).not.toContain(`curated/sources/${request.source_id}.md`);
+          }
+        } finally {
+          await daemon.close();
+        }
+      });
+    });
+  });
+
+  it("runs upload auto-ingest through the configured default local agent and shared worker", async () => {
+    await withTempWorkspace("llm-wiki-daemon-auto-ingest-default-agent-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const rawBody = "Auto-ingest with a configured default local agent.\n";
+      await initializeWiki(wikiDir);
+      const executablePath = await createExecutable(workspaceDir, "upload-success-agent", UPLOAD_SUCCESS_AGENT_SOURCE);
+      await configureDefaultLocalAgent(wikiDir, executablePath);
+      const daemon = await startUploadDaemon({
+        repoRoot: wikiDir,
+        port: 0,
+        autoIngest: {
+          enabled: true,
+          now: () => new Date(TEST_AUTO_INGEST_NOW),
+        },
+      });
+
+      try {
+        // Act
+        const upload = await uploadForm(daemon, textUploadForm("Default Agent Upload", rawBody));
+        const queueRecord = await readQueueRecord(wikiDir, upload.body.data.queue_path);
+        const sourceCard = parseSourceCardFrontmatter<{
+          source_id: string;
+          status: QueueStatus;
+          auto_ingest?: AutoIngestMetadata;
+        }>(await readGeneratedFile(wikiDir, upload.body.data.source_card_path));
+        const curatedSummary = await readGeneratedFile(
+          wikiDir,
+          `curated/sources/${upload.body.data.source_id}.md`,
+        );
+        const curatedIndex = await readGeneratedFile(wikiDir, "curated/index.md");
+        const runtimeLog = await readGeneratedFile(wikiDir, "curated/log.md");
+        const parsedLog = parseLogEntries({ path: "curated/log.md", content: runtimeLog });
+        const sourceLogEntries = parsedLog.entries.filter((entry) => entry.affectedId === upload.body.data.source_id);
+
+        // Assert
+        expect(upload.status).toBe(201);
+        expect(upload.body).toMatchObject({
+          ok: true,
+          data: {
+            status: "added",
+            queue_status: "ingested",
+            auto_ingest: {
+              source_id: upload.body.data.source_id,
+              previous_status: "queued",
+              final_status: "ingested",
+              outcome: "ingested",
+              attempted: true,
+              agent: "codex",
+              applied_paths: [
+                "curated/index.md",
+                "curated/log.md",
+                `curated/sources/${upload.body.data.source_id}.md`,
+              ],
+              auto_ingest: {
+                enabled: true,
+                attempt_count: 1,
+                last_attempt_at: TEST_AUTO_INGEST_NOW,
+                last_result: "ingested",
+                last_error_code: null,
+                last_error_message: null,
+              },
+              error: null,
+            },
+          },
+        });
+        expect(queueRecord).toMatchObject({
+          status: "ingested",
+          auto_ingest: upload.body.data.auto_ingest?.auto_ingest,
+        });
+        expect(sourceCard).toMatchObject({
+          source_id: upload.body.data.source_id,
+          status: "ingested",
+          auto_ingest: upload.body.data.auto_ingest?.auto_ingest,
+        });
+        expect(sourceCard.auto_ingest).toEqual(queueRecord.auto_ingest);
+        expect(curatedSummary).toContain(`source_id: ${upload.body.data.source_id}`);
+        expect(curatedSummary).toContain("The daemon upload exercised the real shared worker.");
+        expect(curatedIndex).toContain(`sources/${upload.body.data.source_id}`);
+        expect((await readGeneratedFile(wikiDir, upload.body.data.original_path)).replaceAll("\r\n", "\n")).toBe(rawBody);
+        expect(parsedLog.issues).toEqual([]);
+        expect(sourceLogEntries.map((entry) => entry.title)).toEqual([
+          "Default Agent Upload",
+          "Status changed to ingesting",
+          "Agent ingest completed",
+          "Status changed to ingested",
+        ]);
+        expect(sourceLogEntries.find((entry) => entry.title === "Status changed to ingesting")?.body).toContain(
+          "- status: queued -> ingesting",
+        );
+        expect(sourceLogEntries.find((entry) => entry.title === "Status changed to ingested")?.body).toContain(
+          "- status: ingesting -> ingested",
+        );
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("returns a safe skipped auto-ingest result when the default agent is missing after capture", async () => {
+    await withTempWorkspace("llm-wiki-daemon-auto-ingest-missing-agent-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({
+        repoRoot: wikiDir,
+        port: 0,
+        autoIngest: {
+          enabled: true,
+        },
+      });
+
+      try {
+        // Act
+        const upload = await uploadForm(daemon, textUploadForm("Missing Agent", "Missing agent capture body.\n"));
+        const queueRecord = await readQueueRecord(wikiDir, upload.body.data.queue_path);
+
+        // Assert
+        expect(upload.status).toBe(201);
+        expect(upload.body).toMatchObject({
+          ok: true,
+          data: {
+            status: "added",
+            queue_status: "queued",
+            auto_ingest: {
+              source_id: upload.body.data.source_id,
+              previous_status: "queued",
+              final_status: "queued",
+              outcome: "skipped",
+              attempted: false,
+              agent: null,
+              applied_paths: [],
+              auto_ingest: null,
+              error: {
+                code: "AGENT_CONFIG_MISSING",
+                path: ".llm-wiki/config.yml:agents.generic",
+              },
+            },
+          },
+        });
+        expect(queueRecord).toMatchObject({
+          status: "queued",
+        });
+        expect(queueRecord).not.toHaveProperty("auto_ingest");
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("re-reads queue status when upload auto-ingest throws after starting an attempt", async () => {
+    await withTempWorkspace("llm-wiki-daemon-auto-ingest-thrown-after-start-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const autoIngest = vi.fn(async (request: { source_id: string }): Promise<AutoIngestSourceResult> => {
+        const started = await transitionQueueStatus(wikiDir, request.source_id, "ingesting", {
+          now: new Date("2999-06-30T12:00:00.000Z"),
+          command: `auto-ingest test ${request.source_id}`,
+          autoIngest: {
+            enabled: true,
+            result: "ingesting",
+            errorCode: null,
+            errorMessage: null,
+          },
+        });
+        expect(started.ok).toBe(true);
+
+        throw new Error("auto-ingest failed after start transition");
+      });
+      const daemon = await startUploadDaemon({
+        repoRoot: wikiDir,
+        port: 0,
+        autoIngest: {
+          enabled: true,
+          run: autoIngest,
+        },
+      });
+
+      try {
+        // Act
+        const upload = await uploadForm(
+          daemon,
+          textUploadForm("Thrown After Start", "Auto-ingest throw after start body.\n"),
+        );
+        const queueRecord = await readQueueRecord(wikiDir, upload.body.data.queue_path);
+
+        // Assert
+        expect(upload.status).toBe(201);
+        expect(upload.body).toMatchObject({
+          ok: true,
+          data: {
+            status: "added",
+            queue_status: "ingesting",
+            auto_ingest: {
+              source_id: upload.body.data.source_id,
+              previous_status: "queued",
+              final_status: "ingesting",
+              outcome: "skipped",
+              applied_paths: [],
+              auto_ingest: queueRecord.auto_ingest,
+              error: {
+                code: "AUTO_INGEST_FAILED",
+              },
+            },
+          },
+        });
+        expect(queueRecord).toMatchObject({
+          status: "ingesting",
+          auto_ingest: {
+            enabled: true,
+            attempt_count: 1,
+            last_result: "ingesting",
+            last_error_code: null,
+            last_error_message: null,
+          },
+        });
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it.each([
+    {
+      name: "agent failure",
+      outcome: "blocked",
+      finalStatus: "blocked",
+      code: "AGENT_COMMAND_FAILED",
+    },
+    {
+      name: "validation failure",
+      outcome: "blocked",
+      finalStatus: "blocked",
+      code: "INGEST_VALIDATION_FAILED",
+    },
+    {
+      name: "busy ingest lock",
+      outcome: "deferred",
+      finalStatus: "queued",
+      code: "INGEST_LOCK_BUSY",
+    },
+  ] as const)("keeps upload success and raw capture artifacts when auto-ingest reports $name", async (scenario) => {
+    await withTempWorkspace(`llm-wiki-daemon-auto-ingest-${scenario.code.toLowerCase()}-`, async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const rawBody = `Auto-ingest ${scenario.name} raw body.\n`;
+      await initializeWiki(wikiDir);
+      const autoIngest = vi.fn(async (request: { source_id: string }): Promise<AutoIngestSourceResult> => {
+        const error = {
+          code: scenario.code,
+          message: `${scenario.name} without raw rollback`,
+          path: `raw/queue/${request.source_id}.json`,
+          hint: "Review the auto-ingest failure and retry manually.",
+        };
+        const metadata = scenario.finalStatus === "blocked"
+          ? await markAutoBlockedForTest(wikiDir, request.source_id, scenario.code, error.message)
+          : null;
+
+        return {
+          source_id: request.source_id,
+          previous_status: "queued",
+          final_status: scenario.finalStatus,
+          outcome: scenario.outcome,
+          attempted: scenario.finalStatus === "blocked",
+          agent: "test-agent",
+          applied_paths: [],
+          auto_ingest: metadata,
+          error,
+        };
+      });
+      const daemon = await startUploadDaemon({
+        repoRoot: wikiDir,
+        port: 0,
+        autoIngest: {
+          enabled: true,
+          run: autoIngest,
+        },
+      });
+
+      try {
+        // Act
+        const upload = await uploadForm(daemon, textUploadForm(`Auto ${scenario.name}`, rawBody));
+        const original = await readGeneratedFile(wikiDir, upload.body.data.original_path);
+        const queueRecord = await readQueueRecord(wikiDir, upload.body.data.queue_path);
+
+        // Assert
+        expect(upload.status).toBe(201);
+        expect(upload.body).toMatchObject({
+          ok: true,
+          data: {
+            status: "added",
+            queue_status: scenario.finalStatus,
+            auto_ingest: {
+              source_id: upload.body.data.source_id,
+              previous_status: "queued",
+              final_status: scenario.finalStatus,
+              outcome: scenario.outcome,
+              applied_paths: [],
+              error: {
+                code: scenario.code,
+              },
+            },
+          },
+        });
+        expect(original.replaceAll("\r\n", "\n")).toBe(rawBody);
+        expect(queueRecord.status).toBe(scenario.finalStatus);
+        if (scenario.finalStatus === "queued") {
+          expect(queueRecord).not.toHaveProperty("auto_ingest");
+        } else {
+          expect(queueRecord.auto_ingest).toMatchObject({
+            attempt_count: 1,
+            last_result: "blocked",
+            last_error_code: scenario.code,
+          });
+        }
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("auto-ingests an existing queued duplicate through the normal queued status transitions", async () => {
+    await withTempWorkspace("llm-wiki-daemon-auto-ingest-queued-duplicate-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const text = "Queued duplicate auto-ingest body.\n";
+      await initializeWiki(wikiDir);
+      const captureDaemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+      const firstUpload = await uploadForm(captureDaemon, textUploadForm("Queued Duplicate", text));
+      await captureDaemon.close();
+      const autoIngest = vi.fn(async (request: {
+        source_id: string;
+        capture: { status: "added" | "duplicate" };
+      }) => {
+        expect(request.capture.status).toBe("duplicate");
+
+        return successfulAutoIngestResult(wikiDir, request.source_id);
+      });
+      const daemon = await startUploadDaemon({
+        repoRoot: wikiDir,
+        port: 0,
+        autoIngest: {
+          enabled: true,
+          run: autoIngest,
+        },
+      });
+
+      try {
+        // Act
+        const duplicate = await uploadForm(daemon, textUploadForm("Queued Duplicate", text));
+        const queueRecord = await readQueueRecord(wikiDir, firstUpload.body.data.queue_path);
+
+        // Assert
+        expect(duplicate.status).toBe(200);
+        expect(duplicate.body.data).toMatchObject({
+          status: "duplicate",
+          source_id: firstUpload.body.data.source_id,
+          queue_status: "ingested",
+          created_paths: [],
+          auto_ingest: {
+            source_id: firstUpload.body.data.source_id,
+            previous_status: "queued",
+            final_status: "ingested",
+            outcome: "ingested",
+            attempted: true,
+          },
+        });
+        expect(autoIngest).toHaveBeenCalledTimes(1);
+        expect(queueRecord).toMatchObject({
+          status: "ingested",
+          auto_ingest: duplicate.body.data.auto_ingest?.auto_ingest,
+        });
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it.each([
+    {
+      status: "ingested",
+      outcome: "skipped",
+      expectedHint: "already ingested",
+    },
+    {
+      status: "blocked",
+      outcome: "skipped",
+      expectedHint: "manual retry",
+    },
+    {
+      status: "ingesting",
+      outcome: "deferred",
+      expectedHint: "already processing",
+    },
+  ] as const)("skips duplicate $status sources without starting a parallel auto-ingest attempt", async (scenario) => {
+    await withTempWorkspace(`llm-wiki-daemon-auto-ingest-${scenario.status}-duplicate-`, async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const text = `Duplicate ${scenario.status} body.\n`;
+      await initializeWiki(wikiDir);
+      const captureDaemon = await startUploadDaemon({ repoRoot: wikiDir, port: 0 });
+      const firstUpload = await uploadForm(captureDaemon, textUploadForm(`Duplicate ${scenario.status}`, text));
+      await captureDaemon.close();
+      await markDuplicateFixtureStatus(wikiDir, firstUpload.body.data.source_id, scenario.status);
+      const beforeDuplicate = await readTreeSnapshot(wikiDir);
+      const autoIngest = vi.fn(async () => successfulAutoIngestResult(wikiDir, firstUpload.body.data.source_id));
+      const daemon = await startUploadDaemon({
+        repoRoot: wikiDir,
+        port: 0,
+        autoIngest: {
+          enabled: true,
+          run: autoIngest,
+        },
+      });
+
+      try {
+        // Act
+        const duplicate = await uploadForm(daemon, textUploadForm(`Duplicate ${scenario.status}`, text));
+        const afterDuplicate = await readTreeSnapshot(wikiDir);
+
+        // Assert
+        expect(duplicate.status).toBe(200);
+        expect(duplicate.body.data).toMatchObject({
+          status: "duplicate",
+          source_id: firstUpload.body.data.source_id,
+          queue_status: scenario.status,
+          created_paths: [],
+          auto_ingest: {
+            source_id: firstUpload.body.data.source_id,
+            previous_status: scenario.status,
+            final_status: scenario.status,
+            outcome: scenario.outcome,
+            attempted: false,
+            agent: null,
+            applied_paths: [],
+            error: {
+              code: "AUTO_INGEST_SOURCE_NOT_ELIGIBLE",
+            },
+          },
+        });
+        expect(duplicate.body.data.auto_ingest?.error?.hint).toContain(scenario.expectedHint);
+        expect(autoIngest).not.toHaveBeenCalled();
+        expect(afterDuplicate).toEqual(beforeDuplicate);
       } finally {
         await daemon.close();
       }

@@ -233,6 +233,14 @@ async function runExploreServeCommand(rawOptions: RawExploreServeOptions, io: Cl
         repoRoot: resolvedRepo.value.rootDir,
         port: normalizeDaemonPort(rawOptions.daemonPort),
         commitUploads: rawOptions.commitUploads === true,
+        ...(autoIngestUploads
+          ? {
+              autoIngest: {
+                enabled: true,
+                command: "llm-wiki explore serve --with-daemon --auto-ingest-uploads upload",
+              } as const,
+            }
+          : {}),
       });
     }
 

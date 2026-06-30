@@ -78,6 +78,15 @@ export type RuntimeLogEntry = {
   body: string;
 };
 
+export type QueueAutoIngestMetadata = {
+  enabled: boolean;
+  attempt_count: number;
+  last_attempt_at: string;
+  last_result: string;
+  last_error_code: string | null;
+  last_error_message: string | null;
+};
+
 export type RuntimeLogScan = {
   entries: RuntimeLogEntry[];
   issues: ScannerIssue[];
@@ -97,6 +106,7 @@ export type QueueItem = {
   upload_session_id?: string;
   uploaded_via?: string;
   status: "queued" | "ingesting" | "ingested" | "blocked";
+  auto_ingest?: QueueAutoIngestMetadata;
   path: string;
   original_path: string;
   [key: string]: unknown;

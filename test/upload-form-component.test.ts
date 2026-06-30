@@ -290,6 +290,159 @@ describe("generated LlmWikiUploadForm component", () => {
     expect(detailValue(form.details, "Auto ingest")).toBe(scenario.expectedAutoCommand);
   });
 
+  it.each([
+    {
+      name: "ingested status alias",
+      queueStatus: "ingested",
+      autoIngest: {
+        status: "ingested",
+        final_status: "ingested",
+        attempted: true,
+        agent: "test-agent",
+        error: null,
+      },
+      expectedStatus: "Auto-ingest completed.",
+      expectedResult: "ingested",
+      expectedFinalStatus: "ingested",
+      expectedRetry: null,
+      expectedGuidance: null,
+    },
+    {
+      name: "blocked outcome",
+      queueStatus: "blocked",
+      autoIngest: {
+        outcome: "blocked",
+        final_status: "blocked",
+        attempted: true,
+        agent: "test-agent",
+        error: {
+          code: "INGEST_VALIDATION_FAILED",
+          message: "Validated ingest did not produce curated output.",
+          path: "raw/queue/src_2026_06_24_upload_abcdef123456.json",
+          hint: "Review the blocked source, then retry auto-ingest.",
+        },
+      },
+      expectedStatus: "Auto-ingest blocked.",
+      expectedResult: "blocked",
+      expectedFinalStatus: "blocked",
+      expectedRetry: "llm-wiki queue set-status src_2026_06_24_upload_abcdef123456 queued && llm-wiki ingest src_2026_06_24_upload_abcdef123456 --auto",
+      expectedGuidance: "Review the blocked source, then retry auto-ingest.",
+    },
+    {
+      name: "queued status alias",
+      queueStatus: "queued",
+      autoIngest: {
+        status: "queued",
+        final_status: "queued",
+        attempted: false,
+        agent: null,
+        error: {
+          code: "AGENT_CONFIG_MISSING",
+          message: "No default auto-ingest agent is configured.",
+          path: ".llm-wiki/config.yml:agents.generic",
+          hint: "Configure agent.default before retrying auto-ingest.",
+        },
+      },
+      expectedStatus: "Auto-ingest did not start; upload remains queued.",
+      expectedResult: "queued",
+      expectedFinalStatus: "queued",
+      expectedRetry: "llm-wiki ingest src_2026_06_24_upload_abcdef123456 --auto",
+      expectedGuidance: "Configure agent.default before retrying auto-ingest.",
+    },
+    {
+      name: "skipped outcome",
+      queueStatus: "queued",
+      autoIngest: {
+        outcome: "skipped",
+        final_status: "queued",
+        attempted: false,
+        agent: null,
+        error: {
+          code: "AUTO_INGEST_SOURCE_NOT_ELIGIBLE",
+          message: "Upload-triggered auto-ingest only processes queued sources.",
+          path: "raw/queue/src_2026_06_24_upload_abcdef123456.json",
+          hint: "Fix the queue state, then retry auto-ingest.",
+        },
+      },
+      expectedStatus: "Auto-ingest skipped; upload remains queued.",
+      expectedResult: "skipped",
+      expectedFinalStatus: "queued",
+      expectedRetry: "llm-wiki ingest src_2026_06_24_upload_abcdef123456 --auto",
+      expectedGuidance: "Fix the queue state, then retry auto-ingest.",
+    },
+    {
+      name: "duplicate skipped already ingested outcome",
+      queueStatus: "ingested",
+      autoIngest: {
+        outcome: "skipped",
+        final_status: "ingested",
+        attempted: false,
+        agent: null,
+        error: {
+          code: "AUTO_INGEST_SOURCE_NOT_ELIGIBLE",
+          message: "Upload-triggered auto-ingest only processes queued sources; current status is ingested.",
+          path: "raw/queue/src_2026_06_24_upload_abcdef123456.json",
+          hint: "This source is already ingested; upload-triggered auto-ingest was skipped.",
+        },
+      },
+      expectedStatus: "Auto-ingest skipped.",
+      expectedResult: "skipped",
+      expectedFinalStatus: "ingested",
+      expectedRetry: null,
+      expectedGuidance: "This source is already ingested; upload-triggered auto-ingest was skipped.",
+    },
+    {
+      name: "deferred outcome",
+      queueStatus: "queued",
+      autoIngest: {
+        outcome: "deferred",
+        final_status: "queued",
+        attempted: false,
+        agent: "test-agent",
+        error: {
+          code: "INGEST_LOCK_BUSY",
+          message: "Another ingest worker is already mutating this repository.",
+          path: ".llm-wiki/locks/ingest",
+          hint: "Wait for the active ingest worker to finish, then retry auto-ingest.",
+        },
+      },
+      expectedStatus: "Auto-ingest deferred.",
+      expectedResult: "deferred",
+      expectedFinalStatus: "queued",
+      expectedRetry: "llm-wiki ingest src_2026_06_24_upload_abcdef123456 --auto",
+      expectedGuidance: "Wait for the active ingest worker to finish, then retry auto-ingest.",
+    },
+  ])("renders final auto-ingest details for $name without polling", async (scenario) => {
+    // Arrange
+    const metadata = enabledMetadata({ auto_ingest_available: true });
+    const fetchMock = stubFetch(async (input) =>
+      String(input) === metadataPath
+        ? jsonResponse(metadata)
+        : uploadAutoIngestResponse(scenario.queueStatus, scenario.autoIngest)
+    );
+    const form = renderUploadForm();
+    await executeGeneratedUploadFormScript();
+    await waitFor(() => expect(form.status.textContent).toBe("Local upload daemon is ready."));
+    selectMode(form, "text");
+    form.titleInput.value = "Uploaded Research";
+    form.textInput.value = "Private body that must not appear in the UI.\n";
+
+    // Act
+    submit(form);
+
+    // Assert
+    await waitFor(() => expect(form.status.textContent).toBe(scenario.expectedStatus));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(detailValue(form.details, "Queue status")).toBe(scenario.queueStatus);
+    expect(detailValue(form.details, "Auto-ingest result")).toBe(scenario.expectedResult);
+    expect(detailValue(form.details, "Auto-ingest final status")).toBe(scenario.expectedFinalStatus);
+    expect(detailValue(form.details, "Manual retry")).toBe(scenario.expectedRetry);
+    expect(detailValue(form.details, "Auto-ingest guidance")).toBe(scenario.expectedGuidance);
+    expect(form.root.textContent).not.toContain("Private body that must not appear in the UI.");
+    expect(form.root.textContent).not.toContain("PRIVATE RAW RESPONSE BODY");
+    expect(form.root.textContent).not.toContain("secret-token-from-response");
+  });
+
   it("posts file, text, and URL uploads through generated metadata and refreshes review queue pages", async () => {
     await withTempWorkspace("llm-wiki-upload-form-live-daemon-", async (workspaceDir) => {
       await withTextServer("Remote browser upload body.\n", async (remoteUrl) => {
@@ -874,6 +1027,43 @@ function uploadDuplicateResponse(): Response {
       },
     },
   });
+}
+
+function uploadAutoIngestResponse(queueStatus: string, autoIngest: Record<string, unknown>): Response {
+  return jsonResponse({
+    ok: true,
+    data: {
+      status: "added",
+      title: "Uploaded Research",
+      source_id: "src_2026_06_24_upload_abcdef123456",
+      source_kind: "text",
+      visibility: "private",
+      queue_status: queueStatus,
+      queue_path: "raw/queue/src_2026_06_24_upload_abcdef123456.json",
+      source_card_path: "raw/inputs/2026/06/upload/_source.md",
+      original_path: "raw/inputs/2026/06/upload/original.md",
+      raw_upload_body: "PRIVATE RAW RESPONSE BODY",
+      upload_token: "secret-token-from-response",
+      created_paths: [
+        "raw/inputs/2026/06/upload/original.md",
+        "raw/inputs/2026/06/upload/_source.md",
+        "raw/queue/src_2026_06_24_upload_abcdef123456.json",
+      ],
+      commit: {
+        attempted: false,
+        ok: true,
+      },
+      auto_ingest: {
+        source_id: "src_2026_06_24_upload_abcdef123456",
+        previous_status: "queued",
+        applied_paths: [],
+        auto_ingest: null,
+        raw_upload_body: "PRIVATE RAW RESPONSE BODY",
+        upload_token: "secret-token-from-response",
+        ...autoIngest,
+      },
+    },
+  }, 201);
 }
 
 function stubFetch(implementation: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>): FetchMock {

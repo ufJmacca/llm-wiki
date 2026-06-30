@@ -503,10 +503,43 @@ describe("explore sync command", () => {
         "2026-06-23T09:15:00.000Z",
         "2026-06-23T10:10:00.000Z",
       );
+      const successfulAutoIngest = {
+        enabled: true,
+        attempt_count: 1,
+        last_attempt_at: "2026-06-23T10:09:00.000Z",
+        last_result: "ingested",
+        last_error_code: null,
+        last_error_message: null,
+      };
+      const blockedAutoIngest = {
+        enabled: true,
+        attempt_count: 2,
+        last_attempt_at: "2026-06-23T10:04:00.000Z",
+        last_result: "blocked",
+        last_error_code: "INGEST_VALIDATION_FAILED",
+        last_error_message:
+          "Validation failed while checking source text: PRIVATE RAW UPLOAD BODY api_key=sk-sync-leak token=sync-upload-token",
+      };
+      const safeBlockedAutoIngest = {
+        ...blockedAutoIngest,
+        last_error_message:
+          "Validation failed while checking source text: [raw upload content redacted] api_key=[redacted] token=[redacted]",
+      };
 
-      for (const source of [queued, ingesting, blocked, ingested]) {
-        await writeReviewSourceFixture(wikiDir, source);
-      }
+      await writeReviewSourceFixture(wikiDir, queued);
+      await writeReviewSourceFixture(wikiDir, ingesting);
+      await writeReviewSourceFixture(wikiDir, blocked, {
+        queue: {
+          auto_ingest: blockedAutoIngest,
+          raw_body: "PRIVATE RAW UPLOAD BODY api_key=sk-sync-leak",
+          upload_token: "sync-upload-token",
+        },
+        sourceCard: { auto_ingest: blockedAutoIngest },
+      });
+      await writeReviewSourceFixture(wikiDir, ingested, {
+        queue: { auto_ingest: successfulAutoIngest },
+        sourceCard: { auto_ingest: successfulAutoIngest },
+      });
       await writeCuratedPage(
         wikiDir,
         `curated/sources/${ingested.sourceId}.md`,
@@ -613,7 +646,14 @@ describe("explore sync command", () => {
         ].join("\n"),
       );
       await runCliBuffered(["lint", "--repo", wikiDir, "--fix", "--json"]);
-      await writeReviewSourceFixture(wikiDir, blocked, { sourceCard: { visibility: "public" } });
+      await writeReviewSourceFixture(wikiDir, blocked, {
+        queue: {
+          auto_ingest: blockedAutoIngest,
+          raw_body: "PRIVATE RAW UPLOAD BODY api_key=sk-sync-leak",
+          upload_token: "sync-upload-token",
+        },
+        sourceCard: { visibility: "public", auto_ingest: blockedAutoIngest },
+      });
 
       // Act
       const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", "review", "--json"]);
@@ -706,6 +746,7 @@ describe("explore sync command", () => {
             visibility: "private",
             source_card_path: ingested.sourceCardPath,
             queue_path: ingested.queuePath,
+            auto_ingest: successfulAutoIngest,
           }),
           expect.objectContaining({
             title: "Sync Blocked",
@@ -715,6 +756,7 @@ describe("explore sync command", () => {
             visibility: "public",
             source_card_path: blocked.sourceCardPath,
             queue_path: blocked.queuePath,
+            auto_ingest: safeBlockedAutoIngest,
           }),
           expect.objectContaining({
             title: "Sync Ingesting",
@@ -768,11 +810,21 @@ describe("explore sync command", () => {
       expect(profileSummary).toContain("| Queue items | 4 |");
       expect(profileSummary).toContain("| Raw source cards | 4 |");
       expect(sourceQueue).toContain("| Total | 4 |");
-      expect(sourceQueue).toContain(`| ${blocked.sourceId} | Sync Blocked | blocked | url | public | ${blocked.sourceCardPath} | ${blocked.queuePath} | ${blocked.originalPath} |`);
+      expect(sourceQueue).toContain(`| ${ingested.sourceId} | Sync Ingested | ingested | text | private | ${ingested.sourceCardPath} | ${ingested.queuePath} | ingested | ${ingested.originalPath} |`);
+      expect(sourceQueue).toContain(`| ${blocked.sourceId} | Sync Blocked | blocked | url | public | ${blocked.sourceCardPath} | ${blocked.queuePath} | blocked - INGEST_VALIDATION_FAILED: ${safeBlockedAutoIngest.last_error_message} | ${blocked.originalPath} |`);
+      expect(JSON.stringify(sourceQueueFrontmatter)).toContain("[raw upload content redacted]");
+      expect(sourceQueue).toContain("[raw upload content redacted]");
+      expect(JSON.stringify(sourceQueueFrontmatter)).not.toContain("PRIVATE RAW UPLOAD BODY");
+      expect(sourceQueue).not.toContain("PRIVATE RAW UPLOAD BODY");
+      expect(JSON.stringify(sourceQueueFrontmatter)).not.toContain("sk-sync-leak");
+      expect(sourceQueue).not.toContain("sk-sync-leak");
+      expect(JSON.stringify(sourceQueueFrontmatter)).not.toContain("sync-upload-token");
+      expect(sourceQueue).not.toContain("sync-upload-token");
       expect(parseReviewJsonItemBlocks(sourceQueue)[0] ?? []).toContainEqual(
         expect.objectContaining({
           source_id: blocked.sourceId,
           title: "Sync Blocked",
+          auto_ingest: safeBlockedAutoIngest,
           source: expect.objectContaining({
             source_id: blocked.sourceId,
             title: "Sync Blocked",
@@ -1965,6 +2017,26 @@ visibility:
       ]);
       expect(addResult.exitCode).toBe(0);
       const capture = parseSourceCapture(addResult.stdout);
+      const autoIngestSource = reviewSourceFixture(
+        "src_2026_06_23_public_auto_ingest_111111",
+        "Public Sync Auto Ingest Fixture",
+        "blocked",
+        "text",
+        "2026-06-23T11:00:00.000Z",
+        "2026-06-23T11:01:00.000Z",
+      );
+      const autoIngestMetadata = {
+        enabled: true,
+        attempt_count: 1,
+        last_attempt_at: "2026-06-23T11:01:00.000Z",
+        last_result: "blocked",
+        last_error_code: "INGEST_VALIDATION_FAILED",
+        last_error_message: "Validation failed without exposing raw source text.",
+      };
+      await writeReviewSourceFixture(wikiDir, autoIngestSource, {
+        queue: { auto_ingest: autoIngestMetadata },
+        sourceCard: { auto_ingest: autoIngestMetadata },
+      });
       await makeDefaultCuratedPagesPublic(wikiDir);
       await prepareGitHubPagesSyncProfile(wikiDir);
       await writeCuratedPage(
@@ -1992,6 +2064,25 @@ visibility:
       const publicLikeProfiles = ["public", "github-pages"] as const;
 
       for (const profile of publicLikeProfiles) {
+        const staleRuntimeMetadataPath = "quartz/content/_llm-wiki/runtime/local-daemon.json";
+        await mkdir(resolve(wikiDir, "quartz/content/_llm-wiki/runtime"), { recursive: true });
+        await writeFile(
+          resolve(wikiDir, staleRuntimeMetadataPath),
+          JSON.stringify(
+            {
+              enabled: true,
+              url: "http://127.0.0.1:32123",
+              upload_path: "/api/raw-upload",
+              token_header: "x-llm-wiki-upload-token",
+              upload_token: "secret-token-that-must-not-be-published",
+              auto_ingest_available: true,
+            },
+            null,
+            2,
+          ) + "\n",
+          "utf8",
+        );
+
         // Act
         const result = await runCliBuffered(["explore", "sync", "--repo", wikiDir, "--profile", profile, "--json"]);
         const payload = parseExploreSync(result.stdout);
@@ -2015,6 +2106,10 @@ visibility:
         expect(syncedPaths).not.toContain(`quartz/content/${capture.source.source_card_path}`);
         expect(syncedPaths).not.toContain(`quartz/content/${capture.source.original_path}`);
         expect(syncedPaths).not.toContain(`quartz/content/${capture.source.queue_path}`);
+        expect(syncedPaths).not.toContain(`quartz/content/${autoIngestSource.sourceCardPath}`);
+        expect(syncedPaths).not.toContain(`quartz/content/${autoIngestSource.originalPath}`);
+        expect(syncedPaths).not.toContain(`quartz/content/${autoIngestSource.queuePath}`);
+        expect(syncedPaths).not.toContain(staleRuntimeMetadataPath);
         expect(syncedPaths.some((path) => path.startsWith("quartz/content/_llm-wiki/upload"))).toBe(false);
         expect(syncedPaths.some((path) => path.startsWith("quartz/content/_llm-wiki/review/"))).toBe(false);
         expect(syncedPaths.some((path) => path.startsWith("quartz/content/_llm-wiki/runtime/"))).toBe(false);
@@ -2022,15 +2117,28 @@ visibility:
         expect(payload.data.generated_paths.some((path) => path.startsWith("quartz/content/_llm-wiki/review/"))).toBe(false);
         expect(payload.data.generated_paths.some((path) => path.startsWith("quartz/content/_llm-wiki/runtime/"))).toBe(false);
         expect(syncedContent.join("\n")).not.toContain(privateRawText);
+        expect(syncedContent.join("\n")).not.toContain("auto_ingest");
+        expect(syncedContent.join("\n")).not.toContain("auto_ingest_available");
+        expect(syncedContent.join("\n")).not.toContain("/api/raw-upload");
+        expect(syncedContent.join("\n")).not.toContain("x-llm-wiki-upload-token");
+        expect(syncedContent.join("\n")).not.toContain("secret-token-that-must-not-be-published");
         expect(manifest.files.some((file) => file.source_path === capture.source.source_card_path)).toBe(false);
         expect(manifest.files.some((file) => file.source_path === capture.source.original_path)).toBe(false);
         expect(manifest.files.some((file) => file.source_path === capture.source.queue_path)).toBe(false);
+        expect(manifest.files.some((file) => file.source_path === autoIngestSource.sourceCardPath)).toBe(false);
+        expect(manifest.files.some((file) => file.source_path === autoIngestSource.originalPath)).toBe(false);
+        expect(manifest.files.some((file) => file.source_path === autoIngestSource.queuePath)).toBe(false);
         expect(JSON.stringify(payload.data)).not.toContain(capture.source.source_card_path);
         expect(JSON.stringify(payload.data)).not.toContain(capture.source.original_path);
         expect(JSON.stringify(payload.data)).not.toContain(capture.source.queue_path);
+        expect(JSON.stringify(payload.data)).not.toContain("auto_ingest");
+        expect(JSON.stringify(payload.data)).not.toContain("auto_ingest_available");
         expect(JSON.stringify(manifest)).not.toContain(capture.source.source_card_path);
         expect(JSON.stringify(manifest)).not.toContain(capture.source.original_path);
         expect(JSON.stringify(manifest)).not.toContain(capture.source.queue_path);
+        expect(JSON.stringify(manifest)).not.toContain(autoIngestSource.sourceId);
+        expect(JSON.stringify(manifest)).not.toContain("auto_ingest");
+        expect(JSON.stringify(manifest)).not.toContain("auto_ingest_available");
         expect(JSON.stringify(manifest)).not.toContain(privateRawText);
       }
     });

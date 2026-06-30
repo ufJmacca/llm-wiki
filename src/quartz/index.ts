@@ -23,7 +23,13 @@ import {
 } from "../profiles/index.js";
 import { gitCommandEnv } from "../utils/git.js";
 import { validateTextFileWriteInsideRoot, writeTextFileInsideRoot, type ScaffoldEntry } from "../utils/fs.js";
-import { buildReviewDataModel, filterReviewScanForProfile, type ReviewCategory, type ReviewDataModel } from "./reviewData.js";
+import {
+  buildReviewDataModel,
+  filterReviewScanForProfile,
+  type ReviewCategory,
+  type ReviewDataModel,
+  type ReviewQueueAutoIngestData,
+} from "./reviewData.js";
 
 export { buildReviewDataModel, type ReviewDataModel } from "./reviewData.js";
 
@@ -309,6 +315,7 @@ export async function syncQuartzContent(
   const selection = selectMarkdownForProfile(profile, scan.markdown, scan.rawOriginals);
   const warnings = await ensureQuartzContentIgnored(repoRoot);
   if (publicLike) {
+    await removeLocalDaemonRuntimeMetadata(repoRoot);
     await assertPublicSyncIsSafe(repoRoot, scan, profile, selection.markdown, selection.matchedMarkdown, {
       lintResult: options.lintResult,
       ignorePreviousPrivateQuartzContent: !preserveContentRoot,
@@ -422,6 +429,16 @@ export async function writeLocalDaemonRuntimeMetadata(
 }
 
 export async function removeLocalDaemonRuntimeMetadata(repoRoot: string): Promise<void> {
+  const validation = await validateTextFileWriteInsideRoot(repoRoot, QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH);
+  if (!validation.ok) {
+    throw new QuartzOperationError({
+      code: "QUARTZ_WRITE_FAILED",
+      message: "Failed to remove local daemon runtime metadata.",
+      path: QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH,
+      hint: validation.error.hint,
+    });
+  }
+
   try {
     await rm(resolve(repoRoot, QUARTZ_LOCAL_DAEMON_RUNTIME_METADATA_PATH), { force: true });
   } catch (error) {
@@ -2989,10 +3006,20 @@ type QueueDashboardItem = {
   source_id: string
   source_kind: string
   queue_status: string
+  auto_ingest: QueueDashboardAutoIngest | null
   visibility: string
   source_card_path: string
   source_card_materialized: boolean
   queue_path: string
+}
+
+type QueueDashboardAutoIngest = {
+  enabled: boolean
+  attempt_count: number
+  last_attempt_at: string
+  last_result: string
+  last_error_code: string | null
+  last_error_message: string | null
 }
 
 function numberValue(value: unknown): number {
@@ -3005,6 +3032,26 @@ function stringValue(value: unknown): string {
 
 function booleanValue(value: unknown): boolean {
   return value === true
+}
+
+function nullableStringValue(value: unknown): string | null {
+  return typeof value === "string" ? value : null
+}
+
+function autoIngestValue(value: unknown): QueueDashboardAutoIngest | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null
+  }
+
+  const record = value as Record<string, unknown>
+  return {
+    enabled: booleanValue(record.enabled),
+    attempt_count: numberValue(record.attempt_count),
+    last_attempt_at: stringValue(record.last_attempt_at),
+    last_result: stringValue(record.last_result),
+    last_error_code: nullableStringValue(record.last_error_code),
+    last_error_message: nullableStringValue(record.last_error_message),
+  }
 }
 
 function queueItems(value: unknown): QueueDashboardItem[] {
@@ -3029,6 +3076,7 @@ function queueItems(value: unknown): QueueDashboardItem[] {
       source_id: sourceId,
       source_kind: stringValue(record.source_kind),
       queue_status: stringValue(record.queue_status) || stringValue(record.status),
+      auto_ingest: autoIngestValue(record.auto_ingest),
       visibility: stringValue(record.visibility),
       source_card_path: stringValue(record.source_card_path),
       source_card_materialized: booleanValue(record.source_card_materialized),
@@ -3039,6 +3087,29 @@ function queueItems(value: unknown): QueueDashboardItem[] {
 
 function slugFromMarkdownPath(path: string): FullSlug {
   return path.replace(/^quartz\\/content\\//u, "").replace(/\\.md$/u, "") as FullSlug
+}
+
+function autoIngestSummary(autoIngest: QueueDashboardAutoIngest | null): string {
+  if (autoIngest === null) {
+    return "Not attempted"
+  }
+
+  const result = autoIngest.last_result || "attempted"
+  const code = autoIngest.last_error_code
+  const message = autoIngest.last_error_message
+  if (code !== null && message !== null) {
+    return result + " - " + code + ": " + message
+  }
+
+  if (code !== null) {
+    return result + " - " + code
+  }
+
+  if (message !== null) {
+    return result + ": " + message
+  }
+
+  return result
 }
 
 const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
@@ -3088,6 +3159,7 @@ const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
                 <th>Source ID</th>
                 <th>Kind</th>
                 <th>Queue status</th>
+                <th>Auto ingest</th>
                 <th>Visibility</th>
                 <th>Source card</th>
                 <th>Queue path</th>
@@ -3100,6 +3172,7 @@ const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
                   <td><code>{item.source_id}</code></td>
                   <td>{item.source_kind || "unknown"}</td>
                   <td>{item.queue_status || "unknown"}</td>
+                  <td>{autoIngestSummary(item.auto_ingest)}</td>
                   <td>{item.visibility || "unknown"}</td>
                   <td>
                     {item.source_card_path === "" ? (
@@ -3656,7 +3729,45 @@ function uploadFormComponentContent(): string {
         ["Browser guidance", browserGuidance],
       ]);
     };
+    const objectValue = (value) => value !== null && typeof value === "object" ? value : null;
+    const stringValue = (value) => typeof value === "string" ? value : "";
+    const autoIngestData = (data) => objectValue(data.auto_ingest);
+    const autoIngestResult = (autoIngest) => stringValue(autoIngest?.outcome) || stringValue(autoIngest?.status);
+    const autoIngestFinalStatus = (autoIngest, result) => {
+      const finalStatus = stringValue(autoIngest?.final_status);
+      if (finalStatus !== "") return finalStatus;
+      return ["queued", "ingesting", "ingested", "blocked"].includes(result) ? result : "";
+    };
+    const autoIngestError = (autoIngest) => objectValue(autoIngest?.error);
+    const autoIngestGuidance = (autoIngest) => {
+      const error = autoIngestError(autoIngest);
+      return stringValue(error?.hint) || stringValue(error?.message);
+    };
+    const manualRetryCommand = (data, autoIngest) => {
+      if (!data.source_id || autoIngest === null) return "";
+      const result = autoIngestResult(autoIngest);
+      const finalStatus = autoIngestFinalStatus(autoIngest, result);
+      if (result === "ingested" || finalStatus === "ingested") return "";
+      if (finalStatus === "blocked") return "llm-wiki queue set-status " + data.source_id + " queued && llm-wiki ingest " + data.source_id + " --auto";
+      return "llm-wiki ingest " + data.source_id + " --auto";
+    };
     const successStatusMessage = (data) => {
+      const autoIngest = autoIngestData(data);
+      if (autoIngest !== null) {
+        const result = autoIngestResult(autoIngest);
+        const finalStatus = autoIngestFinalStatus(autoIngest, result);
+        if (result === "ingested") return "Auto-ingest completed.";
+        if (result === "blocked") return "Auto-ingest blocked.";
+        if (result === "deferred") return "Auto-ingest deferred.";
+        if (result === "skipped") {
+          return finalStatus === "queued" ? "Auto-ingest skipped; upload remains queued." : "Auto-ingest skipped.";
+        }
+        if (result === "queued") return "Auto-ingest did not start; upload remains queued.";
+        if (finalStatus === "ingested") return "Auto-ingest completed.";
+        if (finalStatus === "blocked") return "Auto-ingest blocked.";
+        if (finalStatus === "queued") return "Auto-ingest did not start; upload remains queued.";
+        if (result !== "") return "Auto-ingest result: " + result + ".";
+      }
       const uploadStatus = typeof data.status === "string" ? data.status : "";
       const queueStatus = typeof data.queue_status === "string" ? data.queue_status : "";
       if (uploadStatus === "duplicate") {
@@ -3767,6 +3878,12 @@ function uploadFormComponentContent(): string {
         }
 
         const data = body.data || {};
+        const autoIngest = autoIngestData(data);
+        const autoIngestResultValue = autoIngest === null ? "" : autoIngestResult(autoIngest);
+        const autoIngestFinalStatusValue = autoIngest === null
+          ? ""
+          : autoIngestFinalStatus(autoIngest, autoIngestResultValue);
+        const autoIngestErrorValue = autoIngestError(autoIngest);
         setStatus(successStatusMessage(data));
         showDetails([
           ["Upload status", data.status],
@@ -3777,7 +3894,13 @@ function uploadFormComponentContent(): string {
           ["Source card", data.source_card_path],
           ["Original", data.original_path],
           ["Ingest", data.source_id ? "llm-wiki ingest " + data.source_id : ""],
-          ["Auto ingest", daemon.auto_ingest_available === true && data.source_id ? "llm-wiki ingest " + data.source_id + " --auto" : ""],
+          ["Auto ingest", daemon.auto_ingest_available === true && data.source_id && autoIngest === null ? "llm-wiki ingest " + data.source_id + " --auto" : ""],
+          ["Auto-ingest result", autoIngestResultValue],
+          ["Auto-ingest final status", autoIngestFinalStatusValue],
+          ["Auto-ingest agent", autoIngest === null ? "" : autoIngest.agent],
+          ["Auto-ingest error code", autoIngestErrorValue?.code],
+          ["Auto-ingest guidance", autoIngestGuidance(autoIngest)],
+          ["Manual retry", manualRetryCommand(data, autoIngest)],
         ]);
       } catch (error) {
         showError({ code: "DAEMON_UNAVAILABLE", message: error instanceof Error ? error.message : String(error) }, "Upload daemon unavailable.");
@@ -4202,6 +4325,7 @@ function sourceQueueContent(reviewData: ReviewDataModel, options: { includeUploa
       item.visibility ?? "",
       item.source_card_path ?? "",
       item.queue_path,
+      autoIngestMarkdownSummary(item.auto_ingest),
       item.original_path ?? "",
     ].map((value) => escapeTableCell(String(value))).join(" | "),
   );
@@ -4219,8 +4343,8 @@ function sourceQueueContent(reviewData: ReviewDataModel, options: { includeUploa
 | Blocked | ${reviewData.queue.counts.blocked} |
 | Ingested | ${reviewData.queue.counts.completed} |
 
-| Source ID | Title | Status | Kind | Visibility | Source card | Queue file | Original |
-|---|---|---|---|---|---|---|---|
+| Source ID | Title | Status | Kind | Visibility | Source card | Queue file | Auto ingest | Original |
+|---|---|---|---|---|---|---|---|---|
 ${rows.map((row) => `| ${row} |`).join("\n")}
 
 ## Source Badge Data
@@ -4247,10 +4371,32 @@ function queueDashboardFrontmatterFields(reviewData: ReviewDataModel, options: {
       source_card_path: item.source_card_path,
       source_card_materialized: item.source_card_materialized,
       queue_path: item.queue_path,
+      ...(item.auto_ingest === undefined ? {} : { auto_ingest: item.auto_ingest }),
     })),
   };
 
   return stringify(frontmatter).trimEnd().split("\n");
+}
+
+function autoIngestMarkdownSummary(autoIngest: ReviewQueueAutoIngestData | undefined): string {
+  if (autoIngest === undefined) {
+    return "Not attempted";
+  }
+
+  const result = autoIngest.last_result || "attempted";
+  if (autoIngest.last_error_code !== null && autoIngest.last_error_message !== null) {
+    return `${result} - ${autoIngest.last_error_code}: ${autoIngest.last_error_message}`;
+  }
+
+  if (autoIngest.last_error_code !== null) {
+    return `${result} - ${autoIngest.last_error_code}`;
+  }
+
+  if (autoIngest.last_error_message !== null) {
+    return `${result}: ${autoIngest.last_error_message}`;
+  }
+
+  return result;
 }
 
 function reviewCategoryContent(options: {

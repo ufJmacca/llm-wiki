@@ -1,7 +1,9 @@
+import { execFile } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { resolve } from "node:path";
+import { promisify } from "node:util";
 
 import { parse } from "yaml";
 import { describe, expect, it, vi } from "vitest";
@@ -19,6 +21,8 @@ import {
   runCliBuffered,
   withTempWorkspace,
 } from "./helpers/init.js";
+
+const execFileAsync = promisify(execFile);
 
 type UploadSuccessEnvelope = {
   ok: true;
@@ -134,6 +138,30 @@ async function initializeWiki(targetDir: string): Promise<void> {
 
   expect(result.exitCode).toBe(0);
   parseInitJson(result.stdout);
+}
+
+async function initializeGitWiki(targetDir: string): Promise<void> {
+  const result = await runCliBuffered(["init", targetDir, "--json"]);
+
+  expect(result.exitCode).toBe(0);
+  parseInitJson(result.stdout);
+  await execFileAsync("git", ["config", "user.name", "llm-wiki-test"], { cwd: targetDir });
+  await execFileAsync("git", ["config", "user.email", "llm-wiki-test@example.invalid"], { cwd: targetDir });
+}
+
+async function gitCommitPaths(repoRoot: string, revision: string): Promise<string[]> {
+  const { stdout } = await execFileAsync("git", ["show", "--format=", "--name-only", revision], { cwd: repoRoot });
+
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+}
+
+async function gitShow(repoRoot: string, revisionPath: string): Promise<string> {
+  const { stdout } = await execFileAsync("git", ["show", revisionPath], { cwd: repoRoot });
+
+  return stdout;
 }
 
 async function configureDefaultLocalAgent(wikiDir: string, command: string): Promise<void> {
@@ -1056,6 +1084,58 @@ describe("local upload daemon", () => {
         expect(sourceLogEntries.find((entry) => entry.title === "Status changed to ingested")?.body).toContain(
           "- status: ingesting -> ingested",
         );
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("does not sweep stale auto-ingest log entries into later raw upload commits", async () => {
+    await withTempWorkspace("llm-wiki-daemon-auto-ingest-stale-log-commit-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeGitWiki(wikiDir);
+      const executablePath = await createExecutable(workspaceDir, "upload-stale-log-agent", UPLOAD_SUCCESS_AGENT_SOURCE);
+      await configureDefaultLocalAgent(wikiDir, executablePath);
+      const daemon = await startUploadDaemon({
+        repoRoot: wikiDir,
+        port: 0,
+        commitUploads: true,
+        autoIngest: {
+          enabled: true,
+          now: () => new Date(TEST_AUTO_INGEST_NOW),
+        },
+      });
+
+      try {
+        // Act
+        const firstUpload = await uploadForm(
+          daemon,
+          textUploadForm("First Auto Commit", "First auto-ingest commit body.\n"),
+        );
+        const firstCommitPaths = await gitCommitPaths(wikiDir, "HEAD");
+        const firstCommittedLog = await gitShow(wikiDir, "HEAD:curated/log.md");
+        const secondUpload = await uploadForm(
+          daemon,
+          textUploadForm("Second Auto Commit", "Second auto-ingest commit body.\n"),
+        );
+        const secondCommitPaths = await gitCommitPaths(wikiDir, "HEAD");
+        const secondCommittedLog = await gitShow(wikiDir, "HEAD:curated/log.md");
+
+        // Assert
+        expect(firstUpload.status).toBe(201);
+        expect(secondUpload.status).toBe(201);
+        expect(firstCommitPaths).toContain("curated/log.md");
+        expect(firstCommittedLog).toContain(firstUpload.body.data.source_id);
+        expect(firstCommittedLog).not.toContain("Agent ingest completed");
+        expect(secondCommitPaths).not.toContain("curated/log.md");
+        expect(secondCommittedLog).toBe(firstCommittedLog);
+        expect(secondCommittedLog).not.toContain("Agent ingest completed");
+        expect(secondCommitPaths).toEqual(expect.arrayContaining([
+          secondUpload.body.data.original_path,
+          secondUpload.body.data.source_card_path,
+          secondUpload.body.data.queue_path,
+        ]));
       } finally {
         await daemon.close();
       }

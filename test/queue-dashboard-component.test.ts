@@ -235,6 +235,7 @@ describe("LlmWikiQueueDashboard generated component", () => {
           "src_2026_06_23_completed",
           "file",
           "ingested",
+          "Not attempted",
           "public",
           "raw/inputs/2026/06/src_2026_06_23_completed/_source.md",
           "raw/queue/src_2026_06_23_completed.json",
@@ -244,6 +245,7 @@ describe("LlmWikiQueueDashboard generated component", () => {
           "src_2026_06_23_queued",
           "text",
           "queued",
+          "Not attempted",
           "private",
           "raw/inputs/2026/06/src_2026_06_23_queued/_source.md",
           "raw/queue/src_2026_06_23_queued.json",
@@ -253,6 +255,7 @@ describe("LlmWikiQueueDashboard generated component", () => {
           "src_2026_06_23_blocked",
           "url",
           "blocked",
+          "Not attempted",
           "public",
           "raw/inputs/2026/06/src_2026_06_23_blocked/_source.md",
           "raw/queue/src_2026_06_23_blocked.json",
@@ -262,6 +265,7 @@ describe("LlmWikiQueueDashboard generated component", () => {
           "src_2026_06_23_ingesting",
           "file",
           "ingesting",
+          "Not attempted",
           "private",
           "raw/inputs/2026/06/src_2026_06_23_ingesting/_source.md",
           "raw/queue/src_2026_06_23_ingesting.json",
@@ -274,6 +278,65 @@ describe("LlmWikiQueueDashboard generated component", () => {
         ["/resolved/raw/inputs/2026/06/src_2026_06_23_ingesting/_source"],
       ]);
       expect(anchors).toHaveLength(4);
+    });
+  });
+
+  it("renders safe blocked auto-ingest summaries without private passthrough fields", async () => {
+    await withTempWorkspace("llm-wiki-queue-dashboard-auto-ingest-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await mkdir(wikiDir, { recursive: true });
+      await initializeQuartzRuntime(wikiDir);
+      const component = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiQueueDashboard.tsx");
+
+      // Act
+      const dashboard = await renderGeneratedDashboard(component, {
+        llm_wiki_queue_total: 1,
+        llm_wiki_queue_queued: 0,
+        llm_wiki_queue_ingesting: 0,
+        llm_wiki_queue_blocked: 1,
+        llm_wiki_queue_completed: 0,
+        llm_wiki_queue_items: [
+          {
+            title: "Blocked Auto Source",
+            source_id: "src_2026_06_23_blocked_auto",
+            source_kind: "text",
+            queue_status: "blocked",
+            visibility: "private",
+            source_card_path: "raw/inputs/2026/06/src_2026_06_23_blocked_auto/_source.md",
+            source_card_materialized: true,
+            queue_path: "raw/queue/src_2026_06_23_blocked_auto.json",
+            auto_ingest: {
+              enabled: true,
+              attempt_count: 1,
+              last_attempt_at: "2026-06-23T08:04:00.000Z",
+              last_result: "blocked",
+              last_error_code: "INGEST_VALIDATION_FAILED",
+              last_error_message: "curated/sources/src_2026_06_23_blocked_auto.md was not created.",
+            },
+            raw_body: "PRIVATE RAW UPLOAD BODY api_key=sk-dashboard-leak",
+            upload_token: "upload-token-secret",
+          },
+        ],
+      });
+      const text = renderText(dashboard);
+      const rows = tableBodyRows(dashboard);
+
+      // Assert
+      expect(tableRowCells(rows[0])).toEqual([
+        "Blocked Auto Source",
+        "src_2026_06_23_blocked_auto",
+        "text",
+        "blocked",
+        "blocked - INGEST_VALIDATION_FAILED: curated/sources/src_2026_06_23_blocked_auto.md was not created.",
+        "private",
+        "raw/inputs/2026/06/src_2026_06_23_blocked_auto/_source.md",
+        "raw/queue/src_2026_06_23_blocked_auto.json",
+      ]);
+      expect(text).toContain("INGEST_VALIDATION_FAILED");
+      expect(text).not.toContain("PRIVATE RAW UPLOAD BODY");
+      expect(text).not.toContain("sk-dashboard-leak");
+      expect(text).not.toContain("upload-token-secret");
     });
   });
 

@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "node:child_process";
 
@@ -32,6 +32,16 @@ vi.mock("node:fs", async (importOriginal) => {
 
 import { serveQuartzExplorer } from "../src/quartz/server.js";
 import { parseInitJson, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
+
+type SourceCaptureEnvelope = {
+  data: {
+    source: {
+      source_id: string;
+      source_card_path: string;
+      queue_path: string;
+    };
+  };
+};
 
 async function initializeWiki(targetDir: string): Promise<void> {
   const result = await runCliBuffered(["init", targetDir, "--no-git", "--json"]);
@@ -169,6 +179,11 @@ async function waitForFileContent(
   );
 }
 
+function parseSourceCapture(stdout: string[]): SourceCaptureEnvelope["data"] {
+  expect(stdout).toHaveLength(1);
+  return (JSON.parse(stdout[0]) as SourceCaptureEnvelope).data;
+}
+
 describe("explore serve watcher target refresh", () => {
   beforeEach(() => {
     spawnMock.mockReset();
@@ -176,6 +191,143 @@ describe("explore serve watcher target refresh", () => {
     fsWatchMock.watchers.clear();
     installWatchMock();
   });
+
+  it("keeps queue JSON and source-card transition directories in the serve watch targets", async () => {
+    await withTempWorkspace("llm-wiki-explore-serve-queue-source-watchers-", async (workspaceDir) => {
+      // Arrange
+      const quartz = mockLongRunningSpawn();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const sourceDir = resolve(wikiDir, "raw/inputs/2026/06/src_2026_06_23_watch_auto_777777");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await mkdir(sourceDir, { recursive: true });
+      await mkdir(resolve(wikiDir, "raw/queue"), { recursive: true });
+
+      // Act
+      const serveResult = serveQuartzExplorer(wikiDir, {
+        profile: "local",
+        port: 8782,
+      });
+      await quartz.waitUntilStarted();
+      const hasQueueWatcher = fsWatchMock.watchers.has(resolve(wikiDir, "raw/queue"));
+      const hasSourceCardWatcher = fsWatchMock.watchers.has(sourceDir);
+      quartz.close();
+      const result = await serveResult;
+
+      // Assert
+      expect(hasQueueWatcher).toBe(true);
+      expect(hasSourceCardWatcher).toBe(true);
+      expect(result.data.watch_paths).toEqual(
+        expect.arrayContaining(["raw/inputs/**/_source.md", "raw/queue/*.json"]),
+      );
+    });
+  }, 15_000);
+
+  it("refreshes generated review queue content after queue and source-card watch events", async () => {
+    await withTempWorkspace("llm-wiki-explore-serve-queue-transition-watch-", async (workspaceDir) => {
+      // Arrange
+      const quartz = mockLongRunningSpawn();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      let syncCount = 0;
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      const addResult = await runCliBuffered([
+        "add-text",
+        "--repo",
+        wikiDir,
+        "--title",
+        "Watcher Queued Source",
+        "--text",
+        "PRIVATE RAW UPLOAD BODY api_key=sk-watch-leak\n",
+        "--json",
+      ]);
+      expect(addResult.exitCode).toBe(0);
+      const capture = parseSourceCapture(addResult.stdout);
+      const queuePath = resolve(wikiDir, capture.source.queue_path);
+      const sourceCardPath = resolve(wikiDir, capture.source.source_card_path);
+      const sourceCardDir = dirname(sourceCardPath);
+      const safeErrorMessage =
+        "Validation failed while checking source text: [raw upload content redacted] api_key=[redacted] token=[redacted]";
+
+      // Act
+      const serveResult = serveQuartzExplorer(wikiDir, {
+        profile: "local",
+        port: 8783,
+        onSynced: async () => {
+          syncCount += 1;
+        },
+      });
+      await quartz.waitUntilStarted();
+
+      const queueRecord = JSON.parse(await readFile(queuePath, "utf8")) as Record<string, unknown>;
+      await writeFile(
+        queuePath,
+        `${JSON.stringify(
+          {
+            ...queueRecord,
+            status: "blocked",
+            updated_at: "2026-06-23T10:04:00.000Z",
+            auto_ingest: {
+              enabled: true,
+              attempt_count: 1,
+              last_attempt_at: "2026-06-23T10:04:00.000Z",
+              last_result: "blocked",
+              last_error_code: "INGEST_VALIDATION_FAILED",
+              last_error_message:
+                "Validation failed while checking source text: PRIVATE RAW UPLOAD BODY api_key=sk-watch-leak token=watch-upload-token",
+            },
+          },
+          null,
+          2,
+        )}\n`,
+        "utf8",
+      );
+      const updatedSourceCard = (await readFile(sourceCardPath, "utf8"))
+        .replace("title: Watcher Queued Source", "title: Watcher Blocked Source")
+        .replace("status: queued", "status: blocked")
+        .replace(
+          "\n---\n",
+          [
+            "",
+            "auto_ingest:",
+            "  enabled: true",
+            "  attempt_count: 1",
+            "  last_attempt_at: \"2026-06-23T10:04:00.000Z\"",
+            "  last_result: \"blocked\"",
+            "  last_error_code: \"INGEST_VALIDATION_FAILED\"",
+            "  last_error_message: \"Validation failed while checking source text: PRIVATE RAW UPLOAD BODY api_key=sk-watch-leak token=watch-upload-token\"",
+            "---",
+            "",
+          ].join("\n"),
+        );
+      await writeFile(sourceCardPath, updatedSourceCard, "utf8");
+      expect(emitWatchEvent(resolve(wikiDir, "raw/queue"), `${capture.source.source_id}.json`)).toBe(true);
+      expect(emitWatchEvent(sourceCardDir, "_source.md")).toBe(true);
+      const sourceQueue = await waitFor(
+        async () => readFile(resolve(wikiDir, "quartz/content/_llm-wiki/review/source-queue.md"), "utf8"),
+        (content) =>
+          content.includes("| Blocked | 1 |") &&
+          content.includes("Watcher Blocked Source") &&
+          content.includes(`blocked - INGEST_VALIDATION_FAILED: ${safeErrorMessage}`) &&
+          !content.includes("PRIVATE RAW UPLOAD BODY") &&
+          !content.includes("sk-watch-leak") &&
+          !content.includes("watch-upload-token"),
+        "source queue review content to refresh after queue and source-card watch events",
+      );
+      await waitFor(async () => syncCount, (count) => count >= 2, "watcher sync callback after queue transition");
+      quartz.close();
+      const result = await serveResult;
+
+      // Assert
+      expect(result.data.url).toBe("http://127.0.0.1:8783/");
+      expect(syncCount).toBeGreaterThanOrEqual(2);
+      expect(sourceQueue).toContain("| Queued | 0 |");
+      expect(sourceQueue).toContain("| Blocked | 1 |");
+      expect(sourceQueue).not.toContain("Watcher Queued Source");
+    });
+  }, 15_000);
 
   it("refreshes watch targets after a successful watcher sync before later changes in newly created targets", async () => {
     await withTempWorkspace("llm-wiki-explore-serve-post-sync-watch-refresh-", async (workspaceDir) => {

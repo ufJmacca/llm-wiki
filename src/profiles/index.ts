@@ -17,10 +17,24 @@ export type WikiProfile = {
   exclude: string[];
   includePrivate: boolean;
   requiredVisibility: string | null;
+  features: Record<string, boolean>;
 };
 
 export type ProfileError = {
-  code: "PROFILE_INVALID" | "PROFILE_MISSING" | "PROFILE_UNSUPPORTED";
+  code:
+    | "PROFILE_INVALID"
+    | "PROFILE_MISSING"
+    | "PROFILE_UNSUPPORTED"
+    | "PROFILE_UPLOAD_FEATURE_FORBIDDEN"
+    | "PROFILE_REVIEW_FEATURE_FORBIDDEN";
+  message: string;
+  path: string;
+  hint: string;
+};
+
+export type PublicLikeProfileFeatureIssue = {
+  code: Extract<ProfileError["code"], "PROFILE_UPLOAD_FEATURE_FORBIDDEN" | "PROFILE_REVIEW_FEATURE_FORBIDDEN">;
+  lintRuleId: "public_profile_upload_feature_forbidden" | "public_profile_review_feature_forbidden";
   message: string;
   path: string;
   hint: string;
@@ -37,6 +51,10 @@ export function isExploreProfileName(value: string): value is ExploreProfileName
 }
 
 export function isPublicLikeProfile(profileName: ExploreProfileName): boolean {
+  return isPublicLikeProfileName(profileName);
+}
+
+function isPublicLikeProfileName(profileName: string): profileName is Extract<ExploreProfileName, "public" | "github-pages"> {
   return profileName === "public" || profileName === "github-pages";
 }
 
@@ -82,7 +100,7 @@ export async function readWikiProfile(
     });
   }
 
-  return ok({
+  const profile: WikiProfile = {
     requestedName: profileName,
     sourceName,
     path: profilePath,
@@ -92,7 +110,56 @@ export async function readWikiProfile(
     exclude: toStringArray(scan.profile.exclude),
     includePrivate: profileIncludePrivate(scan.profile),
     requiredVisibility: profileRequiredVisibility(scan.profile),
-  });
+    features: profileFeatures(scan.profile),
+  };
+  const forbiddenFeature = publicLikeProfileFeatureIssues(profile)[0];
+  if (forbiddenFeature !== undefined) {
+    return err({
+      code: forbiddenFeature.code,
+      message: forbiddenFeature.message,
+      path: forbiddenFeature.path,
+      hint: forbiddenFeature.hint,
+    });
+  }
+
+  return ok(profile);
+}
+
+export function publicLikeProfileFeatureIssues(input: {
+  requestedName: string;
+  path: string;
+  features?: unknown;
+}): PublicLikeProfileFeatureIssue[] {
+  if (!isPublicLikeProfileName(input.requestedName)) {
+    return [];
+  }
+
+  const features = isRecord(input.features) ? input.features : {};
+  const issues: PublicLikeProfileFeatureIssue[] = [];
+
+  if (features.upload === true) {
+    issues.push({
+      code: "PROFILE_UPLOAD_FEATURE_FORBIDDEN",
+      lintRuleId: "public_profile_upload_feature_forbidden",
+      message: `Public-like profile ${input.requestedName} must not enable features.upload.`,
+      path: input.path,
+      hint: "Set features.upload: false for public and github-pages profiles; uploads belong to local or private Explorer sessions.",
+    });
+  }
+
+  const enabledReviewFeatures = ["review", "review_panel"].filter((feature) => features[feature] === true);
+  if (enabledReviewFeatures.length > 0) {
+    const featureNames = enabledReviewFeatures.map((feature) => `features.${feature}`).join(", ");
+    issues.push({
+      code: "PROFILE_REVIEW_FEATURE_FORBIDDEN",
+      lintRuleId: "public_profile_review_feature_forbidden",
+      message: `Public-like profile ${input.requestedName} must not enable ${featureNames}.`,
+      path: input.path,
+      hint: "Set review features to false for public and github-pages profiles; review surfaces belong to local or private Explorer sessions.",
+    });
+  }
+
+  return issues;
 }
 
 export function selectMarkdownForProfile(
@@ -166,6 +233,16 @@ function profileRequiredVisibility(profile: Record<string, unknown>): string | n
   }
 
   return null;
+}
+
+function profileFeatures(profile: Record<string, unknown>): Record<string, boolean> {
+  if (!isRecord(profile.features)) {
+    return {};
+  }
+
+  return Object.fromEntries(
+    Object.entries(profile.features).filter((entry): entry is [string, boolean] => typeof entry[1] === "boolean"),
+  );
 }
 
 function profileBaseUrl(profile: Record<string, unknown>): string | null {

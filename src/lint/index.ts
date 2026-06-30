@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 
+import { publicLikeProfileFeatureIssues } from "../profiles/index.js";
 import { scanWikiRepository, isRawOriginalPath, type RepoMarkdownFile, type RepoScan, type SourceCard } from "../scanner/repo.js";
 import {
   computeContentHash,
@@ -1177,6 +1178,22 @@ function publicProfileIssues(scan: RepoScan, profileName: string, linkIndex: Lin
   const markdownByPath = linkIndex.markdownByPath;
   const issues: LintIssue[] = [];
 
+  issues.push(
+    ...publicLikeProfileFeatureIssues({
+      requestedName: profileName,
+      path: profile.path,
+      features: profile.scan.profile.features,
+    }).map((featureIssue) => ({
+      rule_id: featureIssue.lintRuleId,
+      severity: "error" as const,
+      path: featureIssue.path,
+      message: featureIssue.message,
+      fix_hint: featureIssue.hint,
+      fixable: false,
+    })),
+  );
+  issues.push(...publicProfileForbiddenRouteIssues(include, exclude));
+
   if (configuredRequiredVisibility !== requiredVisibility) {
     issues.push({
       rule_id: "public_profile_visibility_invalid",
@@ -2275,6 +2292,54 @@ function selectedForbiddenSkippedProfileRoots(include: string[], exclude: string
       ? [root.path]
       : [],
   );
+}
+
+function publicProfileForbiddenRouteIssues(include: string[], exclude: string[]): LintIssue[] {
+  const forbiddenRoutes = [
+    {
+      candidates: ["_llm-wiki/upload.md", "_llm-wiki/upload/index.md"],
+      rule_id: "public_profile_upload_route_forbidden",
+      message: "Public-like profile selects the local upload route.",
+      fix_hint: "Exclude _llm-wiki/upload.md and _llm-wiki/upload/** from public profiles; upload surfaces belong to local or private Explorer sessions.",
+    },
+    {
+      candidates: [
+        "_llm-wiki/review/overview.md",
+        "_llm-wiki/review/status.md",
+        "_llm-wiki/review/source-queue.md",
+        "_llm-wiki/review/recent-ingests.md",
+        "_llm-wiki/review/needs-review.md",
+        "_llm-wiki/review/contradictions.md",
+        "_llm-wiki/review/orphans.md",
+        "_llm-wiki/review/stale-pages.md",
+        "_llm-wiki/review/visibility-warnings.md",
+        "_llm-wiki/review/profile-summary.md",
+        "_llm-wiki/review/index.md",
+      ],
+      rule_id: "public_profile_review_route_forbidden",
+      message: "Public-like profile selects local review routes.",
+      fix_hint: "Exclude _llm-wiki/review/** from public profiles; review surfaces belong to local or private Explorer sessions.",
+    },
+  ] as const;
+
+  const issues: LintIssue[] = [];
+  for (const route of forbiddenRoutes) {
+    const selectedPath = route.candidates.find((path) => matchesProfile(path, include, exclude));
+    if (selectedPath === undefined) {
+      continue;
+    }
+
+    issues.push({
+      rule_id: route.rule_id,
+      severity: "error",
+      path: selectedPath,
+      message: route.message,
+      fix_hint: route.fix_hint,
+      fixable: false,
+    });
+  }
+
+  return issues;
 }
 
 function selectedSkippedNonMarkdownProfilePaths(include: string[], exclude: string[]): string[] {

@@ -7,6 +7,15 @@ import { promisify } from "node:util";
 import Busboy, { type FieldInfo, type FileInfo } from "busboy";
 
 import {
+  runAutoIngestSource,
+  type AutoIngestOutcome,
+  type AutoIngestSafeError,
+  type AutoIngestSourceResult,
+  type RunAutoIngestSourceInput,
+} from "../autoIngest/index.js";
+import { RuntimeCommandError } from "../runtime/errors.js";
+import { showQueueSource, type AutoIngestMetadata, type QueueStatus } from "../runtime/queue.js";
+import {
   capturePreparedUrlSource,
   captureTextSource,
   captureUploadedFileSource,
@@ -74,12 +83,30 @@ export type UploadCommitResult = {
 
 export type UploadCommitter = (request: UploadCommitRequest) => Promise<UploadCommitResult>;
 
+export type UploadAutoIngestRequest = {
+  repoRoot: string;
+  source_id: string;
+  capture: SourceCaptureSuccess;
+  commit: UploadCommitResult;
+};
+
+export type UploadAutoIngestHandler = (request: UploadAutoIngestRequest) => Promise<AutoIngestSourceResult>;
+
+export type UploadAutoIngestConfig = {
+  enabled: true;
+  run?: UploadAutoIngestHandler;
+  lock?: RunAutoIngestSourceInput["lock"];
+  now?: RunAutoIngestSourceInput["now"];
+  command?: string;
+};
+
 export type UploadDaemonOptions = {
   repoRoot: string;
   host?: string;
   port?: number;
   commitUploads?: boolean;
   commitUpload?: UploadCommitter;
+  autoIngest?: UploadAutoIngestConfig;
 };
 
 export type UploadDaemonErrorCode =
@@ -155,6 +182,7 @@ type UploadApiData = {
   created_paths: string[];
   message: string;
   commit: UploadCommitResult;
+  auto_ingest?: AutoIngestSourceResult;
 };
 
 type MultipartUpload = {
@@ -195,6 +223,7 @@ type UploadRequestOptions = {
   uploadToken: string;
   uploadSessionId: string;
   pendingUploadCommits: PendingUploadCommits;
+  autoIngest: UploadAutoIngestConfig | null;
 };
 
 type CorsApproval =
@@ -210,6 +239,7 @@ type CorsApproval =
 type UploadWorkSuccess = {
   capture: SourceCaptureSuccess;
   commit: UploadCommitResult;
+  autoIngest?: AutoIngestSourceResult;
 };
 
 export async function startUploadDaemon(options: UploadDaemonOptions): Promise<UploadDaemon> {
@@ -231,6 +261,7 @@ export async function startUploadDaemon(options: UploadDaemonOptions): Promise<U
   const host = hostResult.value;
   const commitUploads = options.commitUploads === true;
   const commitUpload = options.commitUpload ?? commitUploadWithGit;
+  const autoIngest = options.autoIngest?.enabled === true ? options.autoIngest : null;
   const pendingUploadCommits: PendingUploadCommits = new Map();
   const uploadToken = randomBytes(32).toString("hex");
   const uploadSessionId = `upl_${randomBytes(8).toString("hex")}`;
@@ -243,6 +274,7 @@ export async function startUploadDaemon(options: UploadDaemonOptions): Promise<U
         uploadToken,
         uploadSessionId,
         pendingUploadCommits,
+        autoIngest,
       },
       request,
       response,
@@ -383,7 +415,7 @@ async function handleDaemonRequest(
     const statusCode = upload.value.capture.status === "added" ? 201 : 200;
     writeJson(response, statusCode, {
       ok: true,
-      data: toUploadApiData(upload.value.capture, upload.value.commit),
+      data: toUploadApiData(upload.value.capture, upload.value.commit, upload.value.autoIngest),
     });
   } catch (error) {
     const daemonError = error instanceof UploadDaemonError
@@ -488,7 +520,142 @@ async function captureAndCommitUpload(
   return ok({
     capture: capture.value,
     commit,
+    autoIngest: await runUploadAutoIngest(options, capture.value, commit),
   });
+}
+
+async function runUploadAutoIngest(
+  options: Pick<UploadRequestOptions, "repoRoot" | "autoIngest">,
+  capture: SourceCaptureSuccess,
+  commit: UploadCommitResult,
+): Promise<AutoIngestSourceResult | undefined> {
+  if (options.autoIngest === null) {
+    return undefined;
+  }
+
+  if (capture.source.queue_status !== "queued") {
+    return uploadAutoIngestNotEligibleResult(capture.source);
+  }
+
+  const run = options.autoIngest.run ?? defaultUploadAutoIngestRunner(options.autoIngest);
+  try {
+    return await run({
+      repoRoot: options.repoRoot,
+      source_id: capture.source.source_id,
+      capture,
+      commit,
+    });
+  } catch (error) {
+    return uploadAutoIngestThrownResult(options.repoRoot, capture.source, error);
+  }
+}
+
+function defaultUploadAutoIngestRunner(config: UploadAutoIngestConfig): UploadAutoIngestHandler {
+  return async (request) => runAutoIngestSource({
+    repoRoot: request.repoRoot,
+    sourceId: request.source_id,
+    lock: config.lock,
+    now: config.now,
+    command: config.command ?? "llm-wiki explore serve --with-daemon --auto-ingest-uploads upload",
+  });
+}
+
+function uploadAutoIngestNotEligibleResult(source: SourceCaptureSuccess["source"]): AutoIngestSourceResult {
+  const outcome: AutoIngestOutcome = source.queue_status === "ingesting" ? "deferred" : "skipped";
+
+  return {
+    source_id: source.source_id,
+    previous_status: source.queue_status,
+    final_status: source.queue_status,
+    outcome,
+    attempted: false,
+    agent: null,
+    applied_paths: [],
+    auto_ingest: null,
+    error: {
+      code: "AUTO_INGEST_SOURCE_NOT_ELIGIBLE",
+      message: `Upload-triggered auto-ingest only processes queued sources; current status is ${source.queue_status}.`,
+      path: source.queue_path,
+      hint: duplicateAutoIngestHint(source.queue_status),
+    },
+  };
+}
+
+function duplicateAutoIngestHint(status: QueueStatus): string {
+  if (status === "ingested") {
+    return "This source is already ingested; upload-triggered auto-ingest was skipped.";
+  }
+
+  if (status === "blocked") {
+    return "This source is blocked; use manual retry guidance to review it, mark it queued, and rerun auto-ingest.";
+  }
+
+  if (status === "ingesting") {
+    return "Another worker is already processing this source; upload-triggered auto-ingest was deferred.";
+  }
+
+  return "Only queued sources are eligible for upload-triggered auto-ingest.";
+}
+
+async function uploadAutoIngestThrownResult(
+  repoRoot: string,
+  source: SourceCaptureSuccess["source"],
+  error: unknown,
+): Promise<AutoIngestSourceResult> {
+  const safeError = uploadAutoIngestSafeError(error, source.source_id);
+  const current = await readUploadAutoIngestCurrentState(repoRoot, source);
+
+  return {
+    source_id: source.source_id,
+    previous_status: source.queue_status,
+    final_status: current.status,
+    outcome: "skipped",
+    attempted: false,
+    agent: null,
+    applied_paths: [],
+    auto_ingest: current.autoIngest,
+    error: safeError,
+  };
+}
+
+async function readUploadAutoIngestCurrentState(
+  repoRoot: string,
+  source: SourceCaptureSuccess["source"],
+): Promise<{ status: QueueStatus; autoIngest: AutoIngestMetadata | null }> {
+  const shown = await showQueueSource(repoRoot, source.source_id);
+  if (!shown.ok) {
+    return {
+      status: source.queue_status,
+      autoIngest: null,
+    };
+  }
+
+  return {
+    status: shown.value.queue_record.status,
+    autoIngest: shown.value.queue_record.auto_ingest ?? null,
+  };
+}
+
+function uploadAutoIngestSafeError(error: unknown, sourceId: string): AutoIngestSafeError {
+  if (error instanceof RuntimeCommandError) {
+    return {
+      code: error.code,
+      message: safeAutoIngestMessage(error.message),
+      path: error.path,
+      hint: safeAutoIngestMessage(error.hint),
+    };
+  }
+
+  return {
+    code: "AUTO_INGEST_FAILED",
+    message: error instanceof Error ? safeAutoIngestMessage(error.message) : safeAutoIngestMessage(String(error)),
+    path: sourceId,
+    hint: "Fix the local agent or repository state, then retry auto-ingest manually.",
+  };
+}
+
+function safeAutoIngestMessage(message: string): string {
+  return message.replace(/\s+/g, " ").trim().slice(0, 500);
 }
 
 async function prepareUploadPayload(
@@ -965,14 +1132,18 @@ async function commitUploadWithGit(request: UploadCommitRequest): Promise<Upload
   }
 }
 
-function toUploadApiData(capture: SourceCaptureSuccess, commit: UploadCommitResult): UploadApiData {
+function toUploadApiData(
+  capture: SourceCaptureSuccess,
+  commit: UploadCommitResult,
+  autoIngest: AutoIngestSourceResult | undefined,
+): UploadApiData {
   return {
     status: capture.status,
     source_id: capture.source.source_id,
     title: capture.source.title,
     source_kind: capture.source.source_kind,
     visibility: capture.source.visibility,
-    queue_status: capture.source.queue_status,
+    queue_status: autoIngest?.final_status ?? capture.source.queue_status,
     queue_path: capture.source.queue_path,
     source_card_path: capture.source.source_card_path,
     original_path: capture.source.original_path,
@@ -981,6 +1152,7 @@ function toUploadApiData(capture: SourceCaptureSuccess, commit: UploadCommitResu
       ? "Raw source uploaded and queued for ingest."
       : "Raw source was already captured; no new artifacts were created.",
     commit,
+    ...(autoIngest === undefined ? {} : { auto_ingest: autoIngest }),
   };
 }
 

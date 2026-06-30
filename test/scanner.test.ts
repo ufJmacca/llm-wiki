@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
 
 import { planWikiScaffold } from "../src/scaffold/files.js";
 import {
@@ -11,6 +13,8 @@ import {
   parseWikilinks,
   scanMarkdownDocument,
 } from "../src/scanner/index.js";
+import { scanStaticOutputLeaks, type StaticLeakFinding } from "../src/scanner/staticLeaks.js";
+import { withTempWorkspace } from "./helpers/init.js";
 
 const defaultOptions = {
   agent: "generic",
@@ -18,6 +22,366 @@ const defaultOptions = {
   dataview: true,
   git: true,
 } as const;
+
+function expectStableStaticLeakFinding(finding: StaticLeakFinding): void {
+  const expectedKeys = ["code", "hint", "message", "path", "severity"];
+  if ("line" in finding) {
+    expectedKeys.push("line");
+  }
+
+  expect(Object.keys(finding).sort()).toEqual(expectedKeys.sort());
+  expect(finding.path).toEqual(expect.any(String));
+  expect(finding.path).not.toHaveLength(0);
+  expect(finding.severity).toBe("error");
+  expect(finding.code).toMatch(/^STATIC_[A-Z0-9_]+_LEAK$/);
+  expect(finding.message).toEqual(expect.any(String));
+  expect(finding.message).not.toHaveLength(0);
+  expect(finding.hint).toEqual(expect.any(String));
+  expect(finding.hint).not.toHaveLength(0);
+  if ("line" in finding) {
+    expect(Number.isInteger(finding.line)).toBe(true);
+    expect(finding.line).toBeGreaterThan(0);
+  }
+}
+
+describe("static output leak scanner", () => {
+  it.each(["quartz/content", "quartz/public"] as const)(
+    "detects upload, runtime, review, raw, queue, source-card, auth, and secret markers under %s",
+    async (scanRoot) => {
+      await withTempWorkspace("llm-wiki-static-leak-markers-", async (workspaceDir) => {
+        // Arrange
+        const targetDir = resolve(workspaceDir, scanRoot);
+        await mkdir(targetDir, { recursive: true });
+        const sourceId = "src_2026_06_23_private_upload_111111";
+        const files: Array<{ path: string; content: string; expectedCode: string; expectedLine: number }> = [
+          {
+            path: "component.js",
+            content: "export const component = 'LlmWikiUploadForm';\n",
+            expectedCode: "STATIC_UPLOAD_COMPONENT_LEAK",
+            expectedLine: 1,
+          },
+          {
+            path: "upload-marker.html",
+            content: "<form data-llm-wiki-upload-form=\"true\"><input type=\"file\"></form>\n",
+            expectedCode: "STATIC_UPLOAD_FORM_LEAK",
+            expectedLine: 1,
+          },
+          {
+            path: "upload-endpoint.js",
+            content: "fetch('/api/raw-upload', { method: 'POST' });\n",
+            expectedCode: "STATIC_UPLOAD_ENDPOINT_LEAK",
+            expectedLine: 1,
+          },
+          {
+            path: "token-header.js",
+            content: "const header = 'x-llm-wiki-upload-token';\n",
+            expectedCode: "STATIC_UPLOAD_TOKEN_LEAK",
+            expectedLine: 1,
+          },
+          {
+            path: "_llm-wiki/runtime/local-daemon.json",
+            content: "{\"enabled\":true,\"upload_path\":\"/api/raw-upload\"}\n",
+            expectedCode: "STATIC_DAEMON_METADATA_LEAK",
+            expectedLine: 1,
+          },
+          {
+            path: "endpoint-config.json",
+            content: "{\n  \"llm_wiki_upload_endpoint\": \"https://uploads.example.com/api/raw-upload\"\n}\n",
+            expectedCode: "STATIC_UPLOAD_ENDPOINT_CONFIG_LEAK",
+            expectedLine: 2,
+          },
+          {
+            path: "signed-upload.js",
+            content: "const signatureHeader = 'x-llm-wiki-upload-signature';\n",
+            expectedCode: "STATIC_UPLOAD_AUTH_LEAK",
+            expectedLine: 1,
+          },
+          {
+            path: "raw-inputs.md",
+            content: `Original path: raw/inputs/2026/06/${sourceId}/original.md\n`,
+            expectedCode: "STATIC_RAW_INPUTS_LEAK",
+            expectedLine: 1,
+          },
+          {
+            path: "raw-queue.md",
+            content: `Queue path: raw/queue/${sourceId}.json\n`,
+            expectedCode: "STATIC_RAW_QUEUE_LEAK",
+            expectedLine: 1,
+          },
+          {
+            path: "source-card.md",
+            content: "---\ntype: raw_source\nvisibility: private\nstatus: queued\n---\n# Source Card\n",
+            expectedCode: "STATIC_PRIVATE_SOURCE_CARD_LEAK",
+            expectedLine: 2,
+          },
+          {
+            path: "_llm-wiki/review/needs-review.html",
+            content: "<h1>Needs review</h1>\n",
+            expectedCode: "STATIC_REVIEW_PAGE_LEAK",
+            expectedLine: 1,
+          },
+          {
+            path: "secrets.js",
+            content: "const token = process.env.GITHUB_TOKEN;\n",
+            expectedCode: "STATIC_SECRET_MARKER_LEAK",
+            expectedLine: 1,
+          },
+        ];
+
+        for (const file of files) {
+          const absolutePath = resolve(targetDir, file.path);
+          await mkdir(resolve(absolutePath, ".."), { recursive: true });
+          await writeFile(absolutePath, file.content, "utf8");
+        }
+
+        // Act
+        const scan = await scanStaticOutputLeaks(workspaceDir);
+
+        // Assert
+        expect(scan.ok).toBe(false);
+        const findings = scan.findings;
+        expect(findings).toHaveLength(files.length);
+        for (const finding of findings) {
+          expectStableStaticLeakFinding(finding);
+        }
+        for (const file of files) {
+          expect(findings).toContainEqual(
+            expect.objectContaining({
+              path: `${scanRoot}/${file.path}`,
+              line: file.expectedLine,
+              code: file.expectedCode,
+              message: expect.stringContaining(scanRoot),
+              hint: expect.stringContaining("GitHub Pages"),
+            }),
+          );
+        }
+        expect(JSON.stringify(findings)).not.toContain("111111/original.md");
+      });
+    },
+  );
+
+  it("does not flag generic public auth documentation as an upload auth leak", async () => {
+    await withTempWorkspace("llm-wiki-static-leak-auth-docs-", async (workspaceDir) => {
+      // Arrange
+      await mkdir(resolve(workspaceDir, "quartz/public/docs"), { recursive: true });
+      await writeFile(
+        resolve(workspaceDir, "quartz/public/docs/auth.html"),
+        "<p>Authorization headers, Bearer tokens, signatures, and HMAC checks are authentication concepts.</p>\n",
+        "utf8",
+      );
+
+      // Act
+      const scan = await scanStaticOutputLeaks(workspaceDir);
+
+      // Assert
+      expect(scan.ok).toBe(true);
+      expect(scan.findings).toEqual([]);
+    });
+  });
+
+  it("detects raw artifacts from static output paths when file contents do not mention raw paths", async () => {
+    await withTempWorkspace("llm-wiki-static-leak-raw-paths-", async (workspaceDir) => {
+      // Arrange
+      const sourceId = "src_2026_06_23_path_only_111111";
+      const rawInputPath = `quartz/public/raw/inputs/2026/06/${sourceId}/original.pdf`;
+      const rawQueuePath = `quartz/public/raw/queue/${sourceId}.json`;
+      await mkdir(resolve(workspaceDir, rawInputPath, ".."), { recursive: true });
+      await mkdir(resolve(workspaceDir, rawQueuePath, ".."), { recursive: true });
+      await writeFile(resolve(workspaceDir, rawInputPath), "%PDF-1.7\n", "utf8");
+      await writeFile(resolve(workspaceDir, rawQueuePath), "{}\n", "utf8");
+
+      // Act
+      const scan = await scanStaticOutputLeaks(workspaceDir);
+
+      // Assert
+      expect(scan.ok).toBe(false);
+      expect(scan.scanned_roots).toEqual(["quartz/public"]);
+      for (const finding of scan.findings) {
+        expectStableStaticLeakFinding(finding);
+      }
+      expect(scan.findings).toEqual([
+        expect.objectContaining({
+          code: "STATIC_RAW_INPUTS_LEAK",
+          path: rawInputPath,
+          line: 1,
+          message: expect.stringContaining("raw input path metadata"),
+        }),
+        expect.objectContaining({
+          code: "STATIC_RAW_QUEUE_LEAK",
+          path: rawQueuePath,
+          line: 1,
+          message: expect.stringContaining("raw queue metadata"),
+        }),
+      ]);
+    });
+  });
+
+  it("scans quartz/content and quartz/public in the same workspace", async () => {
+    await withTempWorkspace("llm-wiki-static-leak-both-roots-", async (workspaceDir) => {
+      // Arrange
+      await mkdir(resolve(workspaceDir, "quartz/content/assets"), { recursive: true });
+      await mkdir(resolve(workspaceDir, "quartz/public/assets"), { recursive: true });
+      await writeFile(resolve(workspaceDir, "quartz/content/assets/upload-form.js"), "LlmWikiUploadForm\n", "utf8");
+      await writeFile(resolve(workspaceDir, "quartz/public/assets/upload-endpoint.js"), "fetch('/api/raw-upload')\n", "utf8");
+
+      // Act
+      const scan = await scanStaticOutputLeaks(workspaceDir);
+
+      // Assert
+      expect(scan.ok).toBe(false);
+      expect(scan.scanned_roots).toEqual(["quartz/content", "quartz/public"]);
+      expect(scan.findings).toEqual([
+        expect.objectContaining({
+          code: "STATIC_UPLOAD_COMPONENT_LEAK",
+          path: "quartz/content/assets/upload-form.js",
+          line: 1,
+        }),
+        expect.objectContaining({
+          code: "STATIC_UPLOAD_ENDPOINT_LEAK",
+          path: "quartz/public/assets/upload-endpoint.js",
+          line: 1,
+        }),
+      ]);
+    });
+  });
+
+  it("passes when static output directories are missing", async () => {
+    await withTempWorkspace("llm-wiki-static-leak-missing-dirs-", async (workspaceDir) => {
+      // Arrange
+      await mkdir(resolve(workspaceDir, "curated"), { recursive: true });
+
+      // Act
+      const scan = await scanStaticOutputLeaks(workspaceDir);
+
+      // Assert
+      expect(scan.ok).toBe(true);
+      expect(scan.findings).toEqual([]);
+    });
+  });
+
+  it("rejects default static scan roots with non-directory parents without throwing", async () => {
+    await withTempWorkspace("llm-wiki-static-leak-file-parent-", async (workspaceDir) => {
+      // Arrange
+      await writeFile(resolve(workspaceDir, "quartz"), "not a directory\n", "utf8");
+
+      // Act
+      const scan = await scanStaticOutputLeaks(workspaceDir);
+
+      // Assert
+      expect(scan.ok).toBe(false);
+      expect(scan.scanned_roots).toEqual([]);
+      expect(scan.findings).toEqual([
+        {
+          severity: "error",
+          code: "STATIC_SCAN_TARGET_UNSAFE",
+          path: "quartz/content",
+          message: "Static output scan target is unsafe: quartz/content.",
+          hint: "Remove the symlink or replace it with a regular directory before publishing GitHub Pages output.",
+        },
+        {
+          severity: "error",
+          code: "STATIC_SCAN_TARGET_UNSAFE",
+          path: "quartz/public",
+          message: "Static output scan target is unsafe: quartz/public.",
+          hint: "Remove the symlink or replace it with a regular directory before publishing GitHub Pages output.",
+        },
+      ]);
+    });
+  });
+
+  it("rejects symlinked static scan targets without following them", async () => {
+    await withTempWorkspace("llm-wiki-static-leak-symlink-target-", async (workspaceDir) => {
+      // Arrange
+      const outsideDir = resolve(workspaceDir, "outside-public");
+      await mkdir(resolve(workspaceDir, "quartz"), { recursive: true });
+      await mkdir(outsideDir, { recursive: true });
+      await writeFile(resolve(outsideDir, "index.html"), "LlmWikiUploadForm\n", "utf8");
+      await symlink(outsideDir, resolve(workspaceDir, "quartz/public"), "dir");
+
+      // Act
+      const scan = await scanStaticOutputLeaks(workspaceDir);
+
+      // Assert
+      expect(scan.ok).toBe(false);
+      expect(scan.findings).toEqual([
+        {
+          severity: "error",
+          code: "STATIC_SCAN_TARGET_UNSAFE",
+          path: "quartz/public",
+          message: "Static output scan target is unsafe: quartz/public.",
+          hint: "Remove the symlink or replace it with a regular directory before publishing GitHub Pages output.",
+        },
+      ]);
+    });
+  });
+
+  it("rejects static scan targets with a symlinked parent without following outside content", async () => {
+    await withTempWorkspace("llm-wiki-static-leak-symlink-parent-", async (workspaceDir) => {
+      // Arrange
+      const repoDir = resolve(workspaceDir, "repo");
+      const outsideQuartzDir = resolve(workspaceDir, "outside-quartz");
+      await mkdir(resolve(repoDir), { recursive: true });
+      await mkdir(resolve(outsideQuartzDir, "content"), { recursive: true });
+      await mkdir(resolve(outsideQuartzDir, "public"), { recursive: true });
+      await writeFile(resolve(outsideQuartzDir, "content/index.html"), "LlmWikiUploadForm\n", "utf8");
+      await writeFile(resolve(outsideQuartzDir, "public/index.html"), "fetch('/api/raw-upload')\n", "utf8");
+      await symlink(outsideQuartzDir, resolve(repoDir, "quartz"), "dir");
+
+      // Act
+      const scan = await scanStaticOutputLeaks(repoDir);
+
+      // Assert
+      expect(scan.ok).toBe(false);
+      expect(scan.scanned_roots).toEqual([]);
+      expect(scan.findings).toEqual([
+        {
+          severity: "error",
+          code: "STATIC_SCAN_TARGET_UNSAFE",
+          path: "quartz/content",
+          message: "Static output scan target is unsafe: quartz/content.",
+          hint: "Remove the symlink or replace it with a regular directory before publishing GitHub Pages output.",
+        },
+        {
+          severity: "error",
+          code: "STATIC_SCAN_TARGET_UNSAFE",
+          path: "quartz/public",
+          message: "Static output scan target is unsafe: quartz/public.",
+          hint: "Remove the symlink or replace it with a regular directory before publishing GitHub Pages output.",
+        },
+      ]);
+      expect(scan.findings.map((finding) => finding.code)).not.toContain("STATIC_UPLOAD_COMPONENT_LEAK");
+      expect(scan.findings.map((finding) => finding.code)).not.toContain("STATIC_UPLOAD_ENDPOINT_LEAK");
+    });
+  });
+
+  it("rejects custom static scan roots that resolve outside the repository", async () => {
+    await withTempWorkspace("llm-wiki-static-leak-outside-root-", async (workspaceDir) => {
+      // Arrange
+      const repoDir = resolve(workspaceDir, "repo");
+      const outsidePublicDir = resolve(workspaceDir, "outside-public");
+      await mkdir(repoDir, { recursive: true });
+      await mkdir(outsidePublicDir, { recursive: true });
+      await writeFile(resolve(outsidePublicDir, "index.html"), "LlmWikiUploadForm\n", "utf8");
+
+      // Act
+      const scan = await scanStaticOutputLeaks(repoDir, { roots: ["../outside-public"] });
+
+      // Assert
+      expect(scan.ok).toBe(false);
+      expect(scan.scanned_roots).toEqual([]);
+      expect(scan.findings).toEqual([
+        {
+          severity: "error",
+          code: "STATIC_SCAN_TARGET_UNSAFE",
+          path: "../outside-public",
+          message: "Static output scan target is unsafe: ../outside-public.",
+          hint: "Remove the symlink or replace it with a regular directory before publishing GitHub Pages output.",
+        },
+      ]);
+      expect(scan.findings.map((finding) => finding.code)).not.toContain("STATIC_UPLOAD_COMPONENT_LEAK");
+    });
+  });
+});
 
 describe("scanner frontmatter and runtime schema compatibility", () => {
   it("parses scaffold raw source cards using raw_source and source_kind", () => {

@@ -86,11 +86,11 @@ const GITHUB_PAGES_PROFILE_PATH = ".llm-wiki/profiles/github-pages.yml" as const
 const PUBLIC_PROFILE_PATH = ".llm-wiki/profiles/public.yml" as const;
 const PROFILE_EXTENSIONS = ["yml", "yaml"] as const;
 const QUARTZ_INSTALL_COMMAND = "cd quartz && npm install" as const;
+const GITHUB_PAGES_BUILD_COMMAND = "llm-wiki explore build --profile github-pages" as const;
 const LOCAL_BUILD_STEPS = [
-  "llm-wiki explore sync --profile github-pages",
-  "llm-wiki lint --profile github-pages --strict",
-  "cd quartz && npm run build",
-  "copy .llm-wiki/cache/github-pages-CNAME to quartz/public/CNAME when configured",
+  GITHUB_PAGES_BUILD_COMMAND,
+  "materialize .llm-wiki/cache/github-pages-CNAME to quartz/public/CNAME when configured",
+  "scan quartz/public for static leaks",
 ] as const;
 
 const REQUIRED_WORKFLOW_PERMISSIONS = {
@@ -111,8 +111,9 @@ const REQUIRED_WORKFLOW_STEPS = [
   { kind: "run", command: "cd quartz && npm install" },
   { kind: "run", command: "llm-wiki explore sync --profile github-pages" },
   { kind: "run", command: "llm-wiki lint --profile github-pages --strict" },
-  { kind: "run", command: "cd quartz && npm run build" },
+  { kind: "run", command: GITHUB_PAGES_BUILD_COMMAND },
   { kind: "run", command: "cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME" },
+  { kind: "run", command: "llm-wiki lint --profile github-pages --strict" },
   { kind: "uses", uses: "actions/upload-pages-artifact@v3", with: { path: "quartz/public" } },
   { kind: "uses", uses: "actions/deploy-pages@v4" },
 ] as const satisfies readonly RequiredWorkflowStep[];
@@ -872,12 +873,14 @@ jobs:
       - name: Strict public lint
         run: llm-wiki lint --profile github-pages --strict
       - name: Build Quartz
-        run: cd quartz && npm run build
+        run: ${GITHUB_PAGES_BUILD_COMMAND}
       - name: Preserve custom domain
         run: |
           if [ -f .llm-wiki/cache/github-pages-CNAME ]; then
             cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME
           fi
+      - name: Scan built Pages artifact
+        run: llm-wiki lint --profile github-pages --strict
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:

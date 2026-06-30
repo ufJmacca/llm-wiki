@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { execFile, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { PassThrough } from "node:stream";
@@ -221,6 +221,9 @@ function mockSuccessfulQuartzBuild(): {
       resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.github-pages.json"),
     );
     publicManifestExistedBeforeBuild = existsSync(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.public.json"));
+    rmSync(resolve(wikiDir, "quartz/public"), { recursive: true, force: true });
+    mkdirSync(resolve(wikiDir, "quartz/public"), { recursive: true });
+    writeFileSync(resolve(wikiDir, "quartz/public/index.html"), "<!doctype html><title>Pages</title>\n", "utf8");
 
     const child = new EventEmitter() as ChildProcessWithoutNullStreams;
     child.stdout = new PassThrough();
@@ -236,6 +239,42 @@ function mockSuccessfulQuartzBuild(): {
     githubPagesManifestExistedBeforeBuild: () => githubPagesManifestExistedBeforeBuild,
     publicManifestExistedBeforeBuild: () => publicManifestExistedBeforeBuild,
   };
+}
+
+function mockQuartzBuildDoesNotCreatePublicOutput(): void {
+  spawnMock.mockImplementation((_command: string, _args: string[], options: SpawnOptionsWithoutStdio) => {
+    const cwd = typeof options.cwd === "string" ? options.cwd : "";
+    const wikiDir = resolve(cwd, "..");
+    rmSync(resolve(wikiDir, "quartz/public"), { recursive: true, force: true });
+
+    const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = new PassThrough();
+    child.kill = vi.fn();
+    queueMicrotask(() => child.emit("close", 0, null));
+
+    return child;
+  });
+}
+
+function mockQuartzBuildEmitsPublicUploadLeak(): void {
+  spawnMock.mockImplementation((_command: string, _args: string[], options: SpawnOptionsWithoutStdio) => {
+    const cwd = typeof options.cwd === "string" ? options.cwd : "";
+    const wikiDir = resolve(cwd, "..");
+    const leakDir = resolve(wikiDir, "quartz/public/assets");
+    mkdirSync(leakDir, { recursive: true });
+    writeFileSync(resolve(leakDir, "upload.js"), "LlmWikiUploadForm\n", "utf8");
+
+    const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = new PassThrough();
+    child.kill = vi.fn();
+    queueMicrotask(() => child.emit("close", 0, null));
+
+    return child;
+  });
 }
 
 function commandOrder(content: string, commands: readonly string[]): number[] {
@@ -353,11 +392,17 @@ describe("deploy github-pages commands", () => {
       expect(workflow).toContain("cd quartz && npm install");
       expect(workflow).toContain("llm-wiki explore sync --profile github-pages");
       expect(workflow).toContain("llm-wiki lint --profile github-pages --strict");
-      expect(workflow).toContain("cd quartz && npm run build");
+      expect(workflow).toContain("llm-wiki explore build --profile github-pages");
       expect(workflow).toContain("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME");
       expect(workflow).toContain("uses: actions/upload-pages-artifact@v3");
       expect(workflow).toContain("path: quartz/public");
       expect(workflow).toContain("uses: actions/deploy-pages@v4");
+      expect(workflow.lastIndexOf("llm-wiki lint --profile github-pages --strict")).toBeGreaterThan(
+        workflow.indexOf("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME"),
+      );
+      expect(workflow.lastIndexOf("llm-wiki lint --profile github-pages --strict")).toBeLessThan(
+        workflow.indexOf("uses: actions/upload-pages-artifact@v3"),
+      );
       const workflowOrder = commandOrder(workflow, [
         "uses: actions/checkout@v4",
         "uses: actions/setup-node@v4",
@@ -366,7 +411,7 @@ describe("deploy github-pages commands", () => {
         "cd quartz && npm install",
         "llm-wiki explore sync --profile github-pages",
         "llm-wiki lint --profile github-pages --strict",
-        "cd quartz && npm run build",
+        "llm-wiki explore build --profile github-pages",
         "cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME",
         "uses: actions/upload-pages-artifact@v3",
         "uses: actions/deploy-pages@v4",
@@ -416,9 +461,9 @@ describe("deploy github-pages commands", () => {
       expect(sync.exitCode).toBe(0);
       expect(sync.stderr).toEqual([]);
       expect(workflow).toContain("llm-wiki explore sync --profile github-pages");
-      expect(workflow).toContain("cd quartz && npm run build");
+      expect(workflow).toContain("llm-wiki explore build --profile github-pages");
       expect(workflow.indexOf("llm-wiki explore sync --profile github-pages")).toBeLessThan(
-        workflow.indexOf("cd quartz && npm run build"),
+        workflow.indexOf("llm-wiki explore build --profile github-pages"),
       );
       expect(payload.data.materialized_paths).toContain("quartz/content/curated/index.md");
       expect(payload.data.generated_paths).toContain("quartz/content/index.md");
@@ -1440,7 +1485,10 @@ const config: QuartzConfig = {`,
       const workflowPath = resolve(invalidWorkflowWiki, ".github/workflows/llm-wiki-pages.yml");
       await writeFile(
         workflowPath,
-        (await readFile(workflowPath, "utf8")).replace("run: cd quartz && npm run build", "run: npm run build"),
+        (await readFile(workflowPath, "utf8")).replace(
+          "run: llm-wiki explore build --profile github-pages",
+          "run: npm run build",
+        ),
         "utf8",
       );
 
@@ -1689,6 +1737,39 @@ const config: QuartzConfig = {`,
       // Assert
       expect(publicLeak.exitCode).toBe(1);
       expect(parseDeployFailure(publicLeak.stdout).error.code).toBe("PUBLIC_LINT_FAILED");
+    });
+  });
+
+  it("fails check and status preflight when committed Quartz public output contains upload-capable code", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-public-static-upload-leak-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--custom-domain", "docs.example.com"]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+      await mkdir(resolve(wikiDir, "quartz/public/assets"), { recursive: true });
+      await writeFile(resolve(wikiDir, "quartz/public/assets/upload.js"), "LlmWikiUploadForm\n", "utf8");
+
+      // Act
+      const status = await runCliBuffered(["deploy", "github-pages", "status", "--repo", wikiDir, "--json"]);
+      const check = await runCliBuffered(["deploy", "github-pages", "check", "--repo", wikiDir, "--json"]);
+      const statusPayload = parseDeployStatus(status.stdout);
+      const checkPayload = parseDeployFailure(check.stdout);
+
+      // Assert
+      expect(status.exitCode).toBe(0);
+      expect(statusPayload.data.public_preflight).toEqual({
+        status: "fail",
+        issue_count: 1,
+      });
+      expect(check.exitCode).toBe(1);
+      expect(checkPayload.error).toMatchObject({
+        code: "PUBLIC_LINT_FAILED",
+        message: "Public preflight failed before GitHub Pages deployment.",
+      });
+      expect(checkPayload.error.hint).toContain("llm-wiki lint --profile github-pages --strict");
     });
   });
 
@@ -2001,16 +2082,15 @@ export default config
       expect(spawnMock).toHaveBeenCalledWith(
         "npm",
         ["run", "build"],
-        { cwd: resolve(wikiDir, "quartz"), stdio: ["ignore", "pipe", "pipe"] },
+        expect.objectContaining({ cwd: resolve(wikiDir, "quartz"), stdio: ["ignore", "pipe", "pipe"] }),
       );
       expect(payload.data).toMatchObject({
         profile: "github-pages",
         output_path: "quartz/public",
         steps: [
-          "llm-wiki explore sync --profile github-pages",
-          "llm-wiki lint --profile github-pages --strict",
-          "cd quartz && npm run build",
-          "copy .llm-wiki/cache/github-pages-CNAME to quartz/public/CNAME when configured",
+          "llm-wiki explore build --profile github-pages",
+          "materialize .llm-wiki/cache/github-pages-CNAME to quartz/public/CNAME when configured",
+          "scan quartz/public for static leaks",
         ],
         sync: {
           manifest_path: ".llm-wiki/cache/quartz-manifest.github-pages.json",
@@ -2042,9 +2122,9 @@ export default config
         workflow.indexOf("llm-wiki lint --profile github-pages --strict"),
       );
       expect(workflow.indexOf("llm-wiki lint --profile github-pages --strict")).toBeLessThan(
-        workflow.indexOf("cd quartz && npm run build"),
+        workflow.indexOf("llm-wiki explore build --profile github-pages"),
       );
-      expect(workflow.indexOf("cd quartz && npm run build")).toBeLessThan(
+      expect(workflow.indexOf("llm-wiki explore build --profile github-pages")).toBeLessThan(
         workflow.indexOf("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME"),
       );
       expect(workflow.indexOf("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME")).toBeLessThan(
@@ -2076,7 +2156,7 @@ export default config
       expect(result.stderr).toEqual([]);
       expect(cachedCname).toBe("docs.example.com\n");
       expect(artifactCname).toBe("docs.example.com\n");
-      expect(workflow.indexOf("cd quartz && npm run build")).toBeLessThan(
+      expect(workflow.indexOf("llm-wiki explore build --profile github-pages")).toBeLessThan(
         workflow.indexOf("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME"),
       );
       expect(workflow.indexOf("cp .llm-wiki/cache/github-pages-CNAME quartz/public/CNAME")).toBeLessThan(
@@ -2188,6 +2268,77 @@ export default config
       await expect(readFile(resolve(wikiDir, ".llm-wiki/cache/quartz-manifest.github-pages.json"), "utf8")).resolves.toContain(
         "\"profile\": \"github-pages\"",
       );
+    });
+  });
+
+  it("fails build-local when Quartz exits successfully without producing the Pages output directory", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-build-local-missing-public-output-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      mockQuartzBuildDoesNotCreatePublicOutput();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--custom-domain", "docs.example.com"]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["deploy", "github-pages", "build-local", "--repo", wikiDir, "--json"]);
+      const payload = parseDeployFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(spawnMock).toHaveBeenCalled();
+      expect(payload.error).toEqual({
+        code: "PUBLIC_PROFILE_ARTIFACT_MISSING",
+        message: "Quartz build did not produce the expected Pages output directory.",
+        hint: "Ensure the Quartz build writes static Pages output to quartz/public before rerunning llm-wiki explore build.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "PUBLIC_PROFILE_ARTIFACT_MISSING",
+          path: "quartz/public",
+        }),
+      ]);
+      expect(existsSync(resolve(wikiDir, "quartz/public/CNAME"))).toBe(false);
+    });
+  });
+
+  it("fails build-local when the Quartz build emits static upload leaks into the Pages artifact", async () => {
+    await withTempWorkspace("llm-wiki-deploy-pages-build-local-post-build-leak-", async (workspaceDir) => {
+      // Arrange
+      spawnMock.mockReset();
+      mockQuartzBuildEmitsPublicUploadLeak();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      await initializeQuartzRuntime(wikiDir);
+      await markQuartzDependenciesInstalled(wikiDir);
+      await runCliBuffered(["deploy", "github-pages", "init", "--repo", wikiDir, "--custom-domain", "docs.example.com"]);
+      await makeDefaultCuratedPagesPublic(wikiDir);
+
+      // Act
+      const result = await runCliBuffered(["deploy", "github-pages", "build-local", "--repo", wikiDir, "--json"]);
+      const payload = parseDeployFailure(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(spawnMock).toHaveBeenCalled();
+      expect(payload.error).toEqual({
+        code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+        message: "Public profile leak check failed after Quartz build: public_static_upload_component_leak.",
+        hint: "Remove upload, runtime, review, queue, raw, and secret data from committed GitHub Pages static output.",
+      });
+      expect(payload.issues).toEqual([
+        expect.objectContaining({
+          severity: "error",
+          code: "PUBLIC_PROFILE_LEAK_CHECK_FAILED",
+          path: "quartz/public/assets/upload.js",
+        }),
+      ]);
     });
   });
 

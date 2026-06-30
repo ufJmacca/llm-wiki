@@ -55,6 +55,7 @@ export type ReviewQueueItem = {
   title: string;
   source_kind: string;
   status: "queued" | "ingesting" | "ingested" | "blocked";
+  auto_ingest?: ReviewQueueAutoIngestData;
   visibility: string | null;
   source_card_path: string | null;
   source_card_materialized: boolean;
@@ -63,6 +64,15 @@ export type ReviewQueueItem = {
   captured_at: string | null;
   updated_at: string | null;
   source: ReviewSourceBadgeData;
+};
+
+export type ReviewQueueAutoIngestData = {
+  enabled: boolean;
+  attempt_count: number;
+  last_attempt_at: string;
+  last_result: string;
+  last_error_code: string | null;
+  last_error_message: string | null;
 };
 
 export type ReviewCategory<Item> = {
@@ -272,6 +282,7 @@ function buildQueueData(
         title: card?.title ?? queueFile.item.title,
         source_kind: sourceKind,
         status: queueFile.item.status,
+        ...autoIngestField(queueFile.item.auto_ingest),
         visibility: card?.visibility ?? stringValue(queueFile.item.visibility),
         source_card_path: card?.path ?? stringValue(queueFile.item.path),
         source_card_materialized: card === undefined ? false : (materializedMarkdownPaths?.has(card.path) ?? true),
@@ -294,6 +305,60 @@ function buildQueueData(
     },
     items,
   };
+}
+
+function autoIngestField(
+  metadata: unknown,
+): { auto_ingest: ReviewQueueAutoIngestData } | Record<string, never> {
+  if (!isReviewQueueAutoIngestData(metadata)) {
+    return {};
+  }
+
+  return {
+    auto_ingest: {
+      enabled: metadata.enabled,
+      attempt_count: metadata.attempt_count,
+      last_attempt_at: metadata.last_attempt_at,
+      last_result: metadata.last_result,
+      last_error_code: metadata.last_error_code,
+      last_error_message: safeReviewText(metadata.last_error_message),
+    },
+  };
+}
+
+function isReviewQueueAutoIngestData(value: unknown): value is ReviewQueueAutoIngestData {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return (
+    typeof value.enabled === "boolean" &&
+    typeof value.attempt_count === "number" &&
+    Number.isInteger(value.attempt_count) &&
+    value.attempt_count >= 0 &&
+    typeof value.last_attempt_at === "string" &&
+    typeof value.last_result === "string" &&
+    nullableStringValue(value.last_error_code) &&
+    nullableStringValue(value.last_error_message)
+  );
+}
+
+function safeReviewText(value: string | null): string | null {
+  if (value === null) {
+    return null;
+  }
+
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  const redacted = normalized
+    .replace(
+      /\b(raw(?:[\s_-]+upload)?[\s_-]+body|upload[\s_-]+body)\s*[:=]\s*(?:"[^"]*"|'[^']*'|.*$)/giu,
+      "$1: [raw upload content redacted]",
+    )
+    .replace(/\bPRIVATE\s+RAW\s+UPLOAD\s+BODY\b/giu, "[raw upload content redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gu, "[redacted]")
+    .replace(/\b(api[_-]?key|upload[_-]?token|token|password|secret)\s*[:=]\s*[^,\s;]+/giu, "$1=[redacted]");
+
+  return redacted.length > 240 ? `${redacted.slice(0, 237)}...` : redacted;
 }
 
 function compareQueueItemsNewestFirst(left: ReviewQueueItem, right: ReviewQueueItem): number {
@@ -695,6 +760,14 @@ function publicImpactForVisibilityRule(ruleId: string): string {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() !== "" ? value : null;
+}
+
+function nullableStringValue(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function category<Item>(items: Item[]): ReviewCategory<Item> {

@@ -55,12 +55,23 @@ type QueueShowData = {
   queue_record: {
     source_id: string;
     status: "queued" | "ingesting" | "ingested" | "blocked";
+    auto_ingest?: AutoIngestMetadata;
   };
   source_card: {
     frontmatter: {
       status: "queued" | "ingesting" | "ingested" | "blocked";
+      auto_ingest?: AutoIngestMetadata;
     };
   };
+};
+
+type AutoIngestMetadata = {
+  enabled: boolean;
+  attempt_count: number;
+  last_attempt_at: string;
+  last_result: string;
+  last_error_code: string | null;
+  last_error_message: string | null;
 };
 
 type IngestAgentData = {
@@ -432,6 +443,17 @@ describe("ingest local agent automation", () => {
       expect(result.stderr).toEqual([]);
       expect(queuePayload.data.queue_record.status).toBe("ingested");
       expect(queuePayload.data.source_card.frontmatter.status).toBe("ingested");
+      expect(queuePayload.data.queue_record.auto_ingest).toMatchObject({
+        enabled: true,
+        attempt_count: 1,
+        last_result: "ingested",
+        last_error_code: null,
+        last_error_message: null,
+      });
+      expect(queuePayload.data.queue_record.auto_ingest?.last_attempt_at).toEqual(expect.any(String));
+      expect(queuePayload.data.source_card.frontmatter.auto_ingest).toEqual(
+        queuePayload.data.queue_record.auto_ingest,
+      );
     });
   });
 

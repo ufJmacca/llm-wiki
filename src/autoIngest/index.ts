@@ -737,7 +737,7 @@ function addSourceResultToCounts(
 }
 
 function watchResultIsSessionFailure(result: AutoIngestSourceResult): boolean {
-  return result.outcome === "blocked" || result.outcome === "deferred";
+  return result.outcome === "blocked" || result.outcome === "deferred" || result.outcome === "skipped";
 }
 
 function normalizeLimit(limit: number | undefined, fallback: number): number {

@@ -23,12 +23,27 @@ export type IngestValidationResult = {
   checked_paths: string[];
 };
 
+export type IngestChangedFilesSnapshot = {
+  enabled: boolean;
+  paths: readonly string[];
+  committedPathsIncomplete?: boolean;
+};
+
+export type IngestValidationOptions = {
+  changedFilesBaseline?: IngestChangedFilesSnapshot;
+  currentAttemptPaths?: readonly string[];
+};
+
 type NoGitValidationWindow = {
   start: string;
   end?: string;
 };
 
-export async function validateIngestReadiness(repoRoot: string, sourceId: string): Promise<IngestValidationResult> {
+export async function validateIngestReadiness(
+  repoRoot: string,
+  sourceId: string,
+  options: IngestValidationOptions = {},
+): Promise<IngestValidationResult> {
   const queueSource = await showQueueSource(repoRoot, sourceId);
   if (!queueSource.ok) {
     const issue = {
@@ -110,7 +125,7 @@ export async function validateIngestReadiness(repoRoot: string, sourceId: string
     scan,
     sourceId,
     sourceSummary,
-    changedFiles,
+    changedFilesForCurrentAttempt(changedFiles, options),
     noGitValidationWindow(queueSource.value.queue_record),
     queueSource.value.queue_record.status,
   );
@@ -138,6 +153,34 @@ export async function validateIngestReadiness(repoRoot: string, sourceId: string
       dedupedIssues,
       sourceIdPages.map((page) => page.path),
     ),
+  };
+}
+
+function changedFilesForCurrentAttempt(
+  changedFiles: { enabled: boolean; paths: readonly string[]; committedPathsIncomplete?: boolean },
+  options: IngestValidationOptions,
+): { enabled: boolean; paths: readonly string[]; committedPathsIncomplete?: boolean } {
+  if (options.changedFilesBaseline === undefined && options.currentAttemptPaths === undefined) {
+    return changedFiles;
+  }
+
+  const baselinePaths = new Set(options.changedFilesBaseline?.paths ?? []);
+  const paths = new Set<string>();
+  for (const path of changedFiles.paths) {
+    if (!baselinePaths.has(path)) {
+      paths.add(path);
+    }
+  }
+
+  for (const path of options.currentAttemptPaths ?? []) {
+    paths.add(path);
+  }
+
+  const hasCurrentAttemptPaths = options.currentAttemptPaths !== undefined;
+  return {
+    enabled: hasCurrentAttemptPaths ? true : changedFiles.enabled,
+    paths: [...paths].sort(),
+    committedPathsIncomplete: hasCurrentAttemptPaths ? false : changedFiles.committedPathsIncomplete,
   };
 }
 

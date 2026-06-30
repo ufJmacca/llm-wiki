@@ -491,7 +491,11 @@ async function runQueueIngestAggregateWatchCommand(
   try {
     do {
       try {
-        mergeQueueIngestData(data, await runQueueIngestOnce(repoRoot, target, limit));
+        const next = await runQueueIngestOnce(repoRoot, target, limit);
+        mergeQueueIngestData(data, next);
+        if (targetedQueueIngestWatchIsComplete(target, next)) {
+          stopRequested = true;
+        }
       } catch (error) {
         throwQueueIngestRuntimeFailure(error, io, repoRoot, json);
       }
@@ -580,6 +584,14 @@ function mergeQueueIngestData(target: QueueIngestData, next: QueueIngestData): v
   target.counts.blocked += next.counts.blocked;
   target.counts.skipped += next.counts.skipped;
   target.counts.deferred += next.counts.deferred;
+}
+
+function targetedQueueIngestWatchIsComplete(target: string | undefined, data: QueueIngestData): boolean {
+  if (target === undefined) {
+    return false;
+  }
+
+  return data.results.some((result) => result.source_id === target && result.final_status !== "queued");
 }
 
 function throwQueueIngestRuntimeFailure(
@@ -719,12 +731,12 @@ function countQueueIngestResults(
   return counts;
 }
 
-function queueIngestIsIncomplete(data: QueueIngestData): boolean {
-  return data.results.some((result) => result.outcome !== "ingested");
+export function queueIngestIsIncomplete(data: QueueIngestData): boolean {
+  return queueIngestIncompleteCount(data) > 0;
 }
 
 function queueIngestIncompleteError(data: QueueIngestData): RuntimeCommandError {
-  const incompleteCount = data.results.filter((result) => result.outcome !== "ingested").length;
+  const incompleteCount = queueIngestIncompleteCount(data);
 
   return new RuntimeCommandError({
     code: "QUEUE_INGEST_INCOMPLETE",
@@ -732,6 +744,10 @@ function queueIngestIncompleteError(data: QueueIngestData): RuntimeCommandError 
     path: "raw/queue",
     hint: "Review the per-source results, fix blocked or deferred sources, then rerun llm-wiki queue ingest --auto.",
   });
+}
+
+function queueIngestIncompleteCount(data: QueueIngestData): number {
+  return data.counts.blocked + data.counts.skipped + data.counts.deferred;
 }
 
 function queueIngestWatchIncompleteError(summary: AutoIngestWatchSummary): RuntimeCommandError {

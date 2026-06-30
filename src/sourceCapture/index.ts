@@ -17,6 +17,15 @@ import { err, ok, type Result } from "../utils/result.js";
 export type SourceKind = "file" | "text" | "url";
 export type QueueStatus = "queued" | "ingesting" | "ingested" | "blocked";
 
+export type QueueAutoIngestMetadata = {
+  enabled: boolean;
+  attempt_count: number;
+  last_attempt_at: string;
+  last_result: string;
+  last_error_code: string | null;
+  last_error_message: string | null;
+};
+
 export type CapturedSource = {
   source_id: string;
   title: string;
@@ -167,6 +176,7 @@ type QueueJson = {
   captured_at: string;
   content_hash: string;
   status: QueueStatus;
+  auto_ingest?: QueueAutoIngestMetadata;
   visibility: "private";
   path: string;
   original_path: string;

@@ -308,7 +308,10 @@ export async function syncQuartzContent(
   const selection = selectMarkdownForProfile(profile, scan.markdown, scan.rawOriginals);
   const warnings = await ensureQuartzContentIgnored(repoRoot);
   if (publicLike) {
-    await assertPublicSyncIsSafe(repoRoot, scan, profile, selection.markdown, selection.matchedMarkdown, options.lintResult);
+    await assertPublicSyncIsSafe(repoRoot, scan, profile, selection.markdown, selection.matchedMarkdown, {
+      lintResult: options.lintResult,
+      ignorePreviousPrivateQuartzContent: !preserveContentRoot,
+    });
     if (!preserveContentRoot) {
       await clearQuartzContent(repoRoot);
       await removeQuartzManifests(repoRoot);
@@ -517,7 +520,7 @@ export async function assertPublicQuartzSyncSafety(
     profile,
     selection.markdown,
     selection.matchedMarkdown,
-    options.lintResult,
+    { lintResult: options.lintResult },
   );
 }
 
@@ -556,7 +559,7 @@ export async function assertPublicQuartzBuildPreflight(
     profile,
     selection.markdown,
     selection.matchedMarkdown,
-    options.lintResult,
+    { lintResult: options.lintResult },
   );
   assertQuartzBuildHomepageSelected(selection.markdown);
 }
@@ -652,13 +655,19 @@ async function assertPublicSyncIsSafe(
   profile: WikiProfile,
   materializedFiles: readonly RepoMarkdownFile[],
   matchedFiles: readonly RepoMarkdownFile[],
-  lintResult?: LintResult,
+  options: {
+    lintResult?: LintResult;
+    ignorePreviousPrivateQuartzContent?: boolean;
+  } = {},
 ): Promise<void> {
-  const publicLintResult = lintResult ?? await lintWiki(repoRoot, {
+  const publicLintResult = options.lintResult ?? await lintWiki(repoRoot, {
     profile: profile.sourceName,
     strict: true,
     staticOutputLeakRoots: [QUARTZ_CONTENT_OUTPUT_ROOT],
   });
+  const previousPrivateQuartzContentPaths = options.ignorePreviousPrivateQuartzContent === true
+    ? await readPreviousPrivateQuartzContentPaths(repoRoot)
+    : new Set<string>();
   const materializedPaths = new Set(materializedFiles.map((file) => file.path));
   const matchedPaths = new Set(matchedFiles.map((file) => file.path));
   const matchedMissingOrInvalidVisibilityPaths = new Set(
@@ -672,7 +681,8 @@ async function assertPublicSyncIsSafe(
         materializedPaths,
         matchedPaths,
         matchedMissingOrInvalidVisibilityPaths,
-      ),
+      ) &&
+      !isPreviousPrivateQuartzContentIssue(issue, previousPrivateQuartzContentPaths),
   );
   if (blockingIssue) {
     throw new QuartzOperationError({
@@ -684,6 +694,25 @@ async function assertPublicSyncIsSafe(
   }
 
   assertPublicLinksTargetMaterializedFiles(scan, materializedFiles);
+}
+
+async function readPreviousPrivateQuartzContentPaths(repoRoot: string): Promise<Set<string>> {
+  const paths = await Promise.all(
+    (["local", "review"] as const).map(async (profileName) => readQuartzManifestContentPaths(repoRoot, profileName)),
+  );
+
+  return new Set(paths.flat().filter((path) => path.startsWith(`${QUARTZ_CONTENT_OUTPUT_ROOT}/`)));
+}
+
+function isPreviousPrivateQuartzContentIssue(
+  issue: LintResult["issues"][number],
+  previousPrivateQuartzContentPaths: ReadonlySet<string>,
+): boolean {
+  return (
+    previousPrivateQuartzContentPaths.has(issue.path) &&
+    (issue.rule_id.startsWith("public_quartz_") ||
+      (issue.rule_id.startsWith("public_static_") && issue.rule_id !== "public_static_scan_target_unsafe"))
+  );
 }
 
 function assertPublicLinksTargetMaterializedFiles(

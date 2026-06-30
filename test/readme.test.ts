@@ -88,6 +88,39 @@ describe("README local agent documentation", () => {
   });
 });
 
+describe("README GitHub Pages deploy documentation", () => {
+  it("documents publisher-only committed Pages deployment instead of CI-side site generation", async () => {
+    // Arrange
+    const requiredDocumentation = [
+      "The generated workflow is publisher-only.",
+      "checks out the repository, uploads the committed `quartz/public` directory with `actions/upload-pages-artifact`, and deploys through the official Pages actions.",
+      "It does not set up Node, install `llm-wiki` or Quartz dependencies, run Explorer sync, ingest, lint, or build steps, or generate Pages output in CI.",
+      "`deploy github-pages` generates the publisher-only Pages workflow/profile pair, validates deploy readiness, and runs the local build/check path used before committing `quartz/public`.",
+      "committed Pages output under `quartz/public` remains trackable by Git.",
+      "running `build-local`, running `check`, committing `quartz/public`, opening a pull request",
+      "`quartz/public/` is generated static Pages output and remains trackable so maintainers can commit it for review before publication.",
+    ];
+    const removedDocumentation = [
+      "sets up Node 22",
+      "installs the `llm-wiki` CLI without requiring root npm project files",
+      "installs Quartz dependencies under `quartz/`, runs GitHub Pages profile sync, strict public lint, the safe `llm-wiki explore build --profile github-pages` wrapper",
+      "runs the local preflight sequence that mirrors CI",
+      "`quartz/content/`, `quartz/public/`, `quartz/.quartz-cache/`, and `quartz/quartz/` are generated Explorer/runtime outputs ignored by the wiki scaffold.",
+    ];
+
+    // Act
+    const readme = await readReadme();
+
+    // Assert
+    for (const expectedText of requiredDocumentation) {
+      expect(readme).toContain(expectedText);
+    }
+    for (const removedText of removedDocumentation) {
+      expect(readme).not.toContain(removedText);
+    }
+  });
+});
+
 describe("README local Explorer upload and review documentation", () => {
   it("documents the browser upload workflow, supported modes, local daemon endpoint, and ingest follow-up commands", async () => {
     // Arrange
@@ -162,6 +195,8 @@ describe("README local Explorer upload and review documentation", () => {
       "`_llm-wiki/runtime/local-daemon.json` is generated only for local/review Explorer runtime use and is excluded from public and GitHub Pages output.",
       "Strict public lint validates live repository inputs selected for public output; it does not scan existing local/review artifacts already under `quartz/content`, so run public sync/build before publishing to regenerate Quartz output without local runtime metadata, daemon tokens, queue data, private review pages, raw source cards, or raw originals.",
       "The local daemon binds to loopback (`127.0.0.1`, `localhost`, or `::1`) so browser uploads stay on the same machine by default.",
+      "writes local/review preview output under ignored `.llm-wiki/cache/` storage instead of committed `quartz/public`",
+      "Local/review Explorer serve writes its preview files under ignored `.llm-wiki/cache/` storage rather than `quartz/public`, which is reserved for committed Pages output.",
     ];
 
     // Act

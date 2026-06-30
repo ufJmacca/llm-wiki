@@ -400,7 +400,17 @@ describe("explore serve command", () => {
       expect(spawnObservation.syncedBeforeServe()).toBe(true);
       expect(spawnMock).toHaveBeenCalledWith(
         "npm",
-        ["run", "serve", "--", "--port", "8765", "--wsPort", expectedWsPort],
+        [
+          "run",
+          "serve",
+          "--",
+          "--port",
+          "8765",
+          "--wsPort",
+          expectedWsPort,
+          "--output",
+          "../.llm-wiki/cache/quartz-serve-public",
+        ],
         {
           cwd: resolve(wikiDir, "quartz"),
           env: expect.objectContaining({
@@ -423,7 +433,17 @@ describe("explore serve command", () => {
         },
         quartz: {
           command: "npm",
-          args: ["run", "serve", "--", "--port", "8765", "--wsPort", expectedWsPort],
+          args: [
+            "run",
+            "serve",
+            "--",
+            "--port",
+            "8765",
+            "--wsPort",
+            expectedWsPort,
+            "--output",
+            "../.llm-wiki/cache/quartz-serve-public",
+          ],
           cwd: resolve(wikiDir, "quartz"),
           status: "running",
         },
@@ -737,7 +757,17 @@ describe("explore serve command", () => {
         expect(result.stderr).toEqual([]);
         expect(spawnMock).toHaveBeenCalledWith(
           "npm.cmd",
-          ["run", "serve", "--", "--port", "8766", "--wsPort", String(payload.data.ws_port)],
+          [
+            "run",
+            "serve",
+            "--",
+            "--port",
+            "8766",
+            "--wsPort",
+            String(payload.data.ws_port),
+            "--output",
+            "../.llm-wiki/cache/quartz-serve-public",
+          ],
           expect.objectContaining({
             cwd: resolve(wikiDir, "quartz"),
             stdio: ["ignore", "pipe", "pipe"],

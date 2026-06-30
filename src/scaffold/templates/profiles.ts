@@ -61,6 +61,8 @@ features:
   graph: true
   backlinks: true
   upload: false
+  review: false
+  review_panel: false
 source_links:
   allow_local_file_links: false
 safety:

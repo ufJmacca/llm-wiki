@@ -148,6 +148,23 @@ describe("core wiki scaffold templates", () => {
     }
   });
 
+  it("keeps generated Quartz internals ignored while allowing committed Pages output", () => {
+    // Arrange
+    const plannedEntries = new Map(planWikiScaffold(defaultOptions).map((entry) => [entry.path, entry.content]));
+
+    // Act
+    const gitignore = plannedEntries.get(".gitignore");
+
+    // Assert
+    expect(gitignore).toBeDefined();
+    expect(gitignore).toContain(".llm-wiki/cache/");
+    expect(gitignore).toContain("node_modules/");
+    expect(gitignore).toContain("quartz/.quartz-cache/");
+    expect(gitignore).toContain("quartz/content/");
+    expect(gitignore).toContain("quartz/quartz/");
+    expect(gitignore).not.toContain("quartz/public/");
+  });
+
   it("scaffolds executable Codex config only for the Codex agent", () => {
     // Arrange
     const codexEntries = new Map(

@@ -35,6 +35,7 @@ const LOOPBACK_LISTEN_PRELOAD = "--require=./scripts/llm-wiki-loopback-listen.cj
 const QUARTZ_READY_SETTLE_MS = 250;
 const QUARTZ_READY_OUTPUT_TAIL_BYTES = 16 * 1024;
 const QUARTZ_SERVE_OUTPUT_TAIL_BYTES = 64 * 1024;
+const PRIVATE_EXPLORER_OUTPUT_PATH = "../.llm-wiki/cache/quartz-serve-public" as const;
 const QUARTZ_BIN_CANDIDATES = [
   "quartz/node_modules/.bin/quartz",
   "quartz/node_modules/.bin/quartz.cmd",
@@ -107,7 +108,16 @@ export async function serveQuartzExplorer(
   const wsPort = await selectQuartzWebSocketPort(host, port);
   const url = explorerUrl(host, port);
   const watchPaths = [...EXPLORER_WATCH_PATHS];
-  const args = ["run", "serve", "--", "--port", String(port), "--wsPort", String(wsPort)];
+  const args = [
+    "run",
+    "serve",
+    "--",
+    "--port",
+    String(port),
+    "--wsPort",
+    String(wsPort),
+    ...privateExplorerOutputArgs(syncResult.data.profile),
+  ];
   const env = quartzServeEnvironment(host);
   const stopWatching = await startExplorerWatchers(
     repoRoot,
@@ -732,6 +742,10 @@ export function syncSummary(
     materialized_paths: sync.materialized_paths,
     generated_paths: sync.generated_paths,
   };
+}
+
+function privateExplorerOutputArgs(profile: QuartzSyncResult["profile"]): string[] {
+  return profile === "local" || profile === "review" ? ["--output", PRIVATE_EXPLORER_OUTPUT_PATH] : [];
 }
 
 async function startExplorerWatchers(

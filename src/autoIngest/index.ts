@@ -1,3 +1,5 @@
+import { setTimeout as sleep } from "node:timers/promises";
+
 import {
   checkLocalAgentAvailability,
   LocalAgentExecutionError,
@@ -58,6 +60,26 @@ export type AutoIngestBatchResult = {
   };
 };
 
+export type AutoIngestWatchSummary = {
+  agent: string;
+  counts: AutoIngestBatchResult["counts"];
+  interrupted: boolean;
+  failure_count: number;
+  exit_code: 0 | 1;
+};
+
+export type AutoIngestWatchEvent =
+  | {
+    event: "result";
+    agent: string;
+    result: AutoIngestSourceResult;
+    counts: AutoIngestBatchResult["counts"];
+  }
+  | {
+    event: "summary";
+    summary: AutoIngestWatchSummary;
+  };
+
 export type RunAutoIngestBatchInput = {
   repoRoot: string;
   limit?: number;
@@ -72,6 +94,17 @@ export type RunAutoIngestSourceInput = {
   now?: () => Date;
   lock?: Pick<IngestLockOptions, "timeoutMs" | "retryDelayMs">;
   command?: string;
+};
+
+export type RunAutoIngestWatchInput = {
+  repoRoot: string;
+  now?: () => Date;
+  lock?: Pick<IngestLockOptions, "timeoutMs" | "retryDelayMs">;
+  command?: string;
+  pollIntervalMs?: number;
+  signal?: AbortSignal;
+  onPreflightComplete?: (agent: LocalAgentConfig) => void | Promise<void>;
+  onEvent?: (event: AutoIngestWatchEvent) => void | Promise<void>;
 };
 
 type QueueCandidate = {
@@ -92,6 +125,8 @@ type CurrentSourceState = {
   status: QueueStatus;
   autoIngest: AutoIngestMetadata | null;
 };
+
+const DEFAULT_WATCH_POLL_INTERVAL_MS = 250;
 
 export async function runAutoIngestBatch(input: RunAutoIngestBatchInput): Promise<AutoIngestBatchResult> {
   const agent = await resolveAndPreflightDefaultLocalAgent(input.repoRoot);
@@ -137,6 +172,76 @@ export async function runAutoIngestSource(input: RunAutoIngestSourceInput): Prom
     lock: input.lock,
     command: input.command,
   });
+}
+
+export async function runAutoIngestWatch(input: RunAutoIngestWatchInput): Promise<AutoIngestWatchSummary> {
+  const agent = await resolveAndPreflightDefaultLocalAgent(input.repoRoot);
+  const counts = emptyAutoIngestCounts();
+  const command = input.command ?? "llm-wiki queue ingest --auto --watch";
+  let failureCount = 0;
+  let interrupted = signalIsAborted(input.signal);
+
+  await input.onPreflightComplete?.(agent);
+
+  while (!interrupted) {
+    const candidates = await selectQueuedCandidates(input.repoRoot);
+
+    for (const candidate of candidates) {
+      if (signalIsAborted(input.signal)) {
+        interrupted = true;
+        break;
+      }
+
+      const result = await runQueuedSourceWithAgent({
+        repoRoot: input.repoRoot,
+        sourceId: candidate.sourceId,
+        agent,
+        now: input.now,
+        lock: input.lock,
+        command,
+      });
+
+      addSourceResultToCounts(counts, result);
+      if (watchResultIsSessionFailure(result)) {
+        failureCount += 1;
+      }
+
+      await input.onEvent?.({
+        event: "result",
+        agent: agent.name,
+        result,
+        counts: { ...counts },
+      });
+
+      if (signalIsAborted(input.signal)) {
+        interrupted = true;
+        break;
+      }
+    }
+
+    if (interrupted || signalIsAborted(input.signal)) {
+      interrupted = true;
+      break;
+    }
+
+    await sleepForWatchPoll(input.pollIntervalMs, input.signal);
+    interrupted = signalIsAborted(input.signal);
+  }
+
+  const summary: AutoIngestWatchSummary = {
+    agent: agent.name,
+    counts: { ...counts },
+    interrupted,
+    failure_count: failureCount,
+    exit_code: failureCount === 0 ? 0 : 1,
+  };
+
+  await input.onEvent?.({
+    event: "summary",
+    summary,
+  });
+
+  return summary;
 }
 
 async function runQueuedSourceWithAgent(input: RunQueuedSourceInput): Promise<AutoIngestSourceResult> {
@@ -391,32 +496,51 @@ function skippedResult(
 }
 
 function countResults(selected: number, results: readonly AutoIngestSourceResult[]): AutoIngestBatchResult["counts"] {
-  const counts: AutoIngestBatchResult["counts"] = {
-    selected,
+  const counts = emptyAutoIngestCounts();
+
+  for (const result of results) {
+    addSourceResultToCounts(counts, result);
+  }
+
+  counts.selected = selected;
+
+  return counts;
+}
+
+function emptyAutoIngestCounts(): AutoIngestBatchResult["counts"] {
+  return {
+    selected: 0,
     attempted: 0,
     ingested: 0,
     blocked: 0,
     skipped: 0,
     deferred: 0,
   };
+}
 
-  for (const result of results) {
-    if (result.attempted) {
-      counts.attempted += 1;
-    }
+function addSourceResultToCounts(
+  counts: AutoIngestBatchResult["counts"],
+  result: AutoIngestSourceResult,
+): void {
+  counts.selected += 1;
 
-    if (result.outcome === "ingested") {
-      counts.ingested += 1;
-    } else if (result.outcome === "blocked") {
-      counts.blocked += 1;
-    } else if (result.outcome === "skipped") {
-      counts.skipped += 1;
-    } else {
-      counts.deferred += 1;
-    }
+  if (result.attempted) {
+    counts.attempted += 1;
   }
 
-  return counts;
+  if (result.outcome === "ingested") {
+    counts.ingested += 1;
+  } else if (result.outcome === "blocked") {
+    counts.blocked += 1;
+  } else if (result.outcome === "skipped") {
+    counts.skipped += 1;
+  } else {
+    counts.deferred += 1;
+  }
+}
+
+function watchResultIsSessionFailure(result: AutoIngestSourceResult): boolean {
+  return result.outcome === "blocked" || result.outcome === "deferred";
 }
 
 function normalizeLimit(limit: number | undefined, fallback: number): number {
@@ -429,6 +553,31 @@ function normalizeLimit(limit: number | undefined, fallback: number): number {
   }
 
   return Math.max(0, Math.trunc(limit));
+}
+
+async function sleepForWatchPoll(pollIntervalMs: number | undefined, signal: AbortSignal | undefined): Promise<void> {
+  const intervalMs = normalizeDuration(pollIntervalMs, DEFAULT_WATCH_POLL_INTERVAL_MS);
+  if (intervalMs === 0) {
+    return;
+  }
+
+  try {
+    await sleep(intervalMs, undefined, signal === undefined ? undefined : { signal });
+  } catch (error) {
+    if (signal?.aborted === true || isAbortError(error)) {
+      return;
+    }
+
+    throw error;
+  }
+}
+
+function normalizeDuration(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return fallback;
+  }
+
+  return Math.max(0, Math.trunc(value));
 }
 
 function currentDate(now: (() => Date) | undefined): Date {
@@ -512,4 +661,12 @@ function errorToSafeAutoIngestError(error: unknown, sourceId: string): AutoInges
 
 function safeMessage(message: string): string {
   return message.replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function signalIsAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
 }

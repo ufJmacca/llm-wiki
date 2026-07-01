@@ -13,6 +13,7 @@ export type StaticLeakCode =
   | "STATIC_UPLOAD_AUTH_LEAK"
   | "STATIC_RAW_INPUTS_LEAK"
   | "STATIC_RAW_QUEUE_LEAK"
+  | "STATIC_AUTO_INGEST_METADATA_LEAK"
   | "STATIC_PRIVATE_SOURCE_CARD_LEAK"
   | "STATIC_REVIEW_PAGE_LEAK"
   | "STATIC_SECRET_MARKER_LEAK"
@@ -76,6 +77,10 @@ const MARKER_RULES: readonly MarkerRule[] = [
     code: "STATIC_RAW_QUEUE_LEAK",
     pattern:
       /\braw\/queue\/[^\s"'`)<]+|\bqueue_path\b|\boriginal_path\b|\bllm_wiki_queue_dashboard\b|\bllm_wiki_queue_items\b/iu,
+  },
+  {
+    code: "STATIC_AUTO_INGEST_METADATA_LEAK",
+    pattern: /\bauto_ingest(?:_available)?\b/iu,
   },
   {
     code: "STATIC_PRIVATE_SOURCE_CARD_LEAK",
@@ -295,6 +300,8 @@ function messageForCode(code: Exclude<StaticLeakCode, "STATIC_SCAN_TARGET_UNSAFE
       return "GitHub Pages static output contains raw input path metadata";
     case "STATIC_RAW_QUEUE_LEAK":
       return "GitHub Pages static output contains raw queue metadata";
+    case "STATIC_AUTO_INGEST_METADATA_LEAK":
+      return "GitHub Pages static output contains auto-ingest runtime metadata";
     case "STATIC_PRIVATE_SOURCE_CARD_LEAK":
       return "GitHub Pages static output contains private source-card metadata";
     case "STATIC_REVIEW_PAGE_LEAK":

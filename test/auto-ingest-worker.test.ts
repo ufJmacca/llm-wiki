@@ -613,6 +613,95 @@ describe("shared auto-ingest worker", () => {
     });
   });
 
+  it("applies batch limit before validating unselected queued sources", async () => {
+    await withTempWorkspace("llm-wiki-auto-ingest-limit-before-show-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const executablePath = await createExecutable(workspaceDir, "codex-limit-before-show", SUCCESS_AGENT_SOURCE);
+      await configureDefaultAgent(wikiDir, executablePath);
+      const selected = await writeSourceFixture(wikiDir, {
+        sourceId: sourceIdForSlug("selected"),
+        capturedAt: TEST_CAPTURED_AT,
+      });
+      const unselected = await writeSourceFixture(wikiDir, {
+        sourceId: sourceIdForSlug("broken_later"),
+        capturedAt: "2999-06-30T09:01:00.000Z",
+      });
+      await rm(resolve(wikiDir, unselected.sourceCardPath), { force: true });
+
+      // Act
+      const result = await runAutoIngestBatch({
+        repoRoot: wikiDir,
+        limit: 1,
+        now: () => new Date(TEST_NOW),
+      });
+
+      // Assert
+      expect(result.results.map((item) => item.source_id)).toEqual([selected.sourceId]);
+      expect(result.counts).toMatchObject({ selected: 1, attempted: 1, ingested: 1, blocked: 0 });
+      await expect(readQueueRecord(wikiDir, selected)).resolves.toMatchObject({ status: "ingested" });
+      await expect(readQueueRecord(wikiDir, unselected)).resolves.toMatchObject({ status: "queued" });
+      await expect(pathExists(resolve(wikiDir, unselected.sourceCardPath))).resolves.toBe(false);
+    });
+  });
+
+  it("reports selected invalid queue sources and continues with later valid sources", async () => {
+    await withTempWorkspace("llm-wiki-auto-ingest-selected-invalid-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const executablePath = await createExecutable(workspaceDir, "codex-selected-invalid", SUCCESS_AGENT_SOURCE);
+      await configureDefaultAgent(wikiDir, executablePath);
+      const broken = await writeSourceFixture(wikiDir, {
+        sourceId: sourceIdForSlug("broken_selected"),
+        capturedAt: TEST_CAPTURED_AT,
+      });
+      const valid = await writeSourceFixture(wikiDir, {
+        sourceId: sourceIdForSlug("valid_after_broken"),
+        capturedAt: "2999-06-30T09:01:00.000Z",
+      });
+      await rm(resolve(wikiDir, broken.sourceCardPath), { force: true });
+
+      // Act
+      const result = await runAutoIngestBatch({
+        repoRoot: wikiDir,
+        now: () => new Date(TEST_NOW),
+      });
+
+      // Assert
+      expect(result.results.map((item) => item.source_id)).toEqual([broken.sourceId, valid.sourceId]);
+      expect(result.results[0]).toMatchObject({
+        source_id: broken.sourceId,
+        previous_status: "queued",
+        final_status: "queued",
+        outcome: "skipped",
+        attempted: false,
+        agent: "codex",
+        applied_paths: [],
+        auto_ingest: null,
+      });
+      expectSafeError(result.results[0]?.error ?? null, "QUEUE_SOURCE_CARD_MISSING");
+      expect(result.results[1]).toMatchObject({
+        source_id: valid.sourceId,
+        previous_status: "queued",
+        final_status: "ingested",
+        outcome: "ingested",
+        attempted: true,
+      });
+      expect(result.counts).toMatchObject({
+        selected: 2,
+        attempted: 1,
+        ingested: 1,
+        blocked: 0,
+        skipped: 1,
+        deferred: 0,
+      });
+      await expect(readQueueRecord(wikiDir, broken)).resolves.toMatchObject({ status: "queued" });
+      await expect(readQueueRecord(wikiDir, valid)).resolves.toMatchObject({ status: "ingested" });
+    });
+  });
+
   it.each([
     { status: "ingested" as const, outcome: "skipped" as const },
     { status: "blocked" as const, outcome: "skipped" as const },
@@ -843,6 +932,22 @@ describe("shared auto-ingest worker", () => {
         applied_paths: [],
       });
       expectSafeError(result.error, "INGEST_VALIDATION_FAILED");
+      expect(result.error?.issues).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: "ingest_index_missing",
+            message: expect.stringContaining(source.sourceId),
+          }),
+          expect.objectContaining({
+            code: "ingest_log_entry_missing",
+            message: expect.stringContaining(source.sourceId),
+          }),
+          expect.objectContaining({
+            code: "ingest_source_ids_missing",
+            message: expect.stringContaining(source.sourceId),
+          }),
+        ]),
+      );
       expect(result.auto_ingest).toMatchObject({
         enabled: true,
         attempt_count: 1,

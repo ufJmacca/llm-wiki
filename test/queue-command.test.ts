@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { parse, stringify } from "yaml";
@@ -32,6 +32,13 @@ type RuntimeFailureEnvelope<Command extends string> = {
     hint: string;
   }>;
 };
+
+type RuntimePartialFailureEnvelope<Command extends string, Data> =
+  & RuntimeFailureEnvelope<Command>
+  & {
+    data: Data;
+    warnings: string[];
+  };
 
 type SourceCaptureData = {
   status: "added" | "duplicate";
@@ -80,6 +87,7 @@ type QueueShowData = {
     visibility: string;
     path: string;
     original_path: string;
+    auto_ingest?: AutoIngestMetadata;
   };
   source_card: {
     path: string;
@@ -90,6 +98,7 @@ type QueueShowData = {
       source_kind: string;
       status: string;
       visibility: string;
+      auto_ingest?: AutoIngestMetadata;
     };
   };
 };
@@ -102,6 +111,45 @@ type QueueSetStatusData = {
   queue_path: string;
   updated_at: string;
   log_path: "curated/log.md";
+};
+
+type AutoIngestMetadata = {
+  enabled: boolean;
+  attempt_count: number;
+  last_attempt_at: string;
+  last_result: string;
+  last_error_code: string | null;
+  last_error_message: string | null;
+};
+
+type AutoIngestSourceResult = {
+  source_id: string;
+  previous_status: QueueStatus | null;
+  final_status: QueueStatus | null;
+  outcome: "ingested" | "blocked" | "skipped" | "deferred";
+  attempted: boolean;
+  agent: string | null;
+  applied_paths: string[];
+  auto_ingest: AutoIngestMetadata | null;
+  error: {
+    code: string;
+    message: string;
+    path: string;
+    hint: string;
+  } | null;
+};
+
+type QueueIngestData = {
+  agent: string | null;
+  results: AutoIngestSourceResult[];
+  counts: {
+    selected: number;
+    attempted: number;
+    ingested: number;
+    blocked: number;
+    skipped: number;
+    deferred: number;
+  };
 };
 
 const originalTimezone = process.env.TZ;
@@ -132,6 +180,108 @@ async function captureTextSource(wikiDir: string, title: string, text: string): 
   return payload.data.source;
 }
 
+async function configureDefaultAgent(wikiDir: string, command: string): Promise<void> {
+  const configPath = resolve(wikiDir, ".llm-wiki/config.yml");
+  const config = await readFile(configPath, "utf8");
+  await writeFile(
+    configPath,
+    [
+      config.replace("default: generic", "default: codex").trimEnd(),
+      "agents:",
+      "  codex:",
+      "    type: local-exec",
+      `    command: ${JSON.stringify(command)}`,
+      "    args:",
+      "      - exec",
+      "    timeout_seconds: 10",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+}
+
+async function createFakeCodex(workspaceDir: string): Promise<string> {
+  const binDir = resolve(workspaceDir, "fake-codex-bin");
+  const executablePath = resolve(binDir, "codex");
+  await mkdir(binDir, { recursive: true });
+  await writeFile(executablePath, QUEUE_AUTO_CODEX_SOURCE, "utf8");
+  await chmod(executablePath, 0o755);
+
+  return executablePath;
+}
+
+const QUEUE_AUTO_CODEX_SOURCE = [
+  `#!${process.execPath}`,
+  "const fs = require('node:fs');",
+  "const path = require('node:path');",
+  "const cwd = process.cwd();",
+  "const prompt = fs.readFileSync(0, 'utf8') || process.argv[process.argv.length - 1] || '';",
+  "const sourceId = prompt.match(/Source ID: (src_[^\\n]+)/)?.[1];",
+  "if (!sourceId) {",
+  "  console.error('missing source id');",
+  "  process.exit(2);",
+  "}",
+  "if (!prompt.includes('Queue status: ingesting')) {",
+  "  console.error('prompt was not rebuilt after queued -> ingesting');",
+  "  process.exit(3);",
+  "}",
+  "const queue = JSON.parse(fs.readFileSync(path.join(cwd, 'raw/queue', sourceId + '.json'), 'utf8'));",
+  "const title = String(queue.title || sourceId) + ' Summary';",
+  "const sourceCardPath = String(queue.path || 'raw/queue/' + sourceId + '.json');",
+  "const summary = [",
+  "  '---',",
+  "  'type: source_summary',",
+  "  'title: ' + JSON.stringify(title),",
+  "  'visibility: private',",
+  "  'source_ids:',",
+  "  '  - ' + sourceId,",
+  "  'source_id: ' + sourceId,",
+  "  '---',",
+  "  '',",
+  "  '# ' + title,",
+  "  '',",
+  "  'The source supports queue CLI auto-ingest.',",
+  "  '',",
+  "].join('\\n');",
+  "const index = [",
+  "  '---',",
+  "  'type: index',",
+  "  'title: Index',",
+  "  'visibility: private',",
+  "  'source_ids: []',",
+  "  '---',",
+  "  '',",
+  "  '# Index',",
+  "  '',",
+  "  '- [[sources/' + sourceId + '|' + title + ']]',",
+  "  '',",
+  "].join('\\n');",
+  "const log = [",
+  "  '# Log',",
+  "  '',",
+  "  '## [2026-06-30T09:00:00.000Z] ingest | ' + sourceId + ' | Queue auto-ingest completed',",
+  "  '',",
+  "  '- actor: codex',",
+  "  '- command: \"llm-wiki queue ingest --auto\"',",
+  "  '- git_branch:',",
+  "  '- git_commit:',",
+  "  '- raw_source: ' + sourceCardPath,",
+  "  '- created:',",
+  "  '  - curated/sources/' + sourceId + '.md',",
+  "  '- updated:',",
+  "  '  - curated/index.md',",
+  "  '- contradictions:',",
+  "  '- follow_ups:',",
+  "  '',",
+  "].join('\\n');",
+  "fs.mkdirSync(path.join(cwd, 'curated/sources'), { recursive: true });",
+  "fs.writeFileSync(path.join(cwd, 'curated/sources', sourceId + '.md'), summary, 'utf8');",
+  "fs.writeFileSync(path.join(cwd, 'curated/index.md'), index, 'utf8');",
+  "fs.writeFileSync(path.join(cwd, 'curated/log.md'), log, 'utf8');",
+  "process.exit(0);",
+  "",
+].join("\n");
+
 function parseJsonSuccess<Command extends string, Data>(
   stdout: string[],
 ): RuntimeSuccessEnvelope<Command, Data> {
@@ -144,6 +294,14 @@ function parseJsonFailure<Command extends string>(stdout: string[]): RuntimeFail
   expect(stdout).toHaveLength(1);
 
   return JSON.parse(stdout[0]) as RuntimeFailureEnvelope<Command>;
+}
+
+function parseJsonPartialFailure<Command extends string, Data>(
+  stdout: string[],
+): RuntimePartialFailureEnvelope<Command, Data> {
+  expect(stdout).toHaveLength(1);
+
+  return JSON.parse(stdout[0]) as RuntimePartialFailureEnvelope<Command, Data>;
 }
 
 function parseSourceCardFrontmatter<T>(content: string): T {
@@ -455,6 +613,251 @@ describe("queue command", () => {
       expect(humanResult.stdout.join("\n")).toContain(`Source ID: ${source.source_id}`);
       expect(humanResult.stdout.join("\n")).toContain(`Queue: ${source.queue_path}`);
       expect(humanResult.stdout.join("\n")).toContain(`Source card: ${source.source_card_path}`);
+    });
+  });
+
+  it("runs queue ingest --auto through the batch worker and honors --limit", async () => {
+    await withTempWorkspace("llm-wiki-queue-ingest-auto-limit-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const firstSource = await captureTextSource(wikiDir, "Queue Auto First", "first queued source");
+      const secondSource = await captureTextSource(wikiDir, "Queue Auto Second", "second queued source");
+      await configureDefaultAgent(wikiDir, await createFakeCodex(workspaceDir));
+
+      // Act
+      const result = await runCliBuffered([
+        "queue",
+        "ingest",
+        "--auto",
+        "--limit",
+        "1",
+        "--repo",
+        wikiDir,
+        "--json",
+      ]);
+      const payload = parseJsonSuccess<"queue ingest", QueueIngestData>(result.stdout);
+      const firstQueueResult = await runCliBuffered(["queue", "show", firstSource.source_id, "--repo", wikiDir, "--json"]);
+      const secondQueueResult = await runCliBuffered(["queue", "show", secondSource.source_id, "--repo", wikiDir, "--json"]);
+      const firstQueue = parseJsonSuccess<"queue show", QueueShowData>(firstQueueResult.stdout);
+      const secondQueue = parseJsonSuccess<"queue show", QueueShowData>(secondQueueResult.stdout);
+      const statuses = [firstQueue.data.queue_record.status, secondQueue.data.queue_record.status];
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.counts).toMatchObject({
+        selected: 1,
+        attempted: 1,
+        ingested: 1,
+        blocked: 0,
+        deferred: 0,
+      });
+      expect(payload.data.results).toHaveLength(1);
+      expect(statuses.filter((status) => status === "ingested")).toHaveLength(1);
+      expect(statuses.filter((status) => status === "queued")).toHaveLength(1);
+      const ingestedQueue = firstQueue.data.queue_record.status === "ingested" ? firstQueue : secondQueue;
+      expect(ingestedQueue.data.queue_record.auto_ingest).toMatchObject({
+        enabled: true,
+        attempt_count: 1,
+        last_result: "ingested",
+        last_error_code: null,
+        last_error_message: null,
+      });
+    });
+  });
+
+  it("exits nonzero when batch queue ingest skips selected work", async () => {
+    await withTempWorkspace("llm-wiki-queue-ingest-auto-batch-skipped-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureTextSource(wikiDir, "Broken Batch Queue Auto", "selected source has no card");
+      await configureDefaultAgent(wikiDir, await createFakeCodex(workspaceDir));
+      await rm(resolve(wikiDir, source.source_card_path));
+
+      // Act
+      const result = await runCliBuffered([
+        "queue",
+        "ingest",
+        "--auto",
+        "--repo",
+        wikiDir,
+        "--json",
+      ]);
+      const payload = parseJsonPartialFailure<"queue ingest", QueueIngestData>(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("QUEUE_INGEST_INCOMPLETE");
+      expect(payload.data.counts).toMatchObject({
+        selected: 1,
+        attempted: 0,
+        ingested: 0,
+        blocked: 0,
+        skipped: 1,
+        deferred: 0,
+      });
+      expect(payload.data.results).toEqual([
+        expect.objectContaining({
+          source_id: source.source_id,
+          outcome: "skipped",
+          attempted: false,
+          error: expect.objectContaining({ code: "QUEUE_SOURCE_CARD_MISSING" }),
+        }),
+      ]);
+    });
+  });
+
+  it("runs queue ingest --auto --source-id against only the targeted source", async () => {
+    await withTempWorkspace("llm-wiki-queue-ingest-auto-source-id-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const firstSource = await captureTextSource(wikiDir, "Untouched Queue Auto", "source should stay queued");
+      const secondSource = await captureTextSource(wikiDir, "Target Queue Auto", "source should be ingested");
+      await configureDefaultAgent(wikiDir, await createFakeCodex(workspaceDir));
+
+      // Act
+      const result = await runCliBuffered([
+        "queue",
+        "ingest",
+        "--auto",
+        "--source-id",
+        secondSource.source_id,
+        "--repo",
+        wikiDir,
+        "--json",
+      ]);
+      const payload = parseJsonSuccess<"queue ingest", QueueIngestData>(result.stdout);
+      const firstQueueResult = await runCliBuffered(["queue", "show", firstSource.source_id, "--repo", wikiDir, "--json"]);
+      const secondQueueResult = await runCliBuffered(["queue", "show", secondSource.source_id, "--repo", wikiDir, "--json"]);
+      const firstQueue = parseJsonSuccess<"queue show", QueueShowData>(firstQueueResult.stdout);
+      const secondQueue = parseJsonSuccess<"queue show", QueueShowData>(secondQueueResult.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.counts).toMatchObject({
+        selected: 1,
+        attempted: 1,
+        ingested: 1,
+        blocked: 0,
+        deferred: 0,
+      });
+      expect(payload.data.results.map((item) => item.source_id)).toEqual([secondSource.source_id]);
+      expect(firstQueue.data.queue_record.status).toBe("queued");
+      expect(secondQueue.data.queue_record.status).toBe("ingested");
+      expect(secondQueue.data.queue_record.auto_ingest).toMatchObject({
+        enabled: true,
+        attempt_count: 1,
+        last_result: "ingested",
+      });
+    });
+  });
+
+  it("exits nonzero when targeted queue ingest skips a missing source", async () => {
+    await withTempWorkspace("llm-wiki-queue-ingest-auto-source-id-missing-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const missingSourceId = "src_2026_06_17_missing_target_000000";
+      await initializeWiki(wikiDir);
+
+      // Act
+      const result = await runCliBuffered([
+        "queue",
+        "ingest",
+        "--auto",
+        "--source-id",
+        missingSourceId,
+        "--repo",
+        wikiDir,
+        "--json",
+      ]);
+      const payload = parseJsonSuccess<"queue ingest", QueueIngestData>(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data.counts).toMatchObject({
+        selected: 1,
+        attempted: 0,
+        ingested: 0,
+        blocked: 0,
+        skipped: 1,
+        deferred: 0,
+      });
+      expect(payload.data.results).toEqual([
+        expect.objectContaining({
+          source_id: missingSourceId,
+          outcome: "skipped",
+          attempted: false,
+          error: expect.objectContaining({ code: "QUEUE_ITEM_NOT_FOUND" }),
+        }),
+      ]);
+    });
+  });
+
+  it("emits an error when quiet targeted queue ingest needs attention", async () => {
+    await withTempWorkspace("llm-wiki-queue-ingest-auto-quiet-attention-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const missingSourceId = "src_2026_06_17_missing_quiet_000000";
+      await initializeWiki(wikiDir);
+
+      // Act
+      const result = await runCliBuffered([
+        "queue",
+        "ingest",
+        "--auto",
+        "--source-id",
+        missingSourceId,
+        "--repo",
+        wikiDir,
+        "--quiet",
+      ]);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toEqual([]);
+      expect(result.stderr).toEqual([
+        [
+          "Error: Queue auto-ingest completed with 1 incomplete result.",
+          "Hint: Review the per-source results, fix blocked or deferred sources, then rerun llm-wiki queue ingest --auto.",
+        ].join("\n"),
+      ]);
+    });
+  });
+
+  it("rejects queue ingest --auto --watch when a source target is provided", async () => {
+    await withTempWorkspace("llm-wiki-queue-ingest-auto-watch-target-invalid-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const invalidSourceId = "not-a-source-id";
+      await initializeWiki(wikiDir);
+
+      // Act
+      const result = await runCliBuffered([
+        "queue",
+        "ingest",
+        "--auto",
+        "--source-id",
+        invalidSourceId,
+        "--watch",
+        "--repo",
+        wikiDir,
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"queue ingest">(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "QUEUE_INGEST_ARGUMENT_INVALID",
+        message: "queue ingest --watch cannot combine with --source-id.",
+      });
     });
   });
 

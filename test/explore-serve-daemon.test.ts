@@ -9,6 +9,7 @@ import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "n
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { runCli } from "../src/cli.js";
+import { startUploadDaemon } from "../src/daemon/index.js";
 import { writeLocalDaemonRuntimeMetadata } from "../src/quartz/index.js";
 import { parseInitJson, readGeneratedFile, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
 
@@ -265,6 +266,58 @@ function mockGitOutsideWorkTree(options: { allowUploadCommit: boolean }): void {
       if (command === "git" && (args[0] === "add" || args[0] === "commit")) {
         if (!options.allowUploadCommit) {
           throw new Error("Default explore serve upload path must not attempt a Git commit.");
+        }
+
+        queueMicrotask(() => callback(null, "", ""));
+        return {};
+      }
+
+      queueMicrotask(() => callback(null, "", ""));
+      return {};
+    },
+  );
+}
+
+function mockGitCommitFailsThenLogIsDirty(): void {
+  let commitAttempts = 0;
+
+  execFileMock.mockImplementation(
+    (
+      command: string,
+      args: string[],
+      _options: unknown,
+      callback: ExecFileCallback,
+    ) => {
+      if (command === "git" && args[0] === "rev-parse") {
+        queueMicrotask(() => callback(null, "true\n", ""));
+        return {};
+      }
+
+      if (command === "git" && args[0] === "diff") {
+        if (commitAttempts > 0 && args.includes("--cached")) {
+          const error = new Error("runtime log is staged") as Error & { code: number };
+          error.code = 1;
+          queueMicrotask(() => callback(error, "", ""));
+          return {};
+        }
+
+        queueMicrotask(() => callback(null, "", ""));
+        return {};
+      }
+
+      if (command === "git" && args[0] === "add") {
+        queueMicrotask(() => callback(null, "", ""));
+        return {};
+      }
+
+      if (command === "git" && args[0] === "commit") {
+        commitAttempts += 1;
+        if (commitAttempts === 1) {
+          const error = new Error("commit rejected") as Error & { code: number; stderr: string };
+          error.code = 1;
+          error.stderr = "commit rejected";
+          queueMicrotask(() => callback(error, "", "commit rejected"));
+          return {};
         }
 
         queueMicrotask(() => callback(null, "", ""));
@@ -1557,6 +1610,81 @@ describe("explore serve local upload daemon integration", () => {
         enabled: false,
         updated_at: expect.any(String),
       });
+    });
+  });
+
+  it("keeps the pending runtime log path when retrying a failed duplicate upload commit", async () => {
+    await withTempWorkspace("llm-wiki-explore-serve-daemon-commit-retry-log-", async (workspaceDir) => {
+      // Arrange
+      mockGitCommitFailsThenLogIsDirty();
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const daemon = await startUploadDaemon({
+        repoRoot: wikiDir,
+        port: 0,
+        commitUploads: true,
+      });
+
+      const uploadText = async (): Promise<Response> => {
+        const form = new FormData();
+        form.set("title", "Retry Commit Upload");
+        form.set("text", "Retry commit upload body.\n");
+
+        return fetch(`${daemon.url}/api/raw-upload`, {
+          method: "POST",
+          headers: {
+            "x-llm-wiki-upload-token": daemon.uploadToken,
+          },
+          body: form,
+        });
+      };
+
+      try {
+        // Act
+        const firstResponse = await uploadText();
+        const firstUpload = await firstResponse.json() as {
+          ok: false;
+          error: {
+            code: string;
+          };
+        };
+        const retryResponse = await uploadText();
+        const retryUpload = await retryResponse.json() as UploadSuccessEnvelope;
+        const commitArgs = uploadCommitGitCalls()
+          .map(([, args]) => args)
+          .filter((args): args is string[] => Array.isArray(args) && args[0] === "commit");
+
+        // Assert
+        expect(firstResponse.status).toBe(500);
+        expect(firstUpload).toMatchObject({
+          ok: false,
+          error: {
+            code: "UPLOAD_COMMIT_FAILED",
+          },
+        });
+        expect(retryResponse.status).toBe(200);
+        expect(retryUpload).toMatchObject({
+          ok: true,
+          data: {
+            status: "duplicate",
+            commit: {
+              attempted: true,
+              ok: true,
+            },
+          },
+        });
+        expect(retryUpload.data.commit.committed_paths).toEqual(expect.arrayContaining([
+          retryUpload.data.original_path,
+          retryUpload.data.source_card_path,
+          retryUpload.data.queue_path,
+          "curated/log.md",
+        ]));
+        expect(commitArgs).toHaveLength(2);
+        expect(commitArgs[0]).toEqual(expect.arrayContaining(["curated/log.md"]));
+        expect(commitArgs[1]).toEqual(expect.arrayContaining(["curated/log.md"]));
+      } finally {
+        await daemon.close();
+      }
     });
   });
 

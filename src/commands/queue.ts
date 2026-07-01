@@ -566,16 +566,19 @@ function queueIngestWatchIncompleteError(summary: AutoIngestWatchSummary): Runti
 function queueIngestIssues(data: QueueIngestData): RuntimeIssue[] {
   return data.results
     .filter((result) => result.outcome !== "ingested")
-    .map((result) => {
+    .flatMap((result) => {
       const error = result.error;
+      if (error?.issues !== undefined && error.issues.length > 0) {
+        return error.issues;
+      }
 
-      return {
+      return [{
         severity: "error",
         code: error?.code ?? "QUEUE_INGEST_INCOMPLETE",
         message: error?.message ?? `Queue auto-ingest ${result.outcome} for ${result.source_id}.`,
         path: error?.path ?? `raw/queue/${result.source_id}.json`,
         hint: error?.hint ?? "Review this source queue state before retrying auto-ingest.",
-      };
+      }];
     });
 }
 
@@ -658,6 +661,12 @@ function formatHumanQueueIngest(data: QueueIngestData): string {
 
     if (result.error !== null) {
       lines.push(`Error: ${result.error.code}: ${result.error.message}`, `Hint: ${result.error.hint}`);
+      if (result.error.issues !== undefined && result.error.issues.length > 0) {
+        lines.push(
+          "Issues:",
+          ...result.error.issues.map((issue) => `- ${issue.code} (${issue.path}): ${issue.message}`),
+        );
+      }
     }
   }
 
@@ -720,6 +729,12 @@ function formatHumanQueueIngestWatchResult(result: AutoIngestSourceResult): stri
 
   if (result.error !== null) {
     lines.push(`Error: ${result.error.code}: ${result.error.message}`, `Hint: ${result.error.hint}`);
+    if (result.error.issues !== undefined && result.error.issues.length > 0) {
+      lines.push(
+        "Issues:",
+        ...result.error.issues.map((issue) => `- ${issue.code} (${issue.path}): ${issue.message}`),
+      );
+    }
   }
 
   return lines.join("\n");

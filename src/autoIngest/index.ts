@@ -16,7 +16,7 @@ import {
 import { RuntimeCommandError } from "../runtime/errors.js";
 import { withIngestLock, type IngestLockOptions } from "../runtime/ingestLock.js";
 import {
-  listQueue,
+  listQueueRecordSummaries,
   showQueueSource,
   transitionQueueStatus,
   type AutoIngestMetadata,
@@ -28,11 +28,20 @@ export type { AutoIngestMetadata } from "../runtime/queue.js";
 
 export type AutoIngestOutcome = "ingested" | "blocked" | "skipped" | "deferred";
 
+export type AutoIngestSafeIssue = {
+  severity: "error";
+  code: string;
+  message: string;
+  path: string;
+  hint: string;
+};
+
 export type AutoIngestSafeError = {
   code: string;
   message: string;
   path: string;
   hint: string;
+  issues?: AutoIngestSafeIssue[];
 };
 
 export type AutoIngestSourceResult = {
@@ -109,7 +118,8 @@ export type RunAutoIngestWatchInput = {
 
 type QueueCandidate = {
   sourceId: string;
-  capturedAt: string;
+  status: QueueStatus;
+  error?: QueueCommandError;
 };
 
 type RunQueuedSourceInput = {
@@ -130,11 +140,21 @@ const DEFAULT_WATCH_POLL_INTERVAL_MS = 250;
 
 export async function runAutoIngestBatch(input: RunAutoIngestBatchInput): Promise<AutoIngestBatchResult> {
   const agent = await resolveAndPreflightDefaultLocalAgent(input.repoRoot);
-  const candidates = await selectQueuedCandidates(input.repoRoot);
-  const selected = candidates.slice(0, normalizeLimit(input.limit, candidates.length));
+  const selected = await selectQueuedCandidates(input.repoRoot, input.limit);
   const results: AutoIngestSourceResult[] = [];
 
   for (const candidate of selected) {
+    if (candidate.error !== undefined) {
+      results.push(skippedResult(
+        candidate.sourceId,
+        candidate.status,
+        candidate.status,
+        agent.name,
+        queueErrorToSafeError(candidate.error),
+      ));
+      continue;
+    }
+
     results.push(await runQueuedSourceWithAgent({
       repoRoot: input.repoRoot,
       sourceId: candidate.sourceId,
@@ -165,6 +185,28 @@ export async function runAutoIngestSource(input: RunAutoIngestSourceInput): Prom
   const agent = await resolveAndPreflightDefaultLocalAgent(input.repoRoot);
 
   return runQueuedSourceWithAgent({
+    repoRoot: input.repoRoot,
+    sourceId: input.sourceId,
+    agent,
+    now: input.now,
+    lock: input.lock,
+    command: input.command,
+  });
+}
+
+export async function resumeAutoIngestSource(input: RunAutoIngestSourceInput): Promise<AutoIngestSourceResult> {
+  const current = await readCurrentSourceState(input.repoRoot, input.sourceId);
+  if (!current.ok) {
+    return skippedResult(input.sourceId, null, null, null, queueErrorToSafeError(current.error));
+  }
+
+  if (current.value.status !== "ingesting") {
+    return resumeNotEligibleResult(input.sourceId, current.value.status, current.value.autoIngest);
+  }
+
+  const agent = await resolveAndPreflightDefaultLocalAgent(input.repoRoot);
+
+  return runIngestingSourceWithAgent({
     repoRoot: input.repoRoot,
     sourceId: input.sourceId,
     agent,
@@ -371,34 +413,155 @@ async function runQueuedSourceWithAgent(input: RunQueuedSourceInput): Promise<Au
   }
 }
 
-async function selectQueuedCandidates(repoRoot: string): Promise<QueueCandidate[]> {
-  const listed = await listQueue(repoRoot);
+async function runIngestingSourceWithAgent(input: RunQueuedSourceInput): Promise<AutoIngestSourceResult> {
+  const command = input.command ?? `llm-wiki ingest ${input.sourceId} --auto`;
+
+  try {
+    return await withIngestLock(
+      input.repoRoot,
+      {
+        label: `auto-ingest:${input.sourceId}`,
+        timeoutMs: input.lock?.timeoutMs,
+        retryDelayMs: input.lock?.retryDelayMs,
+        now: input.now,
+      },
+      async () => {
+        const current = await readCurrentSourceState(input.repoRoot, input.sourceId);
+        if (!current.ok) {
+          return skippedResult(input.sourceId, null, null, input.agent.name, queueErrorToSafeError(current.error));
+        }
+
+        if (current.value.status !== "ingesting") {
+          return resumeNotEligibleResult(input.sourceId, current.value.status, current.value.autoIngest, input.agent.name);
+        }
+
+        try {
+          const coreResult = await runLocalAgentIngestCore({
+            repoRoot: input.repoRoot,
+            sourceId: input.sourceId,
+            agent: input.agent,
+            completeAppliedIngest: async () => {
+              const completed = await transitionQueueStatus(input.repoRoot, input.sourceId, "ingested", {
+                now: currentDate(input.now),
+                command,
+                autoIngest: {
+                  enabled: true,
+                  result: "ingested",
+                  errorCode: null,
+                  errorMessage: null,
+                },
+              });
+              if (!completed.ok) {
+                throw queueRuntimeError(completed.error);
+              }
+
+              return completed.value;
+            },
+          });
+          const finalState = await readCurrentSourceStateOrThrow(input.repoRoot, input.sourceId);
+
+          return {
+            source_id: input.sourceId,
+            previous_status: current.value.status,
+            final_status: "ingested",
+            outcome: "ingested",
+            attempted: true,
+            agent: input.agent.name,
+            applied_paths: coreResult.appliedPaths,
+            auto_ingest: finalState.autoIngest,
+            error: null,
+          };
+        } catch (error) {
+          const safeError = errorToSafeAutoIngestError(error, input.sourceId);
+          const blocked = await transitionQueueStatus(input.repoRoot, input.sourceId, "blocked", {
+            now: currentDate(input.now),
+            command,
+            autoIngest: {
+              enabled: true,
+              result: "blocked",
+              errorCode: safeError.code,
+              errorMessage: safeError.message,
+            },
+          });
+          if (!blocked.ok) {
+            throw queueRuntimeError(blocked.error);
+          }
+
+          const finalState = await readCurrentSourceStateOrThrow(input.repoRoot, input.sourceId);
+
+          return {
+            source_id: input.sourceId,
+            previous_status: current.value.status,
+            final_status: "blocked",
+            outcome: "blocked",
+            attempted: true,
+            agent: input.agent.name,
+            applied_paths: [],
+            auto_ingest: finalState.autoIngest,
+            error: safeError,
+          };
+        }
+      },
+    );
+  } catch (error) {
+    if (error instanceof RuntimeCommandError && error.code === "INGEST_LOCK_BUSY") {
+      const current = await readCurrentSourceState(input.repoRoot, input.sourceId);
+      const currentStatus = current.ok ? current.value.status : null;
+      const currentMetadata = current.ok ? current.value.autoIngest : null;
+
+      return {
+        source_id: input.sourceId,
+        previous_status: currentStatus,
+        final_status: currentStatus,
+        outcome: "deferred",
+        attempted: false,
+        agent: input.agent.name,
+        applied_paths: [],
+        auto_ingest: currentMetadata,
+        error: runtimeErrorToSafeError(error),
+      };
+    }
+
+    throw error;
+  }
+}
+
+async function selectQueuedCandidates(repoRoot: string, limit?: number): Promise<QueueCandidate[]> {
+  const listed = await listQueueRecordSummaries(repoRoot);
   if (!listed.ok) {
     throw queueRuntimeError(listed.error);
   }
 
-  const candidates: QueueCandidate[] = [];
-  for (const item of listed.value.items) {
-    if (item.status !== "queued") {
-      continue;
-    }
+  const queued = listed.value.filter((item) => item.status === "queued");
+  const selected = queued
+    .sort((left, right) => {
+      const capturedAtOrder = left.captured_at.localeCompare(right.captured_at);
 
+      return capturedAtOrder === 0
+        ? left.source_id.localeCompare(right.source_id)
+        : capturedAtOrder;
+    })
+    .slice(0, normalizeLimit(limit, queued.length));
+
+  const candidates: QueueCandidate[] = [];
+  for (const item of selected) {
     const shown = await showQueueSource(repoRoot, item.source_id);
     if (!shown.ok) {
-      throw queueRuntimeError(shown.error);
+      candidates.push({
+        sourceId: item.source_id,
+        status: item.status,
+        error: shown.error,
+      });
+      continue;
     }
 
     candidates.push({
       sourceId: shown.value.queue_record.source_id,
-      capturedAt: shown.value.queue_record.captured_at,
+      status: shown.value.queue_record.status,
     });
   }
 
-  return candidates.sort((left, right) => {
-    const capturedAtOrder = left.capturedAt.localeCompare(right.capturedAt);
-
-    return capturedAtOrder === 0 ? left.sourceId.localeCompare(right.sourceId) : capturedAtOrder;
-  });
+  return candidates;
 }
 
 async function resolveAndPreflightDefaultLocalAgent(repoRoot: string): Promise<LocalAgentConfig> {
@@ -471,6 +634,32 @@ function statusNotEligibleResult(
       hint: status === "ingesting"
         ? "Another ingest is already processing this source."
         : "Only queued sources are eligible for auto-ingest.",
+    },
+  };
+}
+
+function resumeNotEligibleResult(
+  sourceId: string,
+  status: QueueStatus,
+  autoIngest: AutoIngestMetadata | null,
+  agent: string | null = null,
+): AutoIngestSourceResult {
+  const outcome: AutoIngestOutcome = status === "ingesting" ? "deferred" : "skipped";
+
+  return {
+    source_id: sourceId,
+    previous_status: status,
+    final_status: status,
+    outcome,
+    attempted: false,
+    agent,
+    applied_paths: [],
+    auto_ingest: autoIngest,
+    error: {
+      code: "AUTO_INGEST_SOURCE_NOT_ELIGIBLE",
+      message: `Auto-ingest resume only processes ingesting sources; current status is ${status}.`,
+      path: `raw/queue/${sourceId}.json`,
+      hint: "Resume only a source that is already marked ingesting, or run normal auto-ingest for queued sources.",
     },
   };
 }
@@ -644,6 +833,7 @@ function errorToSafeAutoIngestError(error: unknown, sourceId: string): AutoInges
       message: `Ingest validation found ${error.issues.length} blocking issue${error.issues.length === 1 ? "" : "s"}.`,
       path: firstIssue?.path ?? `curated/sources/${sourceId}.md`,
       hint: "Complete the required curated summary, index, log, source_ids, and raw immutability fixes.",
+      issues: error.issues.map(validationIssueToSafeIssue),
     };
   }
 
@@ -656,6 +846,18 @@ function errorToSafeAutoIngestError(error: unknown, sourceId: string): AutoInges
     message: error instanceof Error ? safeMessage(error.message) : safeMessage(String(error)),
     path: sourceId,
     hint: "Fix the local agent or repository state, then rerun auto-ingest.",
+  };
+}
+
+function validationIssueToSafeIssue(
+  issue: IngestValidationFailedError["issues"][number],
+): AutoIngestSafeIssue {
+  return {
+    severity: issue.severity,
+    code: issue.rule_id,
+    message: safeMessage(issue.message),
+    path: issue.path,
+    hint: safeMessage(issue.fix_hint),
   };
 }
 

@@ -325,7 +325,7 @@ describe("generated LlmWikiUploadForm component", () => {
       expectedStatus: "Auto-ingest blocked.",
       expectedResult: "blocked",
       expectedFinalStatus: "blocked",
-      expectedRetry: "llm-wiki ingest src_2026_06_24_upload_abcdef123456 --auto",
+      expectedRetry: "llm-wiki queue set-status src_2026_06_24_upload_abcdef123456 queued && llm-wiki ingest src_2026_06_24_upload_abcdef123456 --auto",
       expectedGuidance: "Review the blocked source, then retry auto-ingest.",
     },
     {

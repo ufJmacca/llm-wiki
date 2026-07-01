@@ -47,6 +47,12 @@ export type QueueListItem = {
   updated_at: string;
 };
 
+export type QueueRecordSummary = {
+  source_id: string;
+  captured_at: string;
+  status: QueueStatus;
+};
+
 export type QueueListResult = {
   items: QueueListItem[];
   counts: {
@@ -166,6 +172,21 @@ export async function listQueue(repoRoot: string): Promise<Result<QueueListResul
     items,
     counts: countQueueItems(items),
   });
+}
+
+export async function listQueueRecordSummaries(
+  repoRoot: string,
+): Promise<Result<QueueRecordSummary[], QueueCommandError>> {
+  const queueFiles = await readQueueRecords(repoRoot);
+  if (!queueFiles.ok) {
+    return queueFiles;
+  }
+
+  return ok(queueFiles.value.map(({ record }) => ({
+    source_id: record.source_id,
+    captured_at: record.captured_at,
+    status: record.status,
+  })));
 }
 
 export async function showQueueSource(
@@ -378,12 +399,15 @@ function nextAutoIngestField(
   }
 
   const transitionStartsAttempt = nextStatus === "ingesting";
+  const transitionFinishesMissingAttempt =
+    current === undefined && (nextStatus === "ingested" || nextStatus === "blocked");
   const lastAttemptAt = transitionStartsAttempt || current === undefined ? updatedAt : current.last_attempt_at;
 
   return {
     auto_ingest: {
       enabled: options.enabled,
-      attempt_count: (current?.attempt_count ?? 0) + (transitionStartsAttempt ? 1 : 0),
+      attempt_count:
+        (current?.attempt_count ?? 0) + (transitionStartsAttempt || transitionFinishesMissingAttempt ? 1 : 0),
       last_attempt_at: lastAttemptAt,
       last_result: options.result,
       last_error_code: options.errorCode ?? null,

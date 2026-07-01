@@ -4,7 +4,6 @@ import { resolve } from "node:path";
 import { parse, stringify } from "yaml";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { queueIngestIsIncomplete } from "../src/commands/queue.js";
 import { parseLogEntries } from "../src/scanner/index.js";
 import { parseInitJson, readGeneratedFile, runCliBuffered, withTempWorkspace } from "./helpers/init.js";
 
@@ -33,6 +32,13 @@ type RuntimeFailureEnvelope<Command extends string> = {
     hint: string;
   }>;
 };
+
+type RuntimePartialFailureEnvelope<Command extends string, Data> =
+  & RuntimeFailureEnvelope<Command>
+  & {
+    data: Data;
+    warnings: string[];
+  };
 
 type SourceCaptureData = {
   status: "added" | "duplicate";
@@ -288,6 +294,14 @@ function parseJsonFailure<Command extends string>(stdout: string[]): RuntimeFail
   expect(stdout).toHaveLength(1);
 
   return JSON.parse(stdout[0]) as RuntimeFailureEnvelope<Command>;
+}
+
+function parseJsonPartialFailure<Command extends string, Data>(
+  stdout: string[],
+): RuntimePartialFailureEnvelope<Command, Data> {
+  expect(stdout).toHaveLength(1);
+
+  return JSON.parse(stdout[0]) as RuntimePartialFailureEnvelope<Command, Data>;
 }
 
 function parseSourceCardFrontmatter<T>(content: string): T {
@@ -671,11 +685,12 @@ describe("queue command", () => {
         wikiDir,
         "--json",
       ]);
-      const payload = parseJsonSuccess<"queue ingest", QueueIngestData>(result.stdout);
+      const payload = parseJsonPartialFailure<"queue ingest", QueueIngestData>(result.stdout);
 
       // Assert
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("QUEUE_INGEST_INCOMPLETE");
       expect(payload.data.counts).toMatchObject({
         selected: 1,
         attempted: 0,
@@ -806,73 +821,21 @@ describe("queue command", () => {
       // Assert
       expect(result.exitCode).toBe(1);
       expect(result.stdout).toEqual([]);
-      expect(result.stderr).toEqual(["Error: Auto-ingest completed with work requiring attention."]);
+      expect(result.stderr).toEqual([
+        [
+          "Error: Queue auto-ingest completed with 1 incomplete result.",
+          "Hint: Review the per-source results, fix blocked or deferred sources, then rerun llm-wiki queue ingest --auto.",
+        ].join("\n"),
+      ]);
     });
   });
 
-  it("keeps aggregate watch failures after bounded result details trim", () => {
-    const retainedResults: AutoIngestSourceResult[] = Array.from({ length: 25 }, (_item, index) => ({
-      source_id: `src_ingested_${index}`,
-      previous_status: "queued",
-      final_status: "ingested",
-      outcome: "ingested",
-      attempted: true,
-      agent: "codex",
-      applied_paths: [],
-      auto_ingest: null,
-      error: null,
-    }));
-    const trimmedFailure: AutoIngestSourceResult = {
-      source_id: "src_blocked",
-      previous_status: "queued",
-      final_status: "blocked",
-      outcome: "blocked",
-      attempted: true,
-      agent: "codex",
-      applied_paths: [],
-      auto_ingest: null,
-      error: {
-        code: "AGENT_COMMAND_FAILED",
-        message: "Agent command failed for codex.",
-        path: "raw/queue/src_blocked.json",
-        hint: "Fix the source and rerun queue ingest.",
-      },
-    };
-    const data = {
-      agent: "codex",
-      results: retainedResults,
-      counts: {
-        selected: retainedResults.length + 1,
-        attempted: retainedResults.length + 1,
-        ingested: retainedResults.length,
-        blocked: 1,
-        skipped: 0,
-        deferred: 0,
-      },
-    };
-
-    expect(data.results).toHaveLength(25);
-    expect(data.results.every((item) => item.outcome === "ingested")).toBe(true);
-    expect(data.counts).toMatchObject({
-      selected: 26,
-      attempted: 26,
-      ingested: 25,
-      blocked: 1,
-      skipped: 0,
-      deferred: 0,
-    });
-    expect(data.results.some((item) => item.source_id === trimmedFailure.source_id)).toBe(false);
-    expect(queueIngestIsIncomplete(data)).toBe(true);
-  });
-
-  it("stops source-id watch after the target is ingested", async () => {
-    await withTempWorkspace("llm-wiki-queue-ingest-auto-watch-source-id-", async (workspaceDir) => {
+  it("rejects queue ingest --auto --watch when a source target is provided", async () => {
+    await withTempWorkspace("llm-wiki-queue-ingest-auto-watch-target-invalid-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
+      const invalidSourceId = "not-a-source-id";
       await initializeWiki(wikiDir);
-      const otherSource = await captureTextSource(wikiDir, "Untouched Watch Source", "source should stay queued");
-      const targetSource = await captureTextSource(wikiDir, "Target Watch Source", "source should be ingested once");
-      await configureDefaultAgent(wikiDir, await createFakeCodex(workspaceDir));
 
       // Act
       const result = await runCliBuffered([
@@ -880,38 +843,21 @@ describe("queue command", () => {
         "ingest",
         "--auto",
         "--source-id",
-        targetSource.source_id,
+        invalidSourceId,
         "--watch",
         "--repo",
         wikiDir,
         "--json",
       ]);
-      const payload = parseJsonSuccess<"queue ingest", QueueIngestData>(result.stdout);
-      const otherQueueResult = await runCliBuffered(["queue", "show", otherSource.source_id, "--repo", wikiDir, "--json"]);
-      const targetQueueResult = await runCliBuffered(["queue", "show", targetSource.source_id, "--repo", wikiDir, "--json"]);
-      const otherQueue = parseJsonSuccess<"queue show", QueueShowData>(otherQueueResult.stdout);
-      const targetQueue = parseJsonSuccess<"queue show", QueueShowData>(targetQueueResult.stdout);
+      const payload = parseJsonFailure<"queue ingest">(result.stdout);
 
       // Assert
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode).toBe(1);
       expect(result.stderr).toEqual([]);
-      expect(payload.data.counts).toMatchObject({
-        selected: 1,
-        attempted: 1,
-        ingested: 1,
-        blocked: 0,
-        skipped: 0,
-        deferred: 0,
+      expect(payload.error).toMatchObject({
+        code: "QUEUE_INGEST_ARGUMENT_INVALID",
+        message: "queue ingest --watch cannot combine with --source-id.",
       });
-      expect(payload.data.results).toEqual([
-        expect.objectContaining({
-          source_id: targetSource.source_id,
-          outcome: "ingested",
-          final_status: "ingested",
-        }),
-      ]);
-      expect(otherQueue.data.queue_record.status).toBe("queued");
-      expect(targetQueue.data.queue_record.status).toBe("ingested");
     });
   });
 

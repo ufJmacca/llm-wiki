@@ -96,7 +96,7 @@ Capture files, pasted text, or URLs through the local Explorer. Review private q
 
 Ingest approved sources into curated Markdown with \`llm-wiki ingest <source_id>\`.
 
-Process queued sources with \`llm-wiki queue ingest --auto\`, \`llm-wiki queue ingest --auto --limit 5\`, \`llm-wiki queue ingest --auto --source-id <source_id>\`, or \`llm-wiki queue ingest --auto --watch\`.
+Process queued sources with \`llm-wiki queue ingest --auto\`, \`llm-wiki queue ingest --auto --limit 5\`, \`llm-wiki queue ingest --auto --source-id <source_id>\`, or \`llm-wiki queue ingest --auto --watch\`. Watch mode cannot be combined with \`--source-id\` or \`--limit\`.
 
 Auto-ingest uses \`.llm-wiki/config.yml:agent.default\` and requires that default to name a configured local agent under \`agents.<name>\`; provider-mode auto-ingest is deferred.
 

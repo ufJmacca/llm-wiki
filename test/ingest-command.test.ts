@@ -51,13 +51,24 @@ type QueueShowData = {
   queue_record: {
     source_id: string;
     status: "queued" | "ingesting" | "ingested" | "blocked";
+    auto_ingest?: AutoIngestMetadata;
   };
   source_card: {
     path: string;
     frontmatter: {
       status: "queued" | "ingesting" | "ingested" | "blocked";
+      auto_ingest?: AutoIngestMetadata;
     };
   };
+};
+
+type AutoIngestMetadata = {
+  enabled: boolean;
+  attempt_count: number;
+  last_attempt_at: string;
+  last_result: string;
+  last_error_code: string | null;
+  last_error_message: string | null;
 };
 
 type IngestTaskData = {
@@ -326,6 +337,9 @@ describe("ingest command task scaffolding", () => {
       const wikiDir = resolve(workspaceDir, "wiki");
       await initializeWiki(wikiDir);
       const source = await captureTextSource(wikiDir);
+      const queueBefore = await readFile(resolve(wikiDir, source.queue_path), "utf8");
+      const sourceCardBefore = await readFile(resolve(wikiDir, source.source_card_path), "utf8");
+      const logBefore = await readFile(resolve(wikiDir, "curated/log.md"), "utf8");
 
       // Act
       const result = await runCliBuffered([
@@ -337,8 +351,12 @@ describe("ingest command task scaffolding", () => {
         "--json",
       ]);
       const payload = parseJsonFailure<"ingest">(result.stdout);
+      const queueResult = await runCliBuffered(["queue", "show", source.source_id, "--repo", wikiDir, "--json"]);
+      const queuePayload = parseJsonSuccess<"queue show", QueueShowData>(queueResult.stdout);
 
       // Assert
+      expect(queueBefore).not.toContain("\"auto_ingest\"");
+      expect(sourceCardBefore).not.toContain("auto_ingest:");
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toEqual([]);
       expect(payload.error).toMatchObject({
@@ -349,6 +367,13 @@ describe("ingest command task scaffolding", () => {
       expect(payload.issues[0]).toMatchObject({
         path: ".llm-wiki/config.yml:agents.generic",
       });
+      expect(queuePayload.data.queue_record.status).toBe("queued");
+      expect(queuePayload.data.source_card.frontmatter.status).toBe("queued");
+      expect(queuePayload.data.queue_record.auto_ingest).toBeUndefined();
+      expect(queuePayload.data.source_card.frontmatter.auto_ingest).toBeUndefined();
+      expect(await readFile(resolve(wikiDir, source.queue_path), "utf8")).toBe(queueBefore);
+      expect(await readFile(resolve(wikiDir, source.source_card_path), "utf8")).toBe(sourceCardBefore);
+      expect(await readFile(resolve(wikiDir, "curated/log.md"), "utf8")).toBe(logBefore);
     });
   });
 
@@ -418,6 +443,9 @@ describe("ingest command task scaffolding", () => {
         defaultAgent,
         command: "llm-wiki-definitely-missing-codex",
       });
+      const queueBefore = await readFile(resolve(wikiDir, source.queue_path), "utf8");
+      const sourceCardBefore = await readFile(resolve(wikiDir, source.source_card_path), "utf8");
+      const logBefore = await readFile(resolve(wikiDir, "curated/log.md"), "utf8");
 
       // Act
       const result = await runCliBuffered([
@@ -433,6 +461,8 @@ describe("ingest command task scaffolding", () => {
       const queuePayload = parseJsonSuccess<"queue show", QueueShowData>(queueResult.stdout);
 
       // Assert
+      expect(queueBefore).not.toContain("\"auto_ingest\"");
+      expect(sourceCardBefore).not.toContain("auto_ingest:");
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toEqual([]);
       expect(payload.error).toMatchObject({
@@ -445,6 +475,11 @@ describe("ingest command task scaffolding", () => {
       });
       expect(queuePayload.data.queue_record.status).toBe("queued");
       expect(queuePayload.data.source_card.frontmatter.status).toBe("queued");
+      expect(queuePayload.data.queue_record.auto_ingest).toBeUndefined();
+      expect(queuePayload.data.source_card.frontmatter.auto_ingest).toBeUndefined();
+      expect(await readFile(resolve(wikiDir, source.queue_path), "utf8")).toBe(queueBefore);
+      expect(await readFile(resolve(wikiDir, source.source_card_path), "utf8")).toBe(sourceCardBefore);
+      expect(await readFile(resolve(wikiDir, "curated/log.md"), "utf8")).toBe(logBefore);
     });
   });
 

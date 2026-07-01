@@ -107,9 +107,96 @@ type IngestTaskData = {
   };
 };
 
+type IngestAgentData = {
+  mode: "agent";
+  agent: string;
+  source: {
+    source_id: string;
+    status: "ingested";
+  };
+  applied_paths: string[];
+  validation: {
+    passed: true;
+    issues: [];
+  };
+  queue: {
+    previous_status: "queued" | "ingesting" | "ingested" | "blocked";
+    status: "ingested";
+  };
+};
+
 const originalTimezone = process.env.TZ;
 const originalPath = process.env.PATH;
 const originalFakeGitLog = process.env.LLM_WIKI_FAKE_GIT_LOG;
+
+const SUCCESS_AUTO_AGENT_SOURCE = [
+  `#!${process.execPath}`,
+  "const fs = require('node:fs');",
+  "const path = require('node:path');",
+  "const cwd = process.cwd();",
+  "const prompt = fs.readFileSync(0, 'utf8') || process.argv[process.argv.length - 1] || '';",
+  "const sourceId = prompt.match(/Source ID: (src_[^\\n]+)/)?.[1];",
+  "if (!sourceId) {",
+  "  console.error('missing source id');",
+  "  process.exit(2);",
+  "}",
+  "if (!prompt.includes('Queue status: ingesting')) {",
+  "  console.error('prompt was not rebuilt after queued -> ingesting');",
+  "  process.exit(3);",
+  "}",
+  "const title = 'Shared Worker ' + sourceId;",
+  "const summary = [",
+  "  '---',",
+  "  'type: source_summary',",
+  "  'title: ' + JSON.stringify(title),",
+  "  'visibility: private',",
+  "  'source_ids:',",
+  "  '  - ' + sourceId,",
+  "  'source_id: ' + sourceId,",
+  "  '---',",
+  "  '',",
+  "  '# ' + title,",
+  "  '',",
+  "  'The source proves ingest --auto is handled by the shared auto-ingest worker.',",
+  "  '',",
+  "].join('\\n');",
+  "const index = [",
+  "  '---',",
+  "  'type: index',",
+  "  'title: Index',",
+  "  'visibility: private',",
+  "  'source_ids: []',",
+  "  '---',",
+  "  '',",
+  "  '# Index',",
+  "  '',",
+  "  '- [[sources/' + sourceId + '|' + title + ']]',",
+  "  '',",
+  "].join('\\n');",
+  "const log = [",
+  "  '# Log',",
+  "  '',",
+  "  '## [2026-06-30T09:00:00.000Z] ingest | ' + sourceId + ' | Shared worker ingest completed',",
+  "  '',",
+  "  '- actor: codex',",
+  "  '- command: \"llm-wiki ingest ' + sourceId + ' --auto\"',",
+  "  '- git_branch:',",
+  "  '- git_commit:',",
+  "  '- raw_source: raw/inputs/text/' + sourceId + '/_source.md',",
+  "  '- created:',",
+  "  '  - curated/sources/' + sourceId + '.md',",
+  "  '- updated:',",
+  "  '  - curated/index.md',",
+  "  '- contradictions:',",
+  "  '- follow_ups:',",
+  "  '',",
+  "].join('\\n');",
+  "fs.mkdirSync(path.join(cwd, 'curated/sources'), { recursive: true });",
+  "fs.writeFileSync(path.join(cwd, 'curated/sources', sourceId + '.md'), summary, 'utf8');",
+  "fs.writeFileSync(path.join(cwd, 'curated/index.md'), index, 'utf8');",
+  "fs.writeFileSync(path.join(cwd, 'curated/log.md'), log, 'utf8');",
+  "",
+].join("\n");
 
 afterEach(() => {
   vi.useRealTimers();
@@ -180,6 +267,16 @@ async function configureCodexLocalAgent(
     ].join("\n"),
     "utf8",
   );
+}
+
+async function createExecutable(workspaceDir: string, fileName: string, source: string): Promise<string> {
+  const binDir = resolve(workspaceDir, "bin");
+  const executablePath = resolve(binDir, fileName);
+  await mkdir(binDir, { recursive: true });
+  await writeFile(executablePath, source, "utf8");
+  await chmod(executablePath, 0o755);
+
+  return executablePath;
 }
 
 async function writeCuratedPage(
@@ -374,6 +471,74 @@ describe("ingest command task scaffolding", () => {
       expect(await readFile(resolve(wikiDir, source.queue_path), "utf8")).toBe(queueBefore);
       expect(await readFile(resolve(wikiDir, source.source_card_path), "utf8")).toBe(sourceCardBefore);
       expect(await readFile(resolve(wikiDir, "curated/log.md"), "utf8")).toBe(logBefore);
+    });
+  });
+
+  it("runs --auto through the shared worker and reports the queued source transition", async () => {
+    await withTempWorkspace("llm-wiki-ingest-auto-shared-worker-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureTextSource(wikiDir);
+      const executablePath = await createExecutable(workspaceDir, "shared-worker-agent", SUCCESS_AUTO_AGENT_SOURCE);
+      await configureCodexLocalAgent(wikiDir, {
+        defaultAgent: "codex",
+        command: executablePath,
+      });
+
+      // Act
+      const result = await runCliBuffered([
+        "ingest",
+        source.source_id,
+        "--repo",
+        wikiDir,
+        "--auto",
+        "--json",
+      ]);
+      const payload = parseJsonSuccess<"ingest", IngestAgentData>(result.stdout);
+      const queueResult = await runCliBuffered(["queue", "show", source.source_id, "--repo", wikiDir, "--json"]);
+      const queuePayload = parseJsonSuccess<"queue show", QueueShowData>(queueResult.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data).toMatchObject({
+        mode: "agent",
+        agent: "codex",
+        source: {
+          source_id: source.source_id,
+          status: "ingested",
+        },
+        validation: {
+          passed: true,
+          issues: [],
+        },
+        queue: {
+          previous_status: "queued",
+          status: "ingested",
+        },
+      });
+      expect(payload.data.applied_paths).toEqual(
+        expect.arrayContaining([
+          `curated/sources/${source.source_id}.md`,
+          "curated/index.md",
+          "curated/log.md",
+        ]),
+      );
+      expect(queuePayload.data.queue_record.status).toBe("ingested");
+      expect(queuePayload.data.source_card.frontmatter.status).toBe("ingested");
+      expect(queuePayload.data.queue_record.auto_ingest).toMatchObject({
+        enabled: true,
+        attempt_count: 1,
+        last_result: "ingested",
+        last_error_code: null,
+        last_error_message: null,
+      });
+      expect(queuePayload.data.source_card.frontmatter.auto_ingest).toEqual(
+        queuePayload.data.queue_record.auto_ingest,
+      );
+      await expect(readFile(resolve(wikiDir, `curated/sources/${source.source_id}.md`), "utf8"))
+        .resolves.toContain("shared auto-ingest worker");
     });
   });
 

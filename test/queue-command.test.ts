@@ -33,6 +33,13 @@ type RuntimeFailureEnvelope<Command extends string> = {
   }>;
 };
 
+type RuntimePartialFailureEnvelope<Command extends string, Data> =
+  & RuntimeFailureEnvelope<Command>
+  & {
+    data: Data;
+    warnings: string[];
+  };
+
 type SourceCaptureData = {
   status: "added" | "duplicate";
   source: {
@@ -289,6 +296,14 @@ function parseJsonFailure<Command extends string>(stdout: string[]): RuntimeFail
   return JSON.parse(stdout[0]) as RuntimeFailureEnvelope<Command>;
 }
 
+function parseJsonPartialFailure<Command extends string, Data>(
+  stdout: string[],
+): RuntimePartialFailureEnvelope<Command, Data> {
+  expect(stdout).toHaveLength(1);
+
+  return JSON.parse(stdout[0]) as RuntimePartialFailureEnvelope<Command, Data>;
+}
+
 function parseSourceCardFrontmatter<T>(content: string): T {
   const frontmatter = content.match(/^---\n([\s\S]*?)\n---\n/);
   expect(frontmatter).not.toBeNull();
@@ -345,6 +360,135 @@ function formatSourceCardFixture(fields: {
 }
 
 describe("queue command", () => {
+  it.each([
+    {
+      name: "queue --auto",
+      command: "queue",
+      option: "--auto",
+      args: (wikiDir: string, _sourceId: string) => ["queue", "--auto", "--repo", wikiDir, "--json"],
+    },
+    {
+      name: "queue --limit",
+      command: "queue",
+      option: "--limit",
+      args: (wikiDir: string, _sourceId: string) => ["queue", "--limit", "1", "--repo", wikiDir, "--json"],
+    },
+    {
+      name: "queue --source-id",
+      command: "queue",
+      option: "--source-id",
+      args: (wikiDir: string, sourceId: string) => ["queue", "--source-id", sourceId, "--repo", wikiDir, "--json"],
+    },
+    {
+      name: "queue show --auto",
+      command: "queue show",
+      option: "--auto",
+      args: (wikiDir: string, sourceId: string) => ["queue", "show", sourceId, "--auto", "--repo", wikiDir, "--json"],
+    },
+    {
+      name: "queue show --limit",
+      command: "queue show",
+      option: "--limit",
+      args: (wikiDir: string, sourceId: string) => [
+        "queue",
+        "show",
+        sourceId,
+        "--limit",
+        "1",
+        "--repo",
+        wikiDir,
+        "--json",
+      ],
+    },
+    {
+      name: "queue show --source-id",
+      command: "queue show",
+      option: "--source-id",
+      args: (wikiDir: string, sourceId: string) => [
+        "queue",
+        "show",
+        sourceId,
+        "--source-id",
+        sourceId,
+        "--repo",
+        wikiDir,
+        "--json",
+      ],
+    },
+    {
+      name: "queue set-status --auto",
+      command: "queue set-status",
+      option: "--auto",
+      args: (wikiDir: string, sourceId: string) => [
+        "queue",
+        "set-status",
+        sourceId,
+        "ingesting",
+        "--auto",
+        "--repo",
+        wikiDir,
+        "--json",
+      ],
+    },
+    {
+      name: "queue set-status --limit",
+      command: "queue set-status",
+      option: "--limit",
+      args: (wikiDir: string, sourceId: string) => [
+        "queue",
+        "set-status",
+        sourceId,
+        "ingesting",
+        "--limit",
+        "1",
+        "--repo",
+        wikiDir,
+        "--json",
+      ],
+    },
+    {
+      name: "queue set-status --source-id",
+      command: "queue set-status",
+      option: "--source-id",
+      args: (wikiDir: string, sourceId: string) => [
+        "queue",
+        "set-status",
+        sourceId,
+        "ingesting",
+        "--source-id",
+        sourceId,
+        "--repo",
+        wikiDir,
+        "--json",
+      ],
+    },
+  ])("rejects ingest-only option $name outside queue ingest", async ({ args, command, option }) => {
+    await withTempWorkspace("llm-wiki-queue-ingest-only-options-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const source = await captureTextSource(wikiDir, "Ingest Flag Guard", "alpha");
+
+      // Act
+      const result = await runCliBuffered(args(wikiDir, source.source_id));
+      const payload = parseJsonFailure<typeof command>(result.stdout);
+
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload).toMatchObject({
+        ok: false,
+        command,
+        error: {
+          code: "QUEUE_INGEST_OPTION_INVALID",
+        },
+      });
+      expect(payload.issues[0]).toMatchObject({
+        path: option,
+      });
+    });
+  });
+
   it("lists queued sources in stable JSON with source paths, updated time, and status counts", async () => {
     await withTempWorkspace("llm-wiki-queue-list-json-", async (workspaceDir) => {
       // Arrange
@@ -541,11 +685,12 @@ describe("queue command", () => {
         wikiDir,
         "--json",
       ]);
-      const payload = parseJsonSuccess<"queue ingest", QueueIngestData>(result.stdout);
+      const payload = parseJsonPartialFailure<"queue ingest", QueueIngestData>(result.stdout);
 
       // Assert
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toEqual([]);
+      expect(payload.error.code).toBe("QUEUE_INGEST_INCOMPLETE");
       expect(payload.data.counts).toMatchObject({
         selected: 1,
         attempted: 0,
@@ -676,74 +821,43 @@ describe("queue command", () => {
       // Assert
       expect(result.exitCode).toBe(1);
       expect(result.stdout).toEqual([]);
-      expect(result.stderr).toEqual(["Error: Auto-ingest completed with work requiring attention."]);
+      expect(result.stderr).toEqual([
+        [
+          "Error: Queue auto-ingest completed with 1 incomplete result.",
+          "Hint: Review the per-source results, fix blocked or deferred sources, then rerun llm-wiki queue ingest --auto.",
+        ].join("\n"),
+      ]);
     });
   });
 
-  it("bounds queue ingest --auto --watch result details while accumulating counts", async () => {
-    await withTempWorkspace("llm-wiki-queue-ingest-auto-watch-bounded-", async (workspaceDir) => {
+  it("rejects queue ingest --auto --watch when a source target is provided", async () => {
+    await withTempWorkspace("llm-wiki-queue-ingest-auto-watch-target-invalid-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
       const invalidSourceId = "not-a-source-id";
-      const beforeSigint = new Set(process.listeners("SIGINT"));
-      const beforeSigterm = new Set(process.listeners("SIGTERM"));
       await initializeWiki(wikiDir);
-      vi.useFakeTimers();
 
-      try {
-        // Act
-        const watchResult = runCliBuffered([
-          "queue",
-          "ingest",
-          "--auto",
-          "--source-id",
-          invalidSourceId,
-          "--watch",
-          "--repo",
-          wikiDir,
-          "--json",
-        ]);
-        let addedSigintListeners = process.listeners("SIGINT").filter((listener) => !beforeSigint.has(listener));
-        for (let attempt = 0; attempt < 50 && addedSigintListeners.length === 0; attempt += 1) {
-          await vi.advanceTimersByTimeAsync(0);
-          addedSigintListeners = process.listeners("SIGINT").filter((listener) => !beforeSigint.has(listener));
-        }
-        expect(addedSigintListeners).toHaveLength(1);
+      // Act
+      const result = await runCliBuffered([
+        "queue",
+        "ingest",
+        "--auto",
+        "--source-id",
+        invalidSourceId,
+        "--watch",
+        "--repo",
+        wikiDir,
+        "--json",
+      ]);
+      const payload = parseJsonFailure<"queue ingest">(result.stdout);
 
-        for (let tick = 0; tick < 30; tick += 1) {
-          await vi.advanceTimersByTimeAsync(1_000);
-        }
-        addedSigintListeners[0]?.("SIGINT");
-        await vi.advanceTimersByTimeAsync(0);
-        const result = await watchResult;
-        const payload = parseJsonSuccess<"queue ingest", QueueIngestData>(result.stdout);
-
-        // Assert
-        expect(result.exitCode).toBe(1);
-        expect(result.stderr).toEqual([]);
-        expect(payload.data.counts).toMatchObject({
-          selected: 31,
-          attempted: 0,
-          ingested: 0,
-          blocked: 0,
-          skipped: 31,
-          deferred: 0,
-        });
-        expect(payload.data.results).toHaveLength(25);
-        expect(payload.data.results.every((item) => item.source_id === invalidSourceId)).toBe(true);
-        expect(payload.data.results.every((item) => item.outcome === "skipped")).toBe(true);
-      } finally {
-        for (const listener of process.listeners("SIGINT")) {
-          if (!beforeSigint.has(listener)) {
-            process.off("SIGINT", listener);
-          }
-        }
-        for (const listener of process.listeners("SIGTERM")) {
-          if (!beforeSigterm.has(listener)) {
-            process.off("SIGTERM", listener);
-          }
-        }
-      }
+      // Assert
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toEqual([]);
+      expect(payload.error).toMatchObject({
+        code: "QUEUE_INGEST_ARGUMENT_INVALID",
+        message: "queue ingest --watch cannot combine with --source-id.",
+      });
     });
   });
 

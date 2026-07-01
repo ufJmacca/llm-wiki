@@ -31,6 +31,16 @@ export type RuntimeFailureEnvelope<Command extends string> = {
   issues: RuntimeIssue[];
 };
 
+export type RuntimePartialFailureEnvelope<Command extends string, Data> = {
+  ok: false;
+  command: Command;
+  repo: string;
+  data: Data;
+  warnings: string[];
+  error: RuntimeErrorEnvelope;
+  issues: RuntimeIssue[];
+};
+
 export function buildRuntimeSuccessEnvelope<Command extends string, Data>(
   command: Command,
   repo: string,
@@ -95,5 +105,28 @@ export function buildRuntimeCommandFailureEnvelope<Command extends string>(
         hint: error.hint,
       },
     ],
+  };
+}
+
+export function buildRuntimePartialFailureEnvelope<Command extends string, Data>(
+  command: Command,
+  repo: string,
+  data: Data,
+  error: RuntimeCommandError,
+  issues: RuntimeIssue[],
+  warnings: string[] = [],
+): RuntimePartialFailureEnvelope<Command, Data> {
+  return {
+    ok: false,
+    command,
+    repo,
+    data,
+    warnings,
+    error: {
+      code: error.code,
+      message: error.message,
+      hint: error.hint,
+    },
+    issues,
   };
 }

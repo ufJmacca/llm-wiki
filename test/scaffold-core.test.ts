@@ -173,7 +173,7 @@ describe("core wiki scaffold templates", () => {
       "Opt into upload-triggered auto-ingest with `llm-wiki explore serve --profile local --with-daemon --auto-ingest-uploads`.",
       "Review private queued sources under `raw/queue/` and their private source cards before ingest.",
       "Ingest approved sources into curated Markdown with `llm-wiki ingest <source_id>`.",
-      "Process queued sources with `llm-wiki queue ingest --auto`, `llm-wiki queue ingest --auto --limit 5`, `llm-wiki queue ingest --auto --source-id <source_id>`, or `llm-wiki queue ingest --auto --watch`.",
+      "Process queued sources with `llm-wiki queue ingest --auto`, `llm-wiki queue ingest --auto --limit 5`, `llm-wiki queue ingest --auto --source-id <source_id>`, or `llm-wiki queue ingest --auto --watch`. Watch mode cannot be combined with `--source-id` or `--limit`.",
       "Auto-ingest uses `.llm-wiki/config.yml:agent.default` and requires that default to name a configured local agent under `agents.<name>`; provider-mode auto-ingest is deferred.",
       "If no default local agent is configured, upload capture can still leave the source `queued`, while `llm-wiki queue ingest --auto` fails before moving queue items to `ingesting`.",
       "If auto-ingest fails, inspect the `blocked` source with `llm-wiki queue show <source_id>` or review pages. To retry automation, run `llm-wiki queue set-status <source_id> queued` and then `llm-wiki ingest <source_id> --auto`; after manual repairs, run `llm-wiki ingest <source_id> --validate`.",

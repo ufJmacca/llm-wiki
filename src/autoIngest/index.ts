@@ -194,6 +194,28 @@ export async function runAutoIngestSource(input: RunAutoIngestSourceInput): Prom
   });
 }
 
+export async function resumeAutoIngestSource(input: RunAutoIngestSourceInput): Promise<AutoIngestSourceResult> {
+  const current = await readCurrentSourceState(input.repoRoot, input.sourceId);
+  if (!current.ok) {
+    return skippedResult(input.sourceId, null, null, null, queueErrorToSafeError(current.error));
+  }
+
+  if (current.value.status !== "ingesting") {
+    return resumeNotEligibleResult(input.sourceId, current.value.status, current.value.autoIngest);
+  }
+
+  const agent = await resolveAndPreflightDefaultLocalAgent(input.repoRoot);
+
+  return runIngestingSourceWithAgent({
+    repoRoot: input.repoRoot,
+    sourceId: input.sourceId,
+    agent,
+    now: input.now,
+    lock: input.lock,
+    command: input.command,
+  });
+}
+
 export async function runAutoIngestWatch(input: RunAutoIngestWatchInput): Promise<AutoIngestWatchSummary> {
   const agent = await resolveAndPreflightDefaultLocalAgent(input.repoRoot);
   const counts = emptyAutoIngestCounts();
@@ -204,7 +226,7 @@ export async function runAutoIngestWatch(input: RunAutoIngestWatchInput): Promis
   await input.onPreflightComplete?.(agent);
 
   while (!interrupted) {
-    const candidates = await selectQueuedCandidates(input.repoRoot, undefined);
+    const candidates = await selectQueuedCandidates(input.repoRoot);
 
     for (const candidate of candidates) {
       if (signalIsAborted(input.signal)) {
@@ -270,28 +292,6 @@ export async function runAutoIngestWatch(input: RunAutoIngestWatchInput): Promis
   });
 
   return summary;
-}
-
-export async function resumeAutoIngestSource(input: RunAutoIngestSourceInput): Promise<AutoIngestSourceResult> {
-  const current = await readCurrentSourceState(input.repoRoot, input.sourceId);
-  if (!current.ok) {
-    return skippedResult(input.sourceId, null, null, null, queueErrorToSafeError(current.error));
-  }
-
-  if (current.value.status !== "ingesting") {
-    return resumeNotEligibleResult(input.sourceId, current.value.status, current.value.autoIngest);
-  }
-
-  const agent = await resolveAndPreflightDefaultLocalAgent(input.repoRoot);
-
-  return runIngestingSourceWithAgent({
-    repoRoot: input.repoRoot,
-    sourceId: input.sourceId,
-    agent,
-    now: input.now,
-    lock: input.lock,
-    command: input.command,
-  });
 }
 
 async function runQueuedSourceWithAgent(input: RunQueuedSourceInput): Promise<AutoIngestSourceResult> {

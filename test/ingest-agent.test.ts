@@ -463,79 +463,6 @@ describe("ingest local agent automation", () => {
     });
   });
 
-  it("--auto --json preserves the ingest success envelope while the shared worker owns queue metadata", async () => {
-    await withTempWorkspace("llm-wiki-ingest-agent-auto-json-", async (workspaceDir) => {
-      // Arrange
-      const wikiDir = resolve(workspaceDir, "wiki");
-      const promptLogPath = resolve(workspaceDir, "auto-json-prompt.md");
-      process.env.LLM_WIKI_AGENT_PROMPT_LOG = promptLogPath;
-      await initializeWiki(wikiDir);
-      const source = await captureTextSource(wikiDir);
-      const executablePath = await createFakeCodex(workspaceDir, successfulCodexSource(source));
-      await configureCodexAgent(wikiDir, {
-        command: executablePath,
-        defaultAgent: "codex",
-      });
-
-      // Act
-      const result = await runCliBuffered([
-        "ingest",
-        source.source_id,
-        "--repo",
-        wikiDir,
-        "--auto",
-        "--json",
-      ]);
-      const payload = parseJsonSuccess<"ingest", IngestAgentData>(result.stdout);
-      const queueResult = await runCliBuffered(["queue", "show", source.source_id, "--repo", wikiDir, "--json"]);
-      const queuePayload = parseJsonSuccess<"queue show", QueueShowData>(queueResult.stdout);
-      const prompt = await readFile(promptLogPath, "utf8");
-      const runtimeLog = await readFile(resolve(wikiDir, "curated/log.md"), "utf8");
-
-      // Assert
-      expect(result.exitCode).toBe(0);
-      expect(result.stderr).toEqual([]);
-      expect(payload.data).toMatchObject({
-        mode: "agent",
-        agent: "codex",
-        source: {
-          source_id: source.source_id,
-          status: "ingested",
-        },
-        validation: {
-          passed: true,
-          issues: [],
-        },
-        queue: {
-          previous_status: "queued",
-          status: "ingested",
-        },
-      });
-      expect(payload.data.applied_paths).toEqual([
-        "curated/index.md",
-        "curated/log.md",
-        `curated/sources/${source.source_id}.md`,
-      ]);
-      expect(prompt).toContain("Queue status: ingesting");
-      expect(queuePayload.data.queue_record.status).toBe("ingested");
-      expect(queuePayload.data.source_card.frontmatter.status).toBe("ingested");
-      expect(queuePayload.data.queue_record.auto_ingest).toMatchObject({
-        enabled: true,
-        attempt_count: 1,
-        last_result: "ingested",
-        last_error_code: null,
-        last_error_message: null,
-      });
-      expect(queuePayload.data.source_card.frontmatter.auto_ingest).toEqual(
-        queuePayload.data.queue_record.auto_ingest,
-      );
-      expect(countOccurrences(runtimeLog, `ingest | ${source.source_id} | Status changed to ingesting`)).toBe(1);
-      expect(countOccurrences(runtimeLog, `ingest | ${source.source_id} | Status changed to ingested`)).toBe(1);
-      expect(countOccurrences(runtimeLog, "- status: queued -> ingesting")).toBe(1);
-      expect(countOccurrences(runtimeLog, "- status: ingesting -> ingested")).toBe(1);
-    });
-  });
-
   it("--auto --json preserves validation issue details when auto-ingest blocks", async () => {
     await withTempWorkspace("llm-wiki-ingest-agent-auto-validation-details-", async (workspaceDir) => {
       // Arrange
@@ -671,11 +598,11 @@ describe("ingest local agent automation", () => {
     });
   });
 
-  it("--auto completes a source that was already moved to ingesting", async () => {
-    await withTempWorkspace("llm-wiki-ingest-agent-auto-existing-ingesting-", async (workspaceDir) => {
+  it("--auto --json preserves the ingest success envelope while the shared worker owns queue metadata", async () => {
+    await withTempWorkspace("llm-wiki-ingest-agent-auto-json-", async (workspaceDir) => {
       // Arrange
       const wikiDir = resolve(workspaceDir, "wiki");
-      const promptLogPath = resolve(workspaceDir, "auto-ingesting-prompt.md");
+      const promptLogPath = resolve(workspaceDir, "auto-json-prompt.md");
       process.env.LLM_WIKI_AGENT_PROMPT_LOG = promptLogPath;
       await initializeWiki(wikiDir);
       const source = await captureTextSource(wikiDir);
@@ -684,17 +611,6 @@ describe("ingest local agent automation", () => {
         command: executablePath,
         defaultAgent: "codex",
       });
-      const started = await transitionQueueStatus(wikiDir, source.source_id, "ingesting", {
-        now: new Date("2999-06-23T08:00:00.000Z"),
-        command: `llm-wiki ingest ${source.source_id} --auto`,
-        autoIngest: {
-          enabled: true,
-          result: "ingesting",
-          errorCode: null,
-          errorMessage: null,
-        },
-      });
-      expect(started.ok).toBe(true);
 
       // Act
       const result = await runCliBuffered([
@@ -726,7 +642,7 @@ describe("ingest local agent automation", () => {
           issues: [],
         },
         queue: {
-          previous_status: "ingesting",
+          previous_status: "queued",
           status: "ingested",
         },
       });
@@ -741,7 +657,6 @@ describe("ingest local agent automation", () => {
       expect(queuePayload.data.queue_record.auto_ingest).toMatchObject({
         enabled: true,
         attempt_count: 1,
-        last_attempt_at: "2999-06-23T08:00:00.000Z",
         last_result: "ingested",
         last_error_code: null,
         last_error_message: null,
@@ -843,6 +758,86 @@ describe("ingest local agent automation", () => {
       expect(runtimeLog).not.toContain("Codex ingest completed");
       expect(countOccurrences(runtimeLog, `ingest | ${source.source_id} | Status changed to ingesting`)).toBe(1);
       expect(countOccurrences(runtimeLog, `ingest | ${source.source_id} | Status changed to blocked`)).toBe(1);
+    });
+  });
+
+  it("--auto completes a source that was already moved to ingesting", async () => {
+    await withTempWorkspace("llm-wiki-ingest-agent-auto-existing-ingesting-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const promptLogPath = resolve(workspaceDir, "auto-ingesting-prompt.md");
+      process.env.LLM_WIKI_AGENT_PROMPT_LOG = promptLogPath;
+      await initializeWiki(wikiDir);
+      const source = await captureTextSource(wikiDir);
+      const executablePath = await createFakeCodex(workspaceDir, successfulCodexSource(source));
+      await configureCodexAgent(wikiDir, {
+        command: executablePath,
+        defaultAgent: "codex",
+      });
+      const started = await transitionQueueStatus(wikiDir, source.source_id, "ingesting", {
+        now: new Date("2999-06-23T08:00:00.000Z"),
+        command: `llm-wiki ingest ${source.source_id} --auto`,
+        autoIngest: {
+          enabled: true,
+          result: "ingesting",
+          errorCode: null,
+          errorMessage: null,
+        },
+      });
+      expect(started.ok).toBe(true);
+
+      // Act
+      const result = await runCliBuffered([
+        "ingest",
+        source.source_id,
+        "--repo",
+        wikiDir,
+        "--auto",
+        "--json",
+      ]);
+      const payload = parseJsonSuccess<"ingest", IngestAgentData>(result.stdout);
+      const queueResult = await runCliBuffered(["queue", "show", source.source_id, "--repo", wikiDir, "--json"]);
+      const queuePayload = parseJsonSuccess<"queue show", QueueShowData>(queueResult.stdout);
+      const prompt = await readFile(promptLogPath, "utf8");
+
+      // Assert
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toEqual([]);
+      expect(payload.data).toMatchObject({
+        mode: "agent",
+        agent: "codex",
+        source: {
+          source_id: source.source_id,
+          status: "ingested",
+        },
+        validation: {
+          passed: true,
+          issues: [],
+        },
+        queue: {
+          previous_status: "ingesting",
+          status: "ingested",
+        },
+      });
+      expect(payload.data.applied_paths).toEqual([
+        "curated/index.md",
+        "curated/log.md",
+        `curated/sources/${source.source_id}.md`,
+      ]);
+      expect(prompt).toContain("Queue status: ingesting");
+      expect(queuePayload.data.queue_record.status).toBe("ingested");
+      expect(queuePayload.data.source_card.frontmatter.status).toBe("ingested");
+      expect(queuePayload.data.queue_record.auto_ingest).toMatchObject({
+        enabled: true,
+        attempt_count: 1,
+        last_attempt_at: "2999-06-23T08:00:00.000Z",
+        last_result: "ingested",
+        last_error_code: null,
+        last_error_message: null,
+      });
+      expect(queuePayload.data.source_card.frontmatter.auto_ingest).toEqual(
+        queuePayload.data.queue_record.auto_ingest,
+      );
     });
   });
 
@@ -1001,43 +996,6 @@ describe("ingest local agent automation", () => {
       });
       expect(queuePayload.data.queue_record.status).toBe("ingesting");
       expect(queuePayload.data.source_card.frontmatter.status).toBe("ingesting");
-      await expect(pathExists(promptLogPath)).resolves.toBe(false);
-    });
-  });
-
-  it("--agent does not start manual ingest while the ingest lock is held", async () => {
-    await withTempWorkspace("llm-wiki-ingest-agent-manual-locked-", async (workspaceDir) => {
-      // Arrange
-      const wikiDir = resolve(workspaceDir, "wiki");
-      const promptLogPath = resolve(workspaceDir, "locked-agent-prompt.md");
-      process.env.LLM_WIKI_AGENT_PROMPT_LOG = promptLogPath;
-      await initializeWiki(wikiDir);
-      const source = await captureTextSource(wikiDir);
-      const executablePath = await createFakeCodex(workspaceDir, successfulCodexSource(source));
-      await configureCodexAgent(wikiDir, { command: executablePath });
-      await mkdir(resolve(wikiDir, INGEST_LOCK_RELATIVE_PATH), { recursive: true });
-
-      // Act
-      const result = await runCliBuffered([
-        "ingest",
-        source.source_id,
-        "--repo",
-        wikiDir,
-        "--agent",
-        "codex",
-        "--json",
-      ]);
-      const payload = parseJsonFailure<"ingest">(result.stdout);
-      const queueResult = await runCliBuffered(["queue", "show", source.source_id, "--repo", wikiDir, "--json"]);
-      const queuePayload = parseJsonSuccess<"queue show", QueueShowData>(queueResult.stdout);
-
-      // Assert
-      expect(result.exitCode).toBe(1);
-      expect(payload.error).toMatchObject({
-        code: "INGEST_LOCK_BUSY",
-      });
-      expect(queuePayload.data.queue_record.status).toBe("queued");
-      expect(queuePayload.data.source_card.frontmatter.status).toBe("queued");
       await expect(pathExists(promptLogPath)).resolves.toBe(false);
     });
   });

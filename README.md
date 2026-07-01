@@ -294,7 +294,7 @@ Treat existing `upload/github/serverless/*` files as unsupported migration debri
 
 `llm-wiki queue ingest --auto` processes currently queued sources with the configured default local agent and prints per-source results. It selects eligible queued sources oldest first, marks each source `ingesting` before running the agent, validates proposals through the same gates as `llm-wiki ingest <source_id> --auto`, marks validated sources `ingested`, and marks failed sources `blocked`.
 
-Use `llm-wiki queue ingest --auto --limit 5` to process only the oldest five eligible queued sources. Use `llm-wiki queue ingest --auto --source-id <source_id>` to target one queued source; it cannot be combined with `--limit`. Use `llm-wiki queue ingest --auto --watch` to keep processing newly queued sources until interrupted.
+Use `llm-wiki queue ingest --auto --limit 5` to process only the oldest five eligible queued sources. Use `llm-wiki queue ingest --auto --source-id <source_id>` to target one queued source; it cannot be combined with `--limit`. Use `llm-wiki queue ingest --auto --watch` to keep processing newly queued sources until interrupted; watch mode cannot be combined with `--source-id` or `--limit`.
 
 Upload-triggered and queue auto-ingest both resolve `.llm-wiki/config.yml:agent.default` and require that value to name a configured local agent under `agents.<name>`. Provider-mode auto-ingest is deferred; `--provider <name>` remains an explicit per-command proposal mode and is not used by upload-triggered or queue auto-ingest.
 

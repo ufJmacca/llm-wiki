@@ -2,7 +2,7 @@
 
 `llm-wiki` is a local-first CLI for creating a Git-backed, Obsidian-compatible Markdown wiki that can later grow into the full LLM Wiki workflow described in the PRD.
 
-The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, `llm-wiki add-url`, and the Explorer local upload path capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki ingest`, `llm-wiki query`, `llm-wiki log`, `llm-wiki lint`, `llm-wiki index rebuild`, `llm-wiki status`, `llm-wiki snapshot`, `llm-wiki search`, `llm-wiki nav`, `llm-wiki explore init/sync/serve/open/build`, and `llm-wiki deploy github-pages` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
+The current supported foundation is intentionally small: `llm-wiki init` creates a deterministic wiki scaffold with raw/curated separation, agent instructions, profile files, privacy defaults, and Git initialization. `llm-wiki add`, `llm-wiki add-text`, `llm-wiki add-url`, and the Explorer local upload path capture private raw sources into the queue with deterministic source IDs, SHA-256 hashes, source cards, queue JSON, and log entries. `llm-wiki queue`, `llm-wiki queue ingest`, `llm-wiki ingest`, `llm-wiki query`, `llm-wiki log`, `llm-wiki lint`, `llm-wiki index rebuild`, `llm-wiki status`, `llm-wiki snapshot`, `llm-wiki search`, `llm-wiki nav`, `llm-wiki explore init/sync/serve/open/build`, and `llm-wiki deploy github-pages` expose that control plane for reviewable local workflow state. Non-init commands share repository discovery and output contracts so future workflow commands can behave consistently.
 
 ## Development
 
@@ -68,6 +68,10 @@ llm-wiki add-text --title "Pasted Note" --text "Captured text"
 llm-wiki add-url https://example.com/research-note --title "Fetched Note"
 llm-wiki queue
 llm-wiki queue show <source_id>
+llm-wiki queue ingest --auto
+llm-wiki queue ingest --auto --limit 5
+llm-wiki queue ingest --auto --source-id <source_id>
+llm-wiki queue ingest --auto --watch
 llm-wiki queue set-status <source_id> ingesting
 llm-wiki ingest <source_id>
 llm-wiki ingest <source_id> --agent codex
@@ -94,6 +98,7 @@ llm-wiki explore init
 llm-wiki explore sync --profile local
 llm-wiki explore serve --profile local
 llm-wiki explore serve --profile local --with-daemon
+llm-wiki explore serve --profile local --with-daemon --auto-ingest-uploads
 llm-wiki explore open
 llm-wiki explore build --profile public
 llm-wiki deploy github-pages init
@@ -120,6 +125,10 @@ llm-wiki add-text --repo my-wiki --title "Pasted Note" --text "Captured text" --
 llm-wiki add-url https://example.com/research-note --repo my-wiki --title "Fetched Note" --json
 llm-wiki queue --repo my-wiki --json
 llm-wiki queue show <source_id> --repo my-wiki --json
+llm-wiki queue ingest --repo my-wiki --auto --json
+llm-wiki queue ingest --repo my-wiki --auto --limit 5 --json
+llm-wiki queue ingest --repo my-wiki --auto --source-id <source_id> --json
+llm-wiki queue ingest --repo my-wiki --auto --watch --json
 llm-wiki queue set-status <source_id> ingesting --repo my-wiki --json
 llm-wiki ingest <source_id> --repo my-wiki --json
 llm-wiki ingest <source_id> --repo my-wiki --agent codex --json
@@ -145,6 +154,7 @@ llm-wiki explore init --repo my-wiki --json
 llm-wiki explore sync --repo my-wiki --profile local --json
 llm-wiki explore serve --repo my-wiki --profile local --json
 llm-wiki explore serve --repo my-wiki --profile local --with-daemon --json
+llm-wiki explore serve --repo my-wiki --profile local --with-daemon --auto-ingest-uploads --json
 llm-wiki explore open --repo my-wiki --json
 llm-wiki explore build --repo my-wiki --profile public --json
 llm-wiki deploy github-pages init --repo my-wiki --json
@@ -163,7 +173,7 @@ llm-wiki snapshot --repo my-wiki --json
 
 `snapshot` runs lint before touching Git. It refuses to commit while error-severity lint issues exist, and malformed or unreadable config fails with an actionable config error before Git preflight. When lint passes, it stages the repository, creates a `chore: snapshot llm-wiki state` commit, falls back to the built-in llm-wiki Git identity when local Git identity is missing, and reports the commit SHA plus post-commit Git state.
 
-`add`, `add-text`, `add-url`, and Explorer upload API responses return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue set-status`, and `log` return the queue records, source-card frontmatter, transition results, and parsed runtime log entries. `ingest` and `query` return generated manual task prompts, local agent/provider execution results, or validation results. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. `explore init` writes isolated Quartz runtime files, `explore sync` materializes profile-selected Markdown into generated Quartz content, `explore serve` starts the local Quartz script after sync and can optionally start the local upload daemon, `explore open` prints the recorded local URL, and `explore build` runs public sync, strict public lint, and the Quartz build script. `deploy github-pages` generates the publisher-only Pages workflow/profile pair, validates deploy readiness, and runs the local build/check path used before committing `quartz/public`. The standalone daemon and remote upload scaffold commands are not part of the v1 public CLI.
+`add`, `add-text`, `add-url`, and Explorer upload API responses return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue ingest`, `queue set-status`, and `log` return the queue records, source-card frontmatter, auto-ingest summaries, transition results, and parsed runtime log entries. `ingest` and `query` return generated manual task prompts, local agent/provider execution results, or validation results. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. `explore init` writes isolated Quartz runtime files, `explore sync` materializes profile-selected Markdown into generated Quartz content, `explore serve` starts the local Quartz script after sync and can optionally start the local upload daemon, `explore open` prints the recorded local URL, and `explore build` runs public sync, strict public lint, and the Quartz build script. `deploy github-pages` generates the publisher-only Pages workflow/profile pair, validates deploy readiness, and runs the local build/check path used before committing `quartz/public`. The standalone daemon and remote upload scaffold commands are not part of the v1 public CLI.
 
 ## Quartz Explorer
 
@@ -185,9 +195,17 @@ cd quartz && npm install
 
 Pass `--with-daemon` to start the local upload daemon alongside Explorer. The daemon also binds to `127.0.0.1` by default, adds `daemon` metadata to the serve readiness envelope, writes local runtime metadata for the browser upload form, and is closed when the Explorer process exits. Use `--daemon-port <port>` to choose the upload daemon port. Upload commits remain disabled unless `--commit-uploads` is also passed.
 
+Pass `--auto-ingest-uploads` with `--with-daemon` to opt into upload-triggered auto-ingest for local or review Explorer serves:
+
+```bash
+llm-wiki explore serve --profile local --with-daemon --auto-ingest-uploads
+```
+
+The flag is rejected without `--with-daemon` and is forbidden for public-like profiles. Local daemon metadata then includes `auto_ingest_available: true` so the browser upload UI can show auto-ingest status and retry guidance.
+
 Open the local Explorer root URL and use the generated upload form to capture a file, pasted text, or URL source. The browser form submits `multipart/form-data` to the local daemon endpoint recorded in `_llm-wiki/runtime/local-daemon.json`: `<daemon.url>/api/raw-upload`. File uploads send the `file` field with an optional `title`; pasted text uploads send `text` plus the required `title`; URL uploads send `url` with an optional `title`.
 
-A successful browser upload shows the title, `source_id`, source kind, queue status, source card path, original path, and next ingest command. Use `llm-wiki ingest <source_id>` to review and curate the queued source manually, or `llm-wiki ingest <source_id> --auto` when the repository has a default local agent configured.
+A successful browser upload shows the title, `source_id`, source kind, queue status, source card path, original path, and next ingest command. Use `llm-wiki ingest <source_id>` to review and curate the queued source manually, or `llm-wiki ingest <source_id> --auto` when the repository has a default local agent configured. When `--auto-ingest-uploads` is enabled, the upload response also reports whether auto-ingest was ingested, blocked, queued, deferred, or skipped, and shows a manual retry command when more action is needed.
 
 Remote/serverless upload scaffolding is outside the v1 GitHub Pages path and is not exposed as a public CLI workflow. The supported upload path is the loopback daemon started by Explorer.
 
@@ -273,6 +291,20 @@ Treat existing `upload/github/serverless/*` files as unsupported migration debri
 `llm-wiki queue show <source_id>` returns the queue record and linked `_source.md` frontmatter. It fails with stable errors when the queue item is missing, the source card is missing, or the queue JSON and source-card frontmatter disagree on source ID, title, source kind, status, or visibility.
 
 `llm-wiki queue set-status <source_id> <status>` supports explicit validated transitions: `queued -> ingesting`, `ingesting -> ingested`, `ingesting -> blocked`, and `blocked -> queued`. It mirrors the status and `updated_at` timestamp into both the queue JSON and `_source.md`, updates the source card body status line, and appends a parseable `ingest` entry to `curated/log.md`.
+
+`llm-wiki queue ingest --auto` processes currently queued sources with the configured default local agent and prints per-source results. It selects eligible queued sources oldest first, marks each source `ingesting` before running the agent, validates proposals through the same gates as `llm-wiki ingest <source_id> --auto`, marks validated sources `ingested`, and marks failed sources `blocked`.
+
+Use `llm-wiki queue ingest --auto --limit 5` to process only the oldest five eligible queued sources. Use `llm-wiki queue ingest --auto --source-id <source_id>` to target one queued source; it cannot be combined with `--limit`. Use `llm-wiki queue ingest --auto --watch` to keep processing newly queued sources until interrupted; watch mode cannot be combined with `--source-id` or `--limit`.
+
+Upload-triggered and queue auto-ingest both resolve `.llm-wiki/config.yml:agent.default` and require that value to name a configured local agent under `agents.<name>`. Provider-mode auto-ingest is deferred; `--provider <name>` remains an explicit per-command proposal mode and is not used by upload-triggered or queue auto-ingest.
+
+If `agent.default` is missing or does not point at a configured local agent, upload capture can still succeed, the source stays `queued`, and the auto-ingest result reports the missing-agent problem. `llm-wiki queue ingest --auto` fails before moving queue items to `ingesting` when no default local agent is configured.
+
+If auto-ingest fails during agent execution, proposal extraction, validation, or application, the source is marked `blocked` and the captured raw upload is not rolled back. Inspect blocked sources with `llm-wiki queue show <source_id>` and review pages. To retry automation, run `llm-wiki queue set-status <source_id> queued` and then `llm-wiki ingest <source_id> --auto`; after manual repairs, run `llm-wiki ingest <source_id> --validate`.
+
+Duplicate uploads do not create a second ingest when the existing source is already `ingested`; if the duplicate is still `queued`, upload-triggered auto-ingest may attempt the existing queue item.
+
+Auto-ingest never builds, commits curated files, snapshots, deploys, publishes, or enables uploads on GitHub Pages.
 
 `llm-wiki log` parses runtime entries from `curated/log.md` while ignoring the seeded entry-format template and fenced examples. JSON output includes parsed entries, scanner issues, and counts.
 

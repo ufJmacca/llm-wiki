@@ -170,9 +170,16 @@ describe("core wiki scaffold templates", () => {
     const plannedEntries = new Map(planWikiScaffold(defaultOptions).map((entry) => [entry.path, entry.content]));
     const requiredDocumentation = [
       "Run local upload with `llm-wiki explore serve --profile local --with-daemon`.",
+      "Opt into upload-triggered auto-ingest with `llm-wiki explore serve --profile local --with-daemon --auto-ingest-uploads`.",
       "Review private queued sources under `raw/queue/` and their private source cards before ingest.",
       "Ingest approved sources into curated Markdown with `llm-wiki ingest <source_id>`.",
+      "Process queued sources with `llm-wiki queue ingest --auto`, `llm-wiki queue ingest --auto --limit 5`, `llm-wiki queue ingest --auto --source-id <source_id>`, or `llm-wiki queue ingest --auto --watch`. Watch mode cannot be combined with `--source-id` or `--limit`.",
+      "Auto-ingest uses `.llm-wiki/config.yml:agent.default` and requires that default to name a configured local agent under `agents.<name>`; provider-mode auto-ingest is deferred.",
+      "If no default local agent is configured, upload capture can still leave the source `queued`, while `llm-wiki queue ingest --auto` fails before moving queue items to `ingesting`.",
+      "If auto-ingest fails, inspect the `blocked` source with `llm-wiki queue show <source_id>` or review pages. To retry automation, run `llm-wiki queue set-status <source_id> queued` and then `llm-wiki ingest <source_id> --auto`; after manual repairs, run `llm-wiki ingest <source_id> --validate`.",
+      "Duplicate uploads do not trigger a second ingest when the existing source is already `ingested`; queued duplicates may attempt the existing queue item.",
       "Publish to GitHub Pages by running `llm-wiki deploy github-pages build-local`, running `llm-wiki deploy github-pages check`, committing `quartz/public`, opening a pull request, merging it, and letting Pages serve the committed static files.",
+      "Auto-ingest never builds, commits curated files, snapshots, deploys, publishes, or enables uploads on GitHub Pages.",
       "GitHub Pages never supports uploads, upload endpoint config, tokens, runtime daemon metadata, raw originals, private source cards, queue state, or review pages.",
       "Treat existing `upload/github/serverless/*` files as unsupported migration debris for GitHub Pages.",
     ];

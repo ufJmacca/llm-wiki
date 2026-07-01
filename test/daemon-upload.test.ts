@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { parse } from "yaml";
 import { describe, expect, it, vi } from "vitest";
 
-import type { AutoIngestSourceResult } from "../src/autoIngest/index.js";
+import { runAutoIngestWatch, type AutoIngestSourceResult } from "../src/autoIngest/index.js";
 import { startUploadDaemon, UPLOAD_TOKEN_HEADER, type UploadCommitter, type UploadDaemon } from "../src/daemon/index.js";
 import { syncQuartzContent } from "../src/quartz/index.js";
 import { showQueueSource, transitionQueueStatus, type AutoIngestMetadata, type QueueStatus } from "../src/runtime/queue.js";
@@ -162,6 +162,24 @@ async function gitShow(repoRoot: string, revisionPath: string): Promise<string> 
   const { stdout } = await execFileAsync("git", ["show", revisionPath], { cwd: repoRoot });
 
   return stdout;
+}
+
+async function commitUploadWithGitForTest(
+  request: Parameters<UploadCommitter>[0],
+): Promise<Awaited<ReturnType<UploadCommitter>>> {
+  const paths = [...new Set(request.paths)].sort();
+  await execFileAsync("git", ["add", "--", ...paths], { cwd: request.repoRoot });
+  await execFileAsync(
+    "git",
+    ["commit", "-m", `chore: upload raw source ${request.source_id}`, "--", ...paths],
+    { cwd: request.repoRoot },
+  );
+
+  return {
+    attempted: true,
+    ok: true,
+    committed_paths: paths,
+  };
 }
 
 async function configureDefaultLocalAgent(wikiDir: string, command: string): Promise<void> {
@@ -1136,6 +1154,110 @@ describe("local upload daemon", () => {
           secondUpload.body.data.source_card_path,
           secondUpload.body.data.queue_path,
         ]));
+      } finally {
+        await daemon.close();
+      }
+    });
+  });
+
+  it("keeps raw upload commits isolated while a queue auto-ingest watcher observes the new source", async () => {
+    await withTempWorkspace("llm-wiki-daemon-watch-race-raw-commit-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeGitWiki(wikiDir);
+      const executablePath = await createExecutable(workspaceDir, "upload-watch-race-agent", UPLOAD_SUCCESS_AGENT_SOURCE);
+      await configureDefaultLocalAgent(wikiDir, executablePath);
+
+      let watchResult: AutoIngestSourceResult | null = null;
+      const commitUpload = vi.fn<UploadCommitter>(async (request) => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 1_000);
+
+        try {
+          const summary = await runAutoIngestWatch({
+            repoRoot: request.repoRoot,
+            command: "llm-wiki queue ingest --auto --watch",
+            lock: {
+              timeoutMs: 0,
+              retryDelayMs: 0,
+            },
+            pollIntervalMs: 5,
+            signal: controller.signal,
+            onEvent: (event) => {
+              if (event.event === "result") {
+                watchResult = event.result;
+                controller.abort();
+              }
+            },
+          });
+
+          expect(summary.counts.selected).toBe(1);
+        } finally {
+          clearTimeout(timeout);
+        }
+
+        return commitUploadWithGitForTest(request);
+      });
+      const daemon = await startUploadDaemon({
+        repoRoot: wikiDir,
+        port: 0,
+        commitUploads: true,
+        commitUpload,
+      });
+
+      try {
+        // Act
+        const upload = await uploadForm(
+          daemon,
+          textUploadForm("Watcher Race Upload", "Watcher race raw upload body.\n"),
+        );
+        const commitPaths = await gitCommitPaths(wikiDir, "HEAD");
+        const committedQueue = JSON.parse(await gitShow(wikiDir, `HEAD:${upload.body.data.queue_path}`)) as {
+          status: QueueStatus;
+          auto_ingest?: AutoIngestMetadata;
+        };
+        const committedSourceCard = parseSourceCardFrontmatter<{
+          status: QueueStatus;
+          auto_ingest?: AutoIngestMetadata;
+        }>(await gitShow(wikiDir, `HEAD:${upload.body.data.source_card_path}`));
+        const committedLog = await gitShow(wikiDir, "HEAD:curated/log.md");
+
+        // Assert
+        expect(upload.status).toBe(201);
+        expect(upload.body.data).toMatchObject({
+          status: "added",
+          queue_status: "queued",
+          commit: {
+            attempted: true,
+            ok: true,
+          },
+        });
+        expect(commitUpload).toHaveBeenCalledTimes(1);
+        expect(watchResult).toMatchObject({
+          source_id: upload.body.data.source_id,
+          previous_status: "queued",
+          final_status: "queued",
+          outcome: "deferred",
+          attempted: false,
+          error: {
+            code: "INGEST_LOCK_BUSY",
+          },
+        });
+        expect(commitPaths).toEqual(expect.arrayContaining([
+          upload.body.data.original_path,
+          upload.body.data.source_card_path,
+          upload.body.data.queue_path,
+          "curated/log.md",
+        ]));
+        expect(commitPaths).not.toContain("curated/index.md");
+        expect(commitPaths).not.toContain(`curated/sources/${upload.body.data.source_id}.md`);
+        expect(committedQueue).toMatchObject({ status: "queued" });
+        expect(committedQueue).not.toHaveProperty("auto_ingest");
+        expect(committedSourceCard).toMatchObject({ status: "queued" });
+        expect(committedSourceCard).not.toHaveProperty("auto_ingest");
+        expect(committedLog).toContain("Watcher Race Upload");
+        expect(committedLog).not.toContain("Status changed to ingesting");
+        expect(committedLog).not.toContain("Agent ingest completed");
       } finally {
         await daemon.close();
       }

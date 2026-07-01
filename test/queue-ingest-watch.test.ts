@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -693,6 +693,85 @@ describe("queue ingest watch mode", () => {
           },
         });
         await expect(readQueueRecord(wikiDir, source)).resolves.toMatchObject({ status: "queued" });
+      } finally {
+        for (const listener of process.listeners("SIGINT")) {
+          if (!beforeSigint.has(listener)) {
+            process.off("SIGINT", listener);
+          }
+        }
+      }
+    });
+  });
+
+  it("exits 1 when watched queued work is skipped and left incomplete", async () => {
+    await withTempWorkspace("llm-wiki-queue-watch-skipped-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const beforeSigint = new Set(process.listeners("SIGINT"));
+      await initializeWiki(wikiDir);
+      const executablePath = await createExecutable(workspaceDir, "agent-watch-skipped", successAgentSource());
+      await configureDefaultAgent(wikiDir, executablePath);
+      const source = await writeSourceFixture(wikiDir, {
+        sourceId: sourceIdForSlug("watch_skipped"),
+        capturedAt: TEST_CAPTURED_AT,
+      });
+      await rm(resolve(wikiDir, source.sourceCardPath), { force: true });
+
+      try {
+        // Act
+        const exitCode = await runCli(["queue", "ingest", "--auto", "--watch", "--repo", wikiDir, "--json"], {
+          stdout: (message) => {
+            stdout.push(message);
+            const payload = JSON.parse(message) as { event?: string };
+            if (payload.event === "result") {
+              const sigintListeners = process.listeners("SIGINT").filter((listener) => !beforeSigint.has(listener));
+              expect(sigintListeners).toHaveLength(1);
+              sigintListeners[0]("SIGINT");
+            }
+          },
+          stderr: (message) => stderr.push(message),
+          stdin: async () => "",
+        });
+        const events = parseJsonLines(stdout);
+
+        // Assert
+        expect(exitCode).toBe(1);
+        expect(stderr).toEqual([]);
+        expect(events).toHaveLength(2);
+        expect(events[0]).toMatchObject({
+          event: "result",
+          result: {
+            source_id: source.sourceId,
+            final_status: "queued",
+            outcome: "skipped",
+            attempted: false,
+            error: {
+              code: "QUEUE_SOURCE_CARD_MISSING",
+            },
+          },
+          counts: {
+            selected: 1,
+            attempted: 0,
+            skipped: 1,
+          },
+        });
+        expect(events[1]).toMatchObject({
+          event: "summary",
+          ok: false,
+          summary: {
+            exit_code: 1,
+            failure_count: 1,
+            counts: {
+              selected: 1,
+              attempted: 0,
+              skipped: 1,
+            },
+          },
+        });
+        await expect(readQueueRecord(wikiDir, source)).resolves.toMatchObject({ status: "queued" });
+        await expect(pathExists(resolve(wikiDir, source.sourceCardPath))).resolves.toBe(false);
       } finally {
         for (const listener of process.listeners("SIGINT")) {
           if (!beforeSigint.has(listener)) {

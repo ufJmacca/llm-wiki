@@ -234,14 +234,22 @@ export async function runAutoIngestWatch(input: RunAutoIngestWatchInput): Promis
         break;
       }
 
-      const result = await runQueuedSourceWithAgent({
-        repoRoot: input.repoRoot,
-        sourceId: candidate.sourceId,
-        agent,
-        now: input.now,
-        lock: input.lock,
-        command,
-      });
+      const result = candidate.error === undefined
+        ? await runQueuedSourceWithAgent({
+            repoRoot: input.repoRoot,
+            sourceId: candidate.sourceId,
+            agent,
+            now: input.now,
+            lock: input.lock,
+            command,
+          })
+        : skippedResult(
+            candidate.sourceId,
+            candidate.status,
+            candidate.status,
+            agent.name,
+            queueErrorToSafeError(candidate.error),
+          );
 
       addSourceResultToCounts(counts, result);
       if (watchResultIsSessionFailure(result)) {
@@ -729,7 +737,7 @@ function addSourceResultToCounts(
 }
 
 function watchResultIsSessionFailure(result: AutoIngestSourceResult): boolean {
-  return result.outcome === "blocked" || result.outcome === "deferred";
+  return result.outcome === "blocked" || result.outcome === "deferred" || result.outcome === "skipped";
 }
 
 function normalizeLimit(limit: number | undefined, fallback: number): number {

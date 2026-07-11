@@ -79,7 +79,7 @@ describe("optional init scaffold groups", () => {
     }
   });
 
-  it("creates only the thin Codex variant when requested", async () => {
+  it("creates only the Codex-specific supplement when requested", async () => {
     // Arrange
     const parent = await mkdtemp(resolve(tmpdir(), "llm-wiki-optional-codex-"));
     const targetDir = resolve(parent, "wiki");

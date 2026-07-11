@@ -173,14 +173,17 @@ describe("llm-wiki init command surface", () => {
       const codexConfig = parse(codexConfigSource) as {
         agent: { default: string };
         agents?: Record<string, unknown>;
+        pdf_ingestion?: Record<string, unknown>;
       };
       const claudeConfig = parse(await readFile(resolve(claudeTargetDir, ".llm-wiki/config.yml"), "utf8")) as {
         agent: { default: string };
         agents?: Record<string, unknown>;
+        pdf_ingestion?: Record<string, unknown>;
       };
       const genericConfig = parse(await readFile(resolve(genericTargetDir, ".llm-wiki/config.yml"), "utf8")) as {
         agent: { default: string };
         agents?: Record<string, unknown>;
+        pdf_ingestion?: Record<string, unknown>;
       };
 
       // Assert
@@ -217,12 +220,22 @@ describe("llm-wiki init command surface", () => {
             timeout_seconds: 900,
           },
         },
+        pdf_ingestion: {
+          codex_agent: "codex",
+          required_plugin: "pdf@openai-primary-runtime",
+          reasoning_effort: "high",
+          pdf_detail: "high",
+          timeout_seconds: 900,
+          require_artifact_before_ingest: true,
+        },
       });
       expect(codexConfigSource).not.toMatch(/api[_-]?key|secret|token|password|sk-/i);
       expect(claudeConfig).toMatchObject({ agent: { default: "claude" } });
       expect(claudeConfig.agents).toBeUndefined();
+      expect(claudeConfig.pdf_ingestion).toBeUndefined();
       expect(genericConfig).toMatchObject({ agent: { default: "generic" } });
       expect(genericConfig.agents).toBeUndefined();
+      expect(genericConfig.pdf_ingestion).toBeUndefined();
     } finally {
       await rm(parent, { force: true, recursive: true });
     }

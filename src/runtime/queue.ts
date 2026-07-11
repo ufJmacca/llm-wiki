@@ -4,6 +4,11 @@ import { basename, isAbsolute, relative, resolve } from "node:path";
 
 import { stringify } from "yaml";
 
+import {
+  normalizePdfExtractionState,
+  pdfExtractionStateEqual,
+  type PdfExtractionState,
+} from "../pdf/stateSchema.js";
 import { parseSourceId, parseQueueItem, scanMarkdownDocument, type ScannerIssue } from "../scanner/index.js";
 import { err, ok, type Result } from "../utils/result.js";
 import { appendRuntimeLogEntry, validateRuntimeLogAppendTarget } from "./log.js";
@@ -25,6 +30,7 @@ export type QueueCommandErrorCode =
   | "QUEUE_STATUS_INVALID"
   | "QUEUE_STATUS_TRANSITION_INVALID"
   | "QUEUE_WRITE_FAILED"
+  | "PDF_ARTIFACT_INCONSISTENT"
   | "SOURCE_ID_INVALID";
 
 export type QueueCommandError = {
@@ -106,6 +112,7 @@ export type QueueRecord = {
   original_path: string;
   updated_at?: string;
   auto_ingest?: AutoIngestMetadata;
+  pdf_extraction?: PdfExtractionState;
   queue_path: string;
   [key: string]: unknown;
 };
@@ -123,6 +130,7 @@ export type SourceCardFrontmatter = {
   visibility: QueueVisibility;
   updated_at?: string;
   auto_ingest?: AutoIngestMetadata;
+  pdf_extraction?: PdfExtractionState;
   [key: string]: unknown;
 };
 
@@ -525,6 +533,7 @@ function normalizeQueueRecord(
   const sourceKind = parseSourceKind(item.source_kind);
   const visibility = parseVisibility(item.visibility);
   const autoIngest = normalizeAutoIngestMetadata(item.auto_ingest);
+  const pdfExtraction = normalizeOptionalPdfExtractionState(item.pdf_extraction);
 
   if (status === null || kind === null || sourceKind === null || visibility === null) {
     return err({
@@ -541,6 +550,15 @@ function normalizeQueueRecord(
       message: `Queue item has invalid auto_ingest metadata in ${queuePath}.`,
       path: queuePath,
       hint: "Use auto_ingest.enabled, attempt_count, last_attempt_at, last_result, last_error_code, and last_error_message.",
+    });
+  }
+
+  if (!pdfExtraction.ok) {
+    return err({
+      code: "PDF_ARTIFACT_INCONSISTENT",
+      message: `Queue item has invalid pdf_extraction state in ${queuePath}: ${pdfExtraction.error}`,
+      path: queuePath,
+      hint: "Repair the canonical pdf_extraction state in both the queue item and source card.",
     });
   }
 
@@ -569,6 +587,7 @@ function normalizeQueueRecord(
     original_path: String(item.original_path),
     ...(typeof item.updated_at === "string" ? { updated_at: item.updated_at } : {}),
     ...(autoIngest.value === undefined ? {} : { auto_ingest: autoIngest.value }),
+    ...(pdfExtraction.value === undefined ? {} : { pdf_extraction: pdfExtraction.value }),
     queue_path: queuePath,
   });
 }
@@ -590,7 +609,7 @@ async function readConsistentQueueSource(
   const mismatch = findQueueSourceCardMismatch(record, sourceCard.value.frontmatter);
   if (mismatch !== null) {
     return err({
-      code: "QUEUE_SOURCE_CARD_MISMATCH",
+      code: mismatch === "pdf_extraction" ? "PDF_ARTIFACT_INCONSISTENT" : "QUEUE_SOURCE_CARD_MISMATCH",
       message: `Queue item and source card disagree for ${record.source_id}: ${mismatch}`,
       path: sourceCard.value.path,
       hint: "Repair either raw/queue JSON or the source card so source_id, title, source_kind, status, and visibility match.",
@@ -649,6 +668,7 @@ function normalizeSourceCardFrontmatter(
   const sourceKind = parseSourceKind(frontmatter.source_kind);
   const visibility = parseVisibility(frontmatter.visibility);
   const autoIngest = normalizeAutoIngestMetadata(frontmatter.auto_ingest);
+  const pdfExtraction = normalizeOptionalPdfExtractionState(frontmatter.pdf_extraction);
 
   if (
     frontmatter.type !== "raw_source" ||
@@ -678,6 +698,15 @@ function normalizeSourceCardFrontmatter(
     });
   }
 
+  if (!pdfExtraction.ok) {
+    return err({
+      code: "PDF_ARTIFACT_INCONSISTENT",
+      message: `Source card frontmatter has invalid pdf_extraction state in ${path}: ${pdfExtraction.error}`,
+      path,
+      hint: "Repair the canonical pdf_extraction state in both the source card and queue item.",
+    });
+  }
+
   return ok({
     ...frontmatter,
     type: "raw_source",
@@ -694,6 +723,7 @@ function normalizeSourceCardFrontmatter(
     visibility,
     ...(typeof frontmatter.updated_at === "string" ? { updated_at: frontmatter.updated_at } : {}),
     ...(autoIngest.value === undefined ? {} : { auto_ingest: autoIngest.value }),
+    ...(pdfExtraction.value === undefined ? {} : { pdf_extraction: pdfExtraction.value }),
   });
 }
 
@@ -713,6 +743,14 @@ function findQueueSourceCardMismatch(record: QueueRecord, frontmatter: SourceCar
 
   if (!autoIngestMetadataEqual(record.auto_ingest, frontmatter.auto_ingest)) {
     return "auto_ingest";
+  }
+
+  if (record.pdf_extraction === undefined || frontmatter.pdf_extraction === undefined) {
+    if (record.pdf_extraction !== frontmatter.pdf_extraction) {
+      return "pdf_extraction";
+    }
+  } else if (!pdfExtractionStateEqual(record.pdf_extraction, frontmatter.pdf_extraction)) {
+    return "pdf_extraction";
   }
 
   return null;
@@ -1058,6 +1096,17 @@ function normalizeAutoIngestMetadata(value: unknown): Result<AutoIngestMetadata 
     last_error_code: lastErrorCode,
     last_error_message: lastErrorMessage,
   });
+}
+
+function normalizeOptionalPdfExtractionState(
+  value: unknown,
+): Result<PdfExtractionState | undefined, string> {
+  if (value === undefined) {
+    return ok(undefined);
+  }
+
+  const normalized = normalizePdfExtractionState(value);
+  return normalized.ok ? normalized : err(normalized.error.message);
 }
 
 function autoIngestMetadataEqual(

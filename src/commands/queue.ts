@@ -10,6 +10,20 @@ import {
   type AutoIngestWatchSummary,
 } from "../autoIngest/index.js";
 import type { CliIo } from "../cli.js";
+import {
+  addPdfExtractionOptions,
+  hasPdfExtractionOptions,
+  pdfOverridesFromRawOptions,
+  PDF_QUEUE_HELP,
+  type RawPdfExtractionOptions,
+} from "../pdf/cli.js";
+import { readPdfIngestionConfig, resolvePdfExtractionSettings } from "../pdf/config.js";
+import {
+  formatHumanPdfSourceStatus,
+  readPdfRepositoryStatuses,
+  readPdfSourceStatus,
+  type PdfSourceStatus,
+} from "../pdf/status.js";
 import { addRuntimeOptions, runRuntimeCommand, type RawRuntimeCommandOptions } from "../runtime/command.js";
 import {
   buildRuntimeCommandFailureEnvelope,
@@ -31,7 +45,13 @@ type QueueIngestData = Omit<AutoIngestBatchResult, "agent"> & {
   agent: string | null;
 };
 
-type RawQueueCommandOptions = RawRuntimeCommandOptions & {
+type QueueListWithPdfStatus = Omit<QueueListResult, "items"> & {
+  items: Array<QueueListResult["items"][number] & { pdf_extraction?: PdfSourceStatus }>;
+};
+
+type QueueShowWithPdfStatus = QueueShowResult & { pdf_extraction?: PdfSourceStatus };
+
+type RawQueueCommandOptions = RawRuntimeCommandOptions & RawPdfExtractionOptions & {
   auto?: unknown;
   limit?: unknown;
   sourceId?: unknown;
@@ -46,7 +66,7 @@ type QueueCliCommandError = {
 };
 
 export function registerQueueCommand(program: Command, io: CliIo): void {
-  const queueCommand = addRuntimeOptions(
+  const queueCommand = addRuntimeOptions(addPdfExtractionOptions(
     program
       .command("queue")
       .description("List and manage raw source queue items")
@@ -56,8 +76,9 @@ export function registerQueueCommand(program: Command, io: CliIo): void {
       .option("--auto", "run queue ingest with the configured default local agent", false)
       .option("--limit <n>", "maximum number of queued sources to auto-ingest")
       .option("--source-id <source_id>", "specific source ID for queue ingest")
-      .option("--watch", "keep processing newly queued sources until interrupted", false),
-  );
+      .option("--watch", "keep processing newly queued sources until interrupted", false)
+      .addHelpText("after", PDF_QUEUE_HELP),
+  ));
 
   queueCommand.action(async (
     action: string | undefined,
@@ -82,9 +103,7 @@ export function registerQueueCommand(program: Command, io: CliIo): void {
             throwQueueCommandError(io, "queue", repo.rootDir, queue.error, runtimeOptions.json === true);
           }
 
-          return {
-            data: queue.value,
-          };
+          return { data: await queueListWithPdfStatus(repo.rootDir, queue.value) };
         },
         formatHuman: (envelope) => formatHumanQueueList(envelope.data),
       });
@@ -106,8 +125,12 @@ export function registerQueueCommand(program: Command, io: CliIo): void {
             throwQueueCommandError(io, "queue show", repo.rootDir, queueItem.error, runtimeOptions.json === true);
           }
 
+          const pdfStatus = await readPdfSourceStatus(repo.rootDir, sourceId);
           return {
-            data: queueItem.value,
+            data: {
+              ...queueItem.value,
+              ...(pdfStatus === null ? {} : { pdf_extraction: pdfStatus }),
+            },
           };
         },
         formatHuman: (envelope) => formatHumanQueueShow(envelope.data),
@@ -176,12 +199,16 @@ export function registerQueueCommand(program: Command, io: CliIo): void {
         rawOptions: runtimeOptions,
         io,
         run: async ({ repo }) => {
+          await validateQueuePdfOptions(repo.rootDir, runtimeOptions);
+          const pdfOverrides = pdfOverridesFromRawOptions(runtimeOptions);
           const data = target === undefined
-            ? await runQueueIngestBatch(repo.rootDir, limit)
+            ? await runQueueIngestBatch(repo.rootDir, limit, runtimeOptions)
             : batchDataFromSourceResult(await runAutoIngestSource({
                 repoRoot: repo.rootDir,
                 sourceId: target,
                 command: `llm-wiki queue ingest --auto --source-id ${target}`,
+                pdfOverrides,
+                allowNonPdfPdfOptions: true,
               }));
 
           if (queueIngestIsIncomplete(data)) {
@@ -254,7 +281,7 @@ function rejectQueueIngestOptionsOutsideIngest(
 
 function firstQueueIngestOnlyOption(
   rawOptions: RawQueueCommandOptions,
-): "--auto" | "--limit" | "--source-id" | "--watch" | undefined {
+): "--auto" | "--limit" | "--source-id" | "--watch" | "--pdf-model" | "--pdf-reasoning-effort" | "--pdf-detail" | "--force" | undefined {
   if (rawOptions.auto === true) {
     return "--auto";
   }
@@ -269,6 +296,22 @@ function firstQueueIngestOnlyOption(
 
   if (rawOptions.watch === true) {
     return "--watch";
+  }
+
+  if (rawOptions.pdfModel !== undefined) {
+    return "--pdf-model";
+  }
+
+  if (rawOptions.pdfReasoningEffort !== undefined) {
+    return "--pdf-reasoning-effort";
+  }
+
+  if (rawOptions.pdfDetail !== undefined) {
+    return "--pdf-detail";
+  }
+
+  if (rawOptions.force === true) {
+    return "--force";
   }
 
   return undefined;
@@ -286,11 +329,16 @@ function queueCommandName(action: string | undefined): "queue" | "queue show" | 
   return "queue";
 }
 
-async function runQueueIngestBatch(repoRoot: string, limit: number | undefined): Promise<QueueIngestData> {
+async function runQueueIngestBatch(
+  repoRoot: string,
+  limit: number | undefined,
+  options: RawQueueCommandOptions,
+): Promise<QueueIngestData> {
   const result = await runAutoIngestBatch({
     repoRoot,
     ...(limit === undefined ? {} : { limit }),
     command: limit === undefined ? "llm-wiki queue ingest --auto" : `llm-wiki queue ingest --auto --limit ${limit}`,
+    pdfOverrides: pdfOverridesFromRawOptions(options),
   });
 
   return result;
@@ -454,6 +502,25 @@ async function runQueueIngestWatchCommand(rawOptions: RawQueueCommandOptions, io
   }
 
   const repoRoot = resolvedRepo.value.rootDir;
+  try {
+    await validateQueuePdfOptions(repoRoot, rawOptions);
+  } catch (error) {
+    const commandError = error instanceof RuntimeCommandError
+      ? error
+      : new RuntimeCommandError({
+          code: "PDF_CONFIG_INVALID",
+          message: error instanceof Error ? error.message : String(error),
+          path: "pdf_ingestion",
+          hint: "Fix PDF extraction settings before starting queue watch.",
+        });
+    const envelope = buildRuntimeCommandFailureEnvelope("queue ingest", commandError, repoRoot);
+    if (json) {
+      io.stdout(JSON.stringify({ event: "summary", ...envelope, summary: preflightFailureWatchSummary() }));
+    } else {
+      io.stderr(`Error: ${envelope.error.message}\nHint: ${envelope.error.hint}`);
+    }
+    throw new CommanderError(1, "llm-wiki.queue ingest", envelope.error.message);
+  }
   const controller = new AbortController();
   const signalHandlers = installQueueIngestWatchSignalHandlers(controller);
 
@@ -464,6 +531,7 @@ async function runQueueIngestWatchCommand(rawOptions: RawQueueCommandOptions, io
         repoRoot,
         signal: controller.signal,
         command: "llm-wiki queue ingest --auto --watch",
+        pdfOverrides: pdfOverridesFromRawOptions(rawOptions),
         onEvent: async (event) => {
           writeQueueIngestWatchEvent(io, repoRoot, event, { json, quiet });
         },
@@ -494,6 +562,22 @@ async function runQueueIngestWatchCommand(rawOptions: RawQueueCommandOptions, io
     }
   } finally {
     signalHandlers.dispose();
+  }
+}
+
+async function validateQueuePdfOptions(repoRoot: string, options: RawQueueCommandOptions): Promise<void> {
+  if (!hasPdfExtractionOptions(options)) {
+    return;
+  }
+
+  const config = await readPdfIngestionConfig(repoRoot);
+  if (!config.ok) {
+    throw new RuntimeCommandError(config.error);
+  }
+
+  const settings = resolvePdfExtractionSettings(config.value, pdfOverridesFromRawOptions(options));
+  if (!settings.ok) {
+    throw new RuntimeCommandError(settings.error);
   }
 }
 
@@ -582,7 +666,7 @@ function queueIngestIssues(data: QueueIngestData): RuntimeIssue[] {
     });
 }
 
-function formatHumanQueueList(data: QueueListResult): string {
+function formatHumanQueueList(data: QueueListWithPdfStatus): string {
   if (data.items.length === 0) {
     return "Queue items: 0";
   }
@@ -597,29 +681,50 @@ function formatHumanQueueList(data: QueueListResult): string {
       "",
       `${item.source_id} | ${item.title}`,
       `Kind: ${item.source_kind}`,
-      `Status: ${item.status}`,
+      `Queue status: ${item.status}`,
       `Visibility: ${item.visibility}`,
       `Updated: ${item.updated_at}`,
       `Source card: ${item.source_card_path}`,
       `Queue: ${item.queue_path}`,
       `Original: ${item.original_path}`,
     );
+    const pdf = item.pdf_extraction;
+    if (pdf !== undefined) lines.push(...formatHumanPdfSourceStatus(pdf));
   }
 
   return lines.join("\n");
 }
 
-function formatHumanQueueShow(data: QueueShowResult): string {
-  return [
+function formatHumanQueueShow(data: QueueShowWithPdfStatus): string {
+  const lines = [
     `Source ID: ${data.queue_record.source_id}`,
     `Title: ${data.queue_record.title}`,
     `Kind: ${data.queue_record.source_kind}`,
-    `Status: ${data.queue_record.status}`,
+    `Queue status: ${data.queue_record.status}`,
     `Visibility: ${data.queue_record.visibility}`,
     `Queue: ${data.queue_record.queue_path}`,
     `Source card: ${data.source_card.path}`,
     `Original: ${data.queue_record.original_path}`,
-  ].join("\n");
+  ];
+  if (data.pdf_extraction !== undefined) lines.push(...formatHumanPdfSourceStatus(data.pdf_extraction));
+  return lines.join("\n");
+}
+
+async function queueListWithPdfStatus(
+  repoRoot: string,
+  data: QueueListResult,
+): Promise<QueueListWithPdfStatus> {
+  const statuses = await readPdfRepositoryStatuses(repoRoot);
+  return {
+    ...data,
+    items: data.items.map((item) => {
+      const pdfStatus = statuses.get(item.source_id);
+      return {
+        ...item,
+        ...(pdfStatus === undefined ? {} : { pdf_extraction: pdfStatus }),
+      };
+    }),
+  };
 }
 
 function formatHumanQueueSetStatus(data: QueueSetStatusResult): string {

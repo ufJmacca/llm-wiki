@@ -17,6 +17,13 @@ export type IngestLockMetadata = {
   label: string;
 };
 
+declare const ingestLockLeaseBrand: unique symbol;
+
+export type IngestLockLease = {
+  readonly repoRoot: string;
+  readonly [ingestLockLeaseBrand]: true;
+};
+
 export const INGEST_LOCK_RELATIVE_PATH = ".llm-wiki/cache/locks/ingest.lock" as const;
 
 const DEFAULT_TIMEOUT_MS = 250;
@@ -26,18 +33,33 @@ const LOCK_METADATA_RELATIVE_PATH = `${INGEST_LOCK_RELATIVE_PATH}/metadata.json`
 const LOCK_RECLAIM_RELATIVE_PATH = `${INGEST_LOCK_RELATIVE_PATH}/reclaiming`;
 const LOCK_RECLAIM_MARKER_STALE_MS = 1_000;
 const LOCK_UNOWNED_STALE_MS = 1_000;
+const activeLeases = new WeakSet<object>();
 
 export async function withIngestLock<T>(
   repoRoot: string,
   options: IngestLockOptions,
-  fn: () => Promise<T>,
+  fn: (lease: IngestLockLease) => Promise<T>,
 ): Promise<T> {
   await acquireIngestLock(repoRoot, options);
+  const lease = { repoRoot: resolve(repoRoot) } as IngestLockLease;
+  activeLeases.add(lease);
 
   try {
-    return await fn();
+    return await fn(lease);
   } finally {
+    activeLeases.delete(lease);
     await removeIngestLock(repoRoot);
+  }
+}
+
+export function assertIngestLockLease(lease: IngestLockLease, repoRoot: string): void {
+  if (!activeLeases.has(lease) || lease.repoRoot !== resolve(repoRoot)) {
+    throw new RuntimeCommandError({
+      code: "INGEST_LOCK_OWNERSHIP_INVALID",
+      message: "The caller does not own the active repository ingest lock.",
+      path: INGEST_LOCK_RELATIVE_PATH,
+      hint: "Acquire the repository ingest lock and pass its active lease to the locked operation.",
+    });
   }
 }
 

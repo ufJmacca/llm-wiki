@@ -190,6 +190,72 @@ describe("llm-wiki CLI baseline", () => {
     expect(help).toContain("HTTP provider");
     expect(help).not.toContain("--provider codex");
     expect(help).toContain("--validate");
+    expect(help).toContain("--pdf-model <model>");
+    expect(help).toContain("--pdf-reasoning-effort <effort>");
+    expect(help).toContain("--pdf-detail <detail>");
+    expect(help).toContain("--force");
+    expect(help).toContain("PDF controls apply only when automated ingest uses the configured Codex PDF agent");
+    expect(help).toContain("Manual, validation, provider, and other-agent modes require a pre-existing validated PDF artifact");
+    expect(help).toContain("llm-wiki ingest <source_id> --auto --pdf-detail high");
+  });
+
+  it("registers the extract pdf command family and shared runtime controls", async () => {
+    const root = { stdout: [] as string[], stderr: [] as string[] };
+    const rootExitCode = await runCli(["extract", "--help"], {
+      stdout: (message) => root.stdout.push(message),
+      stderr: (message) => root.stderr.push(message),
+    });
+    const pdf = { stdout: [] as string[], stderr: [] as string[] };
+    const pdfExitCode = await runCli(["extract", "pdf", "--help"], {
+      stdout: (message) => pdf.stdout.push(message),
+      stderr: (message) => pdf.stderr.push(message),
+    });
+
+    expect(rootExitCode).toBe(0);
+    expect(pdfExitCode).toBe(0);
+    expect(root.stderr).toEqual([]);
+    expect(pdf.stderr).toEqual([]);
+    expect(root.stdout.join("\n")).toContain("pdf");
+    expect(pdf.stdout.join("\n")).toContain("<source_id>");
+    expect(pdf.stdout.join("\n")).toContain("--pdf-model <model>");
+    expect(pdf.stdout.join("\n")).toContain("--pdf-reasoning-effort <effort>");
+    expect(pdf.stdout.join("\n")).toContain("--pdf-detail <detail>");
+    expect(pdf.stdout.join("\n")).toContain("--force");
+    expect(pdf.stdout.join("\n")).toContain("--repo <path>");
+    expect(pdf.stdout.join("\n")).toContain("--json");
+    expect(pdf.stdout.join("\n")).toContain("--quiet");
+    expect(pdf.stdout.join("\n")).toContain("pdf@openai-primary-runtime");
+    expect(pdf.stdout.join("\n")).toContain("user-managed");
+    expect(pdf.stdout.join("\n")).toContain("llm-wiki status");
+    expect(pdf.stdout.join("\n")).toContain("llm-wiki extract pdf <source_id> --force");
+    expect(pdf.stdout.join("\n")).toContain("queue set-status <source_id> queued");
+
+    const queue = { stdout: [] as string[], stderr: [] as string[] };
+    const queueExitCode = await runCli(["queue", "--help"], {
+      stdout: (message) => queue.stdout.push(message),
+      stderr: (message) => queue.stderr.push(message),
+    });
+    expect(queueExitCode).toBe(0);
+    expect(queue.stderr).toEqual([]);
+    expect(queue.stdout.join("\n")).toContain("--pdf-model <model>");
+    expect(queue.stdout.join("\n")).toContain("--pdf-reasoning-effort <effort>");
+    expect(queue.stdout.join("\n")).toContain("--pdf-detail <detail>");
+    expect(queue.stdout.join("\n")).toContain("--force");
+    expect(queue.stdout.join("\n")).toContain("llm-wiki queue ingest --auto --source-id <source_id> --pdf-detail high");
+    expect(queue.stdout.join("\n")).toContain("llm-wiki queue ingest --auto --limit 5 --pdf-detail high");
+    expect(queue.stdout.join("\n")).toContain("llm-wiki queue ingest --auto --watch --pdf-detail high");
+    expect(queue.stdout.join("\n")).toContain("--force creates one new run for each attempted PDF");
+
+    const status = { stdout: [] as string[], stderr: [] as string[] };
+    const statusExitCode = await runCli(["status", "--help"], {
+      stdout: (message) => status.stdout.push(message),
+      stderr: (message) => status.stderr.push(message),
+    });
+    expect(statusExitCode).toBe(0);
+    expect(status.stderr).toEqual([]);
+    expect(status.stdout.join("\n")).toContain("PDF readiness");
+    expect(status.stdout.join("\n")).toContain("Queue status");
+    expect(status.stdout.join("\n")).toContain("PDF extraction status");
   });
 
   it("describes query manual, local agent, auto, validation, and HTTP provider modes in help", async () => {

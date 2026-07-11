@@ -88,6 +88,55 @@ describe("README local agent documentation", () => {
   });
 });
 
+describe("README standalone Codex PDF ingestion documentation", () => {
+  it("documents the experiment boundary, user-managed readiness, commands, recovery, and privacy", async () => {
+    const requiredDocumentation = [
+      "## Standalone Codex PDF ingestion experiment",
+      "This bounded PDF path is implemented directly through Codex and does not invoke `ainative`",
+      "`pdf@openai-primary-runtime`",
+      "codex plugin list --json",
+      "Codex installation, authentication, plugin installation, and plugin enablement are user-managed",
+      "There is no parser fallback",
+      "llm-wiki extract pdf <source_id>",
+      "llm-wiki extract pdf <source_id> --pdf-model <model> --pdf-reasoning-effort <effort> --pdf-detail high --force",
+      "llm-wiki ingest <source_id> --auto --pdf-detail high",
+      "llm-wiki queue ingest --auto --watch --pdf-detail high",
+      "command-line override, repository `pdf_ingestion` value, then documented default or inheritance",
+      "Omitting `--pdf-model` inherits the active Codex model and omits `--model`",
+      "A matching validated run is reused",
+      "Changed identity settings or `--force` create a new immutable run",
+      "Queue status and PDF extraction status are separate state machines",
+      "Manual, validation, provider, and other-agent modes require an existing validated PDF artifact",
+      "llm-wiki queue set-status <source_id> queued",
+      "raw/inputs/<yyyy>/<mm>/<source_id>/extracted/pdf/<extraction_id>/document.md",
+      "Original PDFs, `document.md`, `metadata.json`, queue state, and private review data are rejected from public output",
+      "A newly captured PDF reports `pdf_extraction.status: pending`",
+      "upload-triggered auto-ingest reports whether extraction was reused, extracted, or failed",
+      "`src/ingest/artifact.ts` is the agent-neutral artifact boundary",
+      "`prepareAutomatedIngestArtifact`",
+      "`ensurePreparedIngestArtifactUnderLock`",
+      "A future `ainative` workflow must call that boundary rather than duplicate Codex-specific extraction logic",
+    ];
+
+    const readme = await readReadme();
+
+    for (const expectedText of requiredDocumentation) {
+      expect(readme).toContain(expectedText);
+    }
+    for (const field of [
+      "codex_agent",
+      "required_plugin",
+      "model",
+      "reasoning_effort",
+      "pdf_detail",
+      "timeout_seconds",
+      "require_artifact_before_ingest",
+    ]) {
+      expect(readme).toContain(field);
+    }
+  });
+});
+
 describe("README GitHub Pages deploy documentation", () => {
   it("documents publisher-only committed Pages deployment instead of CI-side site generation", async () => {
     // Arrange

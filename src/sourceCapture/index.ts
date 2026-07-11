@@ -5,6 +5,14 @@ import { basename, dirname, extname, isAbsolute, relative, resolve } from "node:
 
 import { stringify } from "yaml";
 
+import {
+  createPendingPdfExtractionState,
+  isPdfOriginalPath,
+  isPdfSignature,
+  normalizePdfExtractionState,
+  pdfExtractionStateEqual,
+  type PdfExtractionState,
+} from "../pdf/stateSchema.js";
 import { appendRuntimeLogEntry, validateRuntimeLogAppendTarget } from "../runtime/log.js";
 import { scanMarkdownDocument } from "../scanner/index.js";
 import {
@@ -42,6 +50,7 @@ export type CapturedSource = {
   original_path: string;
   source_card_path: string;
   queue_path: string;
+  pdf_extraction?: PdfExtractionState;
 };
 
 export type SourceCaptureSuccess = {
@@ -180,6 +189,7 @@ type QueueJson = {
   visibility: "private";
   path: string;
   original_path: string;
+  pdf_extraction?: PdfExtractionState;
 };
 
 type SourceCardDuplicateMetadata = {
@@ -195,6 +205,7 @@ type SourceCardDuplicateMetadata = {
   content_hash: string;
   status: QueueStatus;
   visibility: "private";
+  pdf_extraction?: PdfExtractionState;
 };
 
 export async function captureFileSource(
@@ -378,6 +389,9 @@ async function captureSource(input: CaptureInput): Promise<Result<SourceCaptureS
     original_path: originalPath,
     source_card_path: sourceCardPath,
     queue_path: queuePath,
+    ...(isPdfOriginalPath(originalPath) && isPdfSignature(input.content)
+      ? { pdf_extraction: createPendingPdfExtractionState(contentHash, capturedAt) }
+      : {}),
   };
   const queueJson = toQueueJson(source);
   const createdPaths = [originalPath, sourceCardPath, queuePath];
@@ -682,6 +696,7 @@ async function validateQueueDuplicate(
     original_path: toRepositoryPath(repoRoot, originalPath),
     source_card_path: sourceCardRelativePath,
     queue_path: `raw/queue/${queueFile}`,
+    ...(queueItem.pdf_extraction === undefined ? {} : { pdf_extraction: queueItem.pdf_extraction }),
   };
 }
 
@@ -715,6 +730,7 @@ function queueDuplicateMatchesSourceCard(queueItem: QueueJson, sourceCard: Sourc
     queueItem.captured_at === sourceCard.captured_at &&
     queueItem.status === sourceCard.status &&
     queueItem.visibility === sourceCard.visibility
+    && optionalPdfStateEqual(queueItem.pdf_extraction, sourceCard.pdf_extraction)
   );
 }
 
@@ -816,6 +832,7 @@ async function findDuplicateSourceCard(
       original_path: originalPath,
       source_card_path: sourceCardRelativePath,
       queue_path: `raw/queue/${sourceCard.source_id}.json`,
+      ...(sourceCard.pdf_extraction === undefined ? {} : { pdf_extraction: sourceCard.pdf_extraction }),
     });
   }
 
@@ -1020,7 +1037,8 @@ function isValidDuplicateQueueItem(value: unknown, contentHash: string): value i
     isQueueStatus(value.status) &&
     value.visibility === "private" &&
     isNonEmptyString(value.path) &&
-    isNonEmptyString(value.original_path)
+    isNonEmptyString(value.original_path) &&
+    isOptionalPdfExtractionState(value.pdf_extraction)
   );
 }
 
@@ -1063,7 +1081,8 @@ function isValidDuplicateSourceCard(
     isOptionalString(value.uploaded_via) &&
     isNonEmptyString(value.captured_at) &&
     isQueueStatus(value.status) &&
-    value.visibility === "private"
+    value.visibility === "private" &&
+    isOptionalPdfExtractionState(value.pdf_extraction)
   );
 }
 
@@ -1077,6 +1096,21 @@ function isNonEmptyString(value: unknown): value is string {
 
 function isOptionalString(value: unknown): value is string | undefined {
   return value === undefined || typeof value === "string";
+}
+
+function isOptionalPdfExtractionState(value: unknown): value is PdfExtractionState | undefined {
+  return value === undefined || normalizePdfExtractionState(value).ok;
+}
+
+function optionalPdfStateEqual(
+  left: PdfExtractionState | undefined,
+  right: PdfExtractionState | undefined,
+): boolean {
+  if (left === undefined || right === undefined) {
+    return left === right;
+  }
+
+  return pdfExtractionStateEqual(left, right);
 }
 
 function comparableOptionalString(value: string | undefined): string {
@@ -1143,6 +1177,9 @@ function toQueueJson(source: CapturedSource): QueueJson {
   if (source.uploaded_via !== undefined) {
     queueJson.uploaded_via = source.uploaded_via;
   }
+  if (source.pdf_extraction !== undefined) {
+    queueJson.pdf_extraction = source.pdf_extraction;
+  }
 
   return queueJson;
 }
@@ -1167,6 +1204,7 @@ function formatSourceCard(source: CapturedSource): string {
     ingested_at: null,
     supersedes: null,
     superseded_by: null,
+    ...(source.pdf_extraction === undefined ? {} : { pdf_extraction: source.pdf_extraction }),
   }).trimEnd();
 
   return `---\n${frontmatter}\n---\n\n# ${formatMarkdownHeadingText(source.title)}\n\nOriginal file: ${formatOriginalFileLink(source.original_path)}\n\n## Capture notes\n\n## Human notes\n\n## Ingest status\n\n- Status: ${source.queue_status}\n- Curated summary:\n`;

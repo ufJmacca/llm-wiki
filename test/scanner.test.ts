@@ -250,6 +250,12 @@ describe("static output leak scanner", () => {
       }
       expect(scan.findings).toEqual([
         expect.objectContaining({
+          code: "STATIC_PDF_ORIGINAL_LEAK",
+          path: rawInputPath,
+          line: 1,
+          message: expect.stringContaining("original PDF"),
+        }),
+        expect.objectContaining({
           code: "STATIC_RAW_INPUTS_LEAK",
           path: rawInputPath,
           line: 1,

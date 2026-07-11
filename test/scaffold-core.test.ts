@@ -223,10 +223,12 @@ describe("core wiki scaffold templates", () => {
     const codexConfig = parse(codexConfigSource ?? "") as {
       agent: { default: string };
       agents?: Record<string, unknown>;
+      pdf_ingestion?: Record<string, unknown>;
     };
     const genericConfig = parse(genericEntries.get(".llm-wiki/config.yml") ?? "") as {
       agent: { default: string };
       agents?: Record<string, unknown>;
+      pdf_ingestion?: Record<string, unknown>;
     };
 
     // Assert
@@ -244,9 +246,58 @@ describe("core wiki scaffold templates", () => {
           timeout_seconds: 900,
         },
       },
+      pdf_ingestion: {
+        codex_agent: "codex",
+        required_plugin: "pdf@openai-primary-runtime",
+        reasoning_effort: "high",
+        pdf_detail: "high",
+        timeout_seconds: 900,
+        require_artifact_before_ingest: true,
+      },
     });
     expect(genericConfig).toMatchObject({ agent: { default: "generic" } });
     expect(genericConfig.agents).toBeUndefined();
+    expect(genericConfig.pdf_ingestion).toBeUndefined();
+  });
+
+  it("scaffolds PDF artifact, retry, privacy, and experiment guidance without changing config ownership", () => {
+    const entries = new Map(
+      planWikiScaffold({ ...defaultOptions, agent: "codex" }).map((entry) => [entry.path, entry.content]),
+    );
+    const genericReadme = planWikiScaffold({ ...defaultOptions, agent: "generic" })
+      .find((entry) => entry.path === "README.md")?.content ?? "";
+    const claudeReadme = planWikiScaffold({ ...defaultOptions, agent: "claude" })
+      .find((entry) => entry.path === "README.md")?.content ?? "";
+    const agents = entries.get("AGENTS.md") ?? "";
+    const codex = entries.get("CODEX.md") ?? "";
+    const readme = entries.get("README.md") ?? "";
+    const rawReadme = entries.get("raw/README.md") ?? "";
+
+    expect(agents).toContain("Queue status and PDF extraction status are separate state machines.");
+    expect(agents).toContain("Do not curate a PDF until a validated canonical `document.md` artifact is selected.");
+    expect(agents).toContain("Run `llm-wiki extract pdf <source_id>` when the artifact is missing, stale, or inconsistent.");
+    expect(agents).toContain("PDF originals, extraction runs, metadata, queue state, and review data stay private.");
+    expect(codex).toContain("The standalone PDF experiment requires `pdf@openai-primary-runtime`.");
+    expect(codex).toContain("Codex installation, authentication, and plugin enablement are user-managed.");
+    expect(codex).toContain("Never write PDF extraction metadata or any path other than the permitted `document.md` proposal.");
+    expect(codex).toContain("This is a standalone Codex experiment with no parser fallback.");
+    expect(codex).toContain("A future `ainative` workflow must call the shared artifact boundary instead of duplicating extraction logic.");
+    expect(readme).toContain("llm-wiki extract pdf <source_id>");
+    expect(readme).toContain("llm-wiki status");
+    expect(readme).toContain("CLI overrides take precedence over `pdf_ingestion`, then defaults or inheritance.");
+    expect(readme).toContain("Omitting the model inherits Codex's active model and can make later automatic reuse unavailable.");
+    expect(readme).toContain("Matching runs are reused; changed settings or `--force` create a new immutable run.");
+    expect(readme).toContain("llm-wiki queue ingest --auto --watch --pdf-detail high");
+    expect(readme).toContain("Queue status and PDF extraction status are separate.");
+    expect(readme).toContain("Manual and provider ingest cannot bypass the PDF artifact requirement.");
+    expect(readme).toContain("Original PDFs and `extracted/pdf/**` remain private and are rejected from public builds.");
+    expect(rawReadme).toContain("extracted/pdf/<extraction_id>/document.md");
+    expect(rawReadme).toContain("`metadata.json` is CLI-owned provenance");
+    expect(rawReadme).toContain("Extraction artifacts must not be selected by public profiles.");
+    expect(rawReadme).not.toContain("Derived files such as extracted text may be added next to the original.");
+    expect(agents).not.toContain("Codex");
+    expect(genericReadme).not.toContain("## Codex PDF ingestion");
+    expect(claudeReadme).not.toContain("## Codex PDF ingestion");
   });
 
   it("generates stable parseable index and log control-plane pages", () => {

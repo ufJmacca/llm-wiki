@@ -10,6 +10,7 @@ import {
   deployProfileCustomDomainError,
 } from "../deploy/profileValidation.js";
 import { computeContentHash } from "../scanner/index.js";
+import { readPdfRepositoryStatuses, type PdfSourceStatus } from "../pdf/status.js";
 import { scanWikiRepository, type RepoMarkdownFile, type RepoScan } from "../scanner/repo.js";
 import { createLinkResolutionIndex, lintWiki, resolveLinks, type LintResult } from "../lint/index.js";
 import {
@@ -160,6 +161,10 @@ const QUARTZ_REVIEW_PANEL_COMPONENT_PATH = "quartz/components/LlmWikiReviewPanel
 const QUARTZ_SOURCE_BADGE_COMPONENT_PATH = "quartz/components/LlmWikiSourceBadge.tsx";
 const QUARTZ_UPLOAD_FORM_COMPONENT_PATH = "quartz/components/LlmWikiUploadForm.tsx";
 const QUARTZ_VISIBILITY_WARNING_COMPONENT_PATH = "quartz/components/LlmWikiVisibilityWarning.tsx";
+// Exact generated Phase 3 templates form a narrow one-version migration allowlist; customized files never match.
+const PRE_PDF_STATUS_QUEUE_DASHBOARD_HASH = "sha256:090f6b95fb0508bda43bf3c86afbe6911a6ea891aa3a12e9fafa245a31effced";
+const PRE_PDF_STATUS_SOURCE_BADGE_HASH = "sha256:b8a38c9fddd4a59eeb31d27d7270bb499a39e6323fcb0e797cdf459737eb09ef";
+const PRE_PDF_STATUS_UPLOAD_FORM_HASH = "sha256:f9b34e1fd7f2cb011fff20c8dc4fb232d913f0b63220b9c33f52a19c8755d5a7";
 const QUARTZ_PARENT_GITIGNORE_PATH = "quartz/.gitignore";
 const QUARTZ_PARENT_CONTENT_IGNORE_RULE = "content/";
 const QUARTZ_RUNTIME_IGNORE_RULE = "quartz/quartz/";
@@ -329,6 +334,7 @@ export async function syncQuartzContent(
     await removeQuartzManifests(repoRoot);
   }
   await ensureQuartzContentRoot(repoRoot);
+  const pdfStatuses = publicLike ? undefined : await readPdfRepositoryStatuses(repoRoot);
   const localRootMaterializedPages = publicLike
     ? []
     : localRootMaterializedPageDefinitions(selection.markdown, selection.excludedRawOriginals);
@@ -336,6 +342,7 @@ export async function syncQuartzContent(
     ? []
     : localExplorerPageDefinitions(profile, scan, selection.markdown, {
         includeUploadPage: options.uploadDaemonActive === true,
+        pdfStatuses,
       });
   const buildHomepagePages = publicLike
     ? quartzBuildHomepageDefinitions(selection.markdown, selection.excludedRawOriginals)
@@ -353,7 +360,7 @@ export async function syncQuartzContent(
 
   const previousContentPaths = preserveContentRoot ? await readQuartzManifestContentPaths(repoRoot, profileName) : [];
   const manifestFiles = [
-    ...await materializeMarkdown(repoRoot, selection.markdown, selection.excludedRawOriginals),
+    ...await materializeMarkdown(repoRoot, selection.markdown, selection.excludedRawOriginals, pdfStatuses),
     ...await writeMaterializedPages(repoRoot, localRootMaterializedPages),
   ].sort(compareQuartzManifestFiles);
   const generatedFiles = await writeGeneratedPages(repoRoot, generatedPages);
@@ -766,12 +773,13 @@ async function materializeMarkdown(
   repoRoot: string,
   files: readonly RepoMarkdownFile[],
   excludedRawOriginals: readonly string[],
+  pdfStatuses?: ReadonlyMap<string, PdfSourceStatus>,
 ): Promise<QuartzManifestFile[]> {
   const manifestFiles: QuartzManifestFile[] = [];
   const excludedRawOriginalSet = new Set(excludedRawOriginals);
   for (const file of files) {
     const contentPath = `quartz/content/${file.path}`;
-    const content = quartzMaterializedMarkdownContent(file, excludedRawOriginalSet);
+    const content = quartzMaterializedMarkdownContent(file, excludedRawOriginalSet, pdfStatuses);
     const writeResult = await writeTextFileInsideRoot(repoRoot, contentPath, content);
     if (!writeResult.ok) {
       throw new QuartzOperationError({
@@ -832,19 +840,29 @@ function compareQuartzManifestFiles(left: QuartzManifestFile, right: QuartzManif
   return left.content_path.localeCompare(right.content_path) || left.source_path.localeCompare(right.source_path);
 }
 
-function quartzMaterializedMarkdownContent(file: RepoMarkdownFile, excludedRawOriginals: ReadonlySet<string>): string {
-  if (!isRawSourceCard(file) || excludedRawOriginals.size === 0) {
-    return file.content;
+function quartzMaterializedMarkdownContent(
+  file: RepoMarkdownFile,
+  excludedRawOriginals: ReadonlySet<string>,
+  pdfStatuses?: ReadonlyMap<string, PdfSourceStatus>,
+): string {
+  let content = file.content;
+  if (isRawSourceCard(file) && excludedRawOriginals.size > 0) {
+    content = content.replace(/!?\[\[((?:[^\]\n]|\](?!\]))+)\]\]/gu, (raw, body: string) => {
+      const target = wikilinkTarget(body);
+      if (!excludedRawOriginals.has(target)) {
+        return raw;
+      }
+
+      return `\`${target}\` (excluded from Explorer sync)`;
+    });
   }
 
-  return file.content.replace(/!?\[\[((?:[^\]\n]|\](?!\]))+)\]\]/gu, (raw, body: string) => {
-    const target = wikilinkTarget(body);
-    if (!excludedRawOriginals.has(target)) {
-      return raw;
-    }
-
-    return `\`${target}\` (excluded from Explorer sync)`;
-  });
+  const sourceId = stringFrontmatterValue(file, "source_id");
+  const pdfStatus = sourceId === null ? undefined : pdfStatuses?.get(sourceId);
+  if (!isRawSourceCard(file) || pdfStatus === undefined) return content;
+  const match = /^---\r?\n[\s\S]*?\r?\n---([\s\S]*)$/u.exec(content);
+  if (match === null || file.scan.frontmatter === undefined) return content;
+  return `---\n${stringify({ ...file.scan.frontmatter, pdf_extraction_status: pdfStatus }).trimEnd()}\n---${match[1] ?? ""}`;
 }
 
 function isRawSourceCard(file: RepoMarkdownFile): boolean {
@@ -892,12 +910,16 @@ function localExplorerPageDefinitions(
   profile: WikiProfile,
   scan: RepoScan,
   files: readonly RepoMarkdownFile[],
-  options: { includeUploadPage?: boolean } = {},
+  options: {
+    includeUploadPage?: boolean;
+    pdfStatuses?: ReadonlyMap<string, PdfSourceStatus>;
+  } = {},
 ): StaticReviewPage[] {
   const reviewScan = filterReviewScanForProfile(scan, profile);
   const reviewData = buildReviewDataModel(scan, {
     profile,
     materializedMarkdownPaths: new Set(files.map((file) => file.path)),
+    pdfStatuses: options.pdfStatuses,
   });
   const includeUploadPage = options.includeUploadPage === true;
   const fallbackHomepage = localGeneratedHomepageDefinition(files, { includeUploadPage });
@@ -2286,7 +2308,8 @@ async function componentSupportsDefaultLayoutImport(
 function isMigratableQueueDashboardComponent(content: string): boolean {
   return (
     isMigratableGeneratedComponent(content, "LlmWikiQueueDashboard", "llm-wiki-queue-dashboard") ||
-    content === queueDashboardComponentContentBeforeFrontmatter()
+    content === queueDashboardComponentContentBeforeFrontmatter() ||
+    computeContentHash(content) === PRE_PDF_STATUS_QUEUE_DASHBOARD_HASH
   );
 }
 
@@ -2301,12 +2324,16 @@ function isMigratableReviewPanelComponent(content: string): boolean {
 function isMigratableSourceBadgeComponent(content: string): boolean {
   return (
     isMigratableGeneratedComponent(content, "LlmWikiSourceBadge", "llm-wiki-source-badge") ||
-    content === sourceBadgeComponentContentBeforeRowBadges()
+    content === sourceBadgeComponentContentBeforeRowBadges() ||
+    computeContentHash(content) === PRE_PDF_STATUS_SOURCE_BADGE_HASH
   );
 }
 
 function isMigratableUploadFormComponent(content: string): boolean {
-  return isMigratableGeneratedComponent(content, "LlmWikiUploadForm", "llm-wiki-upload-form");
+  return (
+    isMigratableGeneratedComponent(content, "LlmWikiUploadForm", "llm-wiki-upload-form") ||
+    computeContentHash(content) === PRE_PDF_STATUS_UPLOAD_FORM_HASH
+  );
 }
 
 function isMigratableVisibilityWarningComponent(content: string): boolean {
@@ -3007,6 +3034,7 @@ type QueueDashboardItem = {
   source_kind: string
   queue_status: string
   auto_ingest: QueueDashboardAutoIngest | null
+  pdf_extraction: QueueDashboardPdfExtraction | null
   visibility: string
   source_card_path: string
   source_card_materialized: boolean
@@ -3020,6 +3048,24 @@ type QueueDashboardAutoIngest = {
   last_result: string
   last_error_code: string | null
   last_error_message: string | null
+}
+
+type QueueDashboardPdfExtraction = {
+  extraction_status: string
+  artifact_health: string
+  extraction_id: string | null
+  artifact_path: string | null
+  plugin_descriptor: string | null
+  model_selection: string | null
+  model_descriptor: string | null
+  reasoning_effort: string | null
+  pdf_detail: string | null
+  reusable: boolean
+  diagnosis_code: string | null
+  diagnosis_message: string | null
+  last_error_code: string | null
+  last_error_message: string | null
+  retry_command: string | null
 }
 
 function numberValue(value: unknown): number {
@@ -3054,6 +3100,37 @@ function autoIngestValue(value: unknown): QueueDashboardAutoIngest | null {
   }
 }
 
+function pdfExtractionValue(value: unknown): QueueDashboardPdfExtraction | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null
+  }
+
+  const record = value as Record<string, unknown>
+  const extractionStatus = stringValue(record.extraction_status) || stringValue(record.status)
+  const artifactHealth = stringValue(record.artifact_health)
+  if (extractionStatus === "" && artifactHealth === "") {
+    return null
+  }
+
+  return {
+    extraction_status: extractionStatus,
+    artifact_health: artifactHealth,
+    extraction_id: nullableStringValue(record.extraction_id),
+    artifact_path: nullableStringValue(record.artifact_path),
+    plugin_descriptor: nullableStringValue(record.plugin_descriptor),
+    model_selection: nullableStringValue(record.model_selection),
+    model_descriptor: nullableStringValue(record.model_descriptor),
+    reasoning_effort: nullableStringValue(record.reasoning_effort),
+    pdf_detail: nullableStringValue(record.pdf_detail),
+    reusable: booleanValue(record.reusable),
+    diagnosis_code: nullableStringValue(record.diagnosis_code),
+    diagnosis_message: nullableStringValue(record.diagnosis_message),
+    last_error_code: nullableStringValue(record.last_error_code),
+    last_error_message: nullableStringValue(record.last_error_message),
+    retry_command: nullableStringValue(record.retry_command),
+  }
+}
+
 function queueItems(value: unknown): QueueDashboardItem[] {
   if (!Array.isArray(value)) {
     return []
@@ -3077,6 +3154,7 @@ function queueItems(value: unknown): QueueDashboardItem[] {
       source_kind: stringValue(record.source_kind),
       queue_status: stringValue(record.queue_status) || stringValue(record.status),
       auto_ingest: autoIngestValue(record.auto_ingest),
+      pdf_extraction: pdfExtractionValue(record.pdf_extraction),
       visibility: stringValue(record.visibility),
       source_card_path: stringValue(record.source_card_path),
       source_card_materialized: booleanValue(record.source_card_materialized),
@@ -3112,6 +3190,16 @@ function autoIngestSummary(autoIngest: QueueDashboardAutoIngest | null): string 
   return result
 }
 
+function pdfProvenance(pdf: QueueDashboardPdfExtraction): string {
+  return [
+    pdf.plugin_descriptor,
+    pdf.model_selection === null ? null : "model-selection=" + pdf.model_selection,
+    pdf.model_descriptor,
+    pdf.reasoning_effort === null ? null : "reasoning=" + pdf.reasoning_effort,
+    pdf.pdf_detail === null ? null : "detail=" + pdf.pdf_detail,
+  ].filter((value): value is string => value !== null && value !== "").join(" · ")
+}
+
 const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
   const frontmatter = fileData.frontmatter ?? {}
   const currentSlug = fileData.slug ?? ("index" as FullSlug)
@@ -3124,6 +3212,7 @@ const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
     ["Completed", numberValue(frontmatter.llm_wiki_queue_completed)],
   ] as const
   const items = queueItems(frontmatter.llm_wiki_queue_items).slice(0, 8)
+  const hasPdfItems = items.some((item) => item.pdf_extraction !== null)
 
   return (
     <section class="llm-wiki-queue-dashboard" data-llm-wiki-queue-dashboard="true" aria-label="LLM Wiki queue dashboard">
@@ -3160,6 +3249,7 @@ const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
                 <th>Kind</th>
                 <th>Queue status</th>
                 <th>Auto ingest</th>
+                {hasPdfItems ? <th>PDF extraction</th> : null}
                 <th>Visibility</th>
                 <th>Source card</th>
                 <th>Queue path</th>
@@ -3173,6 +3263,37 @@ const LlmWikiQueueDashboard: QuartzComponent = ({ fileData }) => {
                   <td>{item.source_kind || "unknown"}</td>
                   <td>{item.queue_status || "unknown"}</td>
                   <td>{autoIngestSummary(item.auto_ingest)}</td>
+                  {hasPdfItems ? (
+                    <td>
+                      {item.pdf_extraction === null ? (
+                        "Not applicable"
+                      ) : (
+                        <div class="llm-wiki-queue-dashboard__pdf-status">
+                          <div><strong>Status:</strong> {item.pdf_extraction.extraction_status || "unknown"}</div>
+                          <div><strong>Artifact health:</strong> {item.pdf_extraction.artifact_health || "unknown"}</div>
+                          {item.pdf_extraction.extraction_id === null ? null : (
+                            <div><strong>Extraction ID:</strong> <code>{item.pdf_extraction.extraction_id}</code></div>
+                          )}
+                          {item.pdf_extraction.artifact_path === null ? null : (
+                            <div><strong>Artifact path:</strong> <code>{item.pdf_extraction.artifact_path}</code></div>
+                          )}
+                          {pdfProvenance(item.pdf_extraction) === "" ? null : (
+                            <div><strong>Provenance:</strong> {pdfProvenance(item.pdf_extraction)}</div>
+                          )}
+                          <div><strong>Reusable:</strong> {item.pdf_extraction.reusable ? "yes" : "no"}</div>
+                          {item.pdf_extraction.diagnosis_code === null ? null : (
+                            <div><strong>Diagnosis:</strong> {item.pdf_extraction.diagnosis_code}{item.pdf_extraction.diagnosis_message === null ? "" : ": " + item.pdf_extraction.diagnosis_message}</div>
+                          )}
+                          {item.pdf_extraction.last_error_code === null ? null : (
+                            <div><strong>Last error:</strong> {item.pdf_extraction.last_error_code}{item.pdf_extraction.last_error_message === null ? "" : ": " + item.pdf_extraction.last_error_message}</div>
+                          )}
+                          {item.pdf_extraction.retry_command === null ? null : (
+                            <div><strong>Retry:</strong> <code>{item.pdf_extraction.retry_command}</code></div>
+                          )}
+                        </div>
+                      )}
+                    </td>
+                  ) : null}
                   <td>{item.visibility || "unknown"}</td>
                   <td>
                     {item.source_card_path === "" ? (
@@ -3453,6 +3574,38 @@ const llmWikiSourceBadgeHref = (path, currentSlug) => {
 
 const llmWikiSourceBadgeIsRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
+const llmWikiSourceBadgePdfRows = (source) => {
+  const pdf = llmWikiSourceBadgeIsRecord(source.pdf_extraction) ? source.pdf_extraction : null;
+  if (pdf === null) return [];
+  const extractionStatus = llmWikiSourceBadgeText(pdf.extraction_status || pdf.status, "unknown");
+  const artifactHealth = llmWikiSourceBadgeText(pdf.artifact_health, "unknown");
+  const provenance = [
+    llmWikiSourceBadgeText(pdf.plugin_descriptor, ""),
+    typeof pdf.model_selection === "string" && pdf.model_selection !== "" ? "model-selection=" + pdf.model_selection : "",
+    llmWikiSourceBadgeText(pdf.model_descriptor, ""),
+    typeof pdf.reasoning_effort === "string" && pdf.reasoning_effort !== "" ? "reasoning=" + pdf.reasoning_effort : "",
+    typeof pdf.pdf_detail === "string" && pdf.pdf_detail !== "" ? "detail=" + pdf.pdf_detail : "",
+  ].filter(Boolean).join(" · ");
+  const retry = llmWikiSourceBadgeText(
+    pdf.retry_command,
+    typeof source.source_id === "string" && source.source_id !== "" ? "llm-wiki extract pdf " + source.source_id : "",
+  );
+  return [
+    ["PDF extraction", extractionStatus],
+    ["PDF artifact health", artifactHealth],
+    ...(typeof pdf.extraction_id === "string" && pdf.extraction_id !== "" ? [["PDF extraction ID", pdf.extraction_id]] : []),
+    ...(typeof pdf.artifact_path === "string" && pdf.artifact_path !== "" ? [["PDF artifact path", pdf.artifact_path]] : []),
+    ...(provenance === "" ? [] : [["PDF provenance", provenance]]),
+    ...(typeof pdf.diagnosis_code === "string" && pdf.diagnosis_code !== ""
+      ? [["PDF diagnosis", pdf.diagnosis_code + (typeof pdf.diagnosis_message === "string" && pdf.diagnosis_message !== "" ? ": " + pdf.diagnosis_message : "")]]
+      : []),
+    ...(typeof pdf.last_error_code === "string" && pdf.last_error_code !== ""
+      ? [["PDF last error", pdf.last_error_code + (typeof pdf.last_error_message === "string" && pdf.last_error_message !== "" ? ": " + pdf.last_error_message : "")]]
+      : []),
+    ...(retry === "" ? [] : [["PDF retry", retry]]),
+  ];
+};
+
 const llmWikiSourceBadgeAddSource = (sources, candidate) => {
   if (!llmWikiSourceBadgeIsRecord(candidate) || typeof candidate.source_id !== "string") return;
   sources.push(candidate);
@@ -3491,6 +3644,7 @@ const llmWikiSourceBadgeRender = (source, currentSlug) => {
   const rows = [
     ["Source kind", llmWikiSourceBadgeText(source.source_kind, "unknown")],
     ["Queue status", llmWikiSourceBadgeText(source.queue_status || source.status, "unknown")],
+    ...llmWikiSourceBadgePdfRows(source),
     ["Visibility", llmWikiSourceBadgeText(source.visibility, "unknown")],
   ];
   for (const [label, value] of rows) {
@@ -3577,9 +3731,27 @@ type SourceBadgeData = {
   title: string
   source_kind: string | null
   queue_status: string | null
+  pdf_extraction: SourceBadgePdfExtraction | null
   visibility: string | null
   source_card_path: string | null
   page_path: string | null
+}
+
+type SourceBadgePdfExtraction = {
+  extraction_status: string | null
+  artifact_health: string | null
+  extraction_id: string | null
+  artifact_path: string | null
+  plugin_descriptor: string | null
+  model_selection: string | null
+  model_descriptor: string | null
+  reasoning_effort: string | null
+  pdf_detail: string | null
+  diagnosis_code: string | null
+  diagnosis_message: string | null
+  last_error_code: string | null
+  last_error_message: string | null
+  retry_command: string | null
 }
 
 const knownSourceKinds = new Set(["file", "text", "url"])
@@ -3595,6 +3767,47 @@ function normalizedValue(value: unknown, knownValues: ReadonlySet<string>): stri
   return text !== null && knownValues.has(text) ? text : text
 }
 
+function pdfExtractionValue(value: unknown, sourceId: string): SourceBadgePdfExtraction | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null
+  }
+
+  const record = value as Record<string, unknown>
+  const extractionStatus = stringValue(record.extraction_status ?? record.status)
+  const artifactHealth = stringValue(record.artifact_health)
+  if (extractionStatus === null && artifactHealth === null) {
+    return null
+  }
+
+  return {
+    extraction_status: extractionStatus,
+    artifact_health: artifactHealth,
+    extraction_id: stringValue(record.extraction_id),
+    artifact_path: stringValue(record.artifact_path),
+    plugin_descriptor: stringValue(record.plugin_descriptor),
+    model_selection: stringValue(record.model_selection),
+    model_descriptor: stringValue(record.model_descriptor),
+    reasoning_effort: stringValue(record.reasoning_effort),
+    pdf_detail: stringValue(record.pdf_detail),
+    diagnosis_code: stringValue(record.diagnosis_code),
+    diagnosis_message: stringValue(record.diagnosis_message),
+    last_error_code: stringValue(record.last_error_code),
+    last_error_message: stringValue(record.last_error_message),
+    retry_command: stringValue(record.retry_command) ?? \`llm-wiki extract pdf \${sourceId}\`,
+  }
+}
+
+function pdfProvenance(pdf: SourceBadgePdfExtraction): string | null {
+  const parts = [
+    pdf.plugin_descriptor,
+    pdf.model_selection === null ? null : \`model-selection=\${pdf.model_selection}\`,
+    pdf.model_descriptor,
+    pdf.reasoning_effort === null ? null : \`reasoning=\${pdf.reasoning_effort}\`,
+    pdf.pdf_detail === null ? null : \`detail=\${pdf.pdf_detail}\`,
+  ].filter((value): value is string => value !== null)
+  return parts.length === 0 ? null : parts.join(" · ")
+}
+
 function routeForMarkdownPath(path: string): FullSlug {
   return path.replace(/\\.md$/u, "") as FullSlug
 }
@@ -3607,11 +3820,16 @@ function sourceFromFrontmatter(frontmatter: Record<string, unknown> | undefined,
   }
 
   const pagePath = stringValue(frontmatter?.page_path) ?? \`\${currentSlug}.md\`
+  const normalizedSourceId = sourceId ?? sourceCardPath ?? pagePath
   return {
-    source_id: sourceId ?? sourceCardPath ?? pagePath,
-    title: stringValue(frontmatter?.title) ?? sourceId ?? sourceCardPath ?? pagePath,
+    source_id: normalizedSourceId,
+    title: stringValue(frontmatter?.title) ?? normalizedSourceId,
     source_kind: normalizedValue(frontmatter?.source_kind, knownSourceKinds),
     queue_status: normalizedValue(frontmatter?.queue_status ?? frontmatter?.status, knownQueueStatuses),
+    pdf_extraction: pdfExtractionValue(
+      frontmatter?.pdf_extraction_status ?? frontmatter?.pdf_extraction,
+      normalizedSourceId,
+    ),
     visibility: normalizedValue(frontmatter?.visibility, knownVisibilities),
     source_card_path: sourceCardPath,
     page_path: pagePath,
@@ -3632,6 +3850,50 @@ function SourceBadgeDetails({ source, currentSlug }: { source: SourceBadgeData; 
       <dd>{displayValue(source.source_kind)}</dd>
       <dt>Queue status</dt>
       <dd>{displayValue(source.queue_status)}</dd>
+      {source.pdf_extraction === null ? null : (
+        <>
+          <dt>PDF extraction</dt>
+          <dd>{displayValue(source.pdf_extraction.extraction_status)}</dd>
+          <dt>PDF artifact health</dt>
+          <dd>{displayValue(source.pdf_extraction.artifact_health)}</dd>
+          {source.pdf_extraction.extraction_id === null ? null : (
+            <>
+              <dt>PDF extraction ID</dt>
+              <dd><code>{source.pdf_extraction.extraction_id}</code></dd>
+            </>
+          )}
+          {source.pdf_extraction.artifact_path === null ? null : (
+            <>
+              <dt>PDF artifact path</dt>
+              <dd><code>{source.pdf_extraction.artifact_path}</code></dd>
+            </>
+          )}
+          {pdfProvenance(source.pdf_extraction) === null ? null : (
+            <>
+              <dt>PDF provenance</dt>
+              <dd>{pdfProvenance(source.pdf_extraction)}</dd>
+            </>
+          )}
+          {source.pdf_extraction.diagnosis_code === null ? null : (
+            <>
+              <dt>PDF diagnosis</dt>
+              <dd>{source.pdf_extraction.diagnosis_code}{source.pdf_extraction.diagnosis_message === null ? "" : \`: \${source.pdf_extraction.diagnosis_message}\`}</dd>
+            </>
+          )}
+          {source.pdf_extraction.last_error_code === null ? null : (
+            <>
+              <dt>PDF last error</dt>
+              <dd>{source.pdf_extraction.last_error_code}{source.pdf_extraction.last_error_message === null ? "" : \`: \${source.pdf_extraction.last_error_message}\`}</dd>
+            </>
+          )}
+          {source.pdf_extraction.retry_command === null ? null : (
+            <>
+              <dt>PDF retry</dt>
+              <dd><code>{source.pdf_extraction.retry_command}</code></dd>
+            </>
+          )}
+        </>
+      )}
       <dt>Visibility</dt>
       <dd>{displayValue(source.visibility)}</dd>
       {linkPath === null ? null : (
@@ -3731,6 +3993,29 @@ function uploadFormComponentContent(): string {
     };
     const objectValue = (value) => value !== null && typeof value === "object" ? value : null;
     const stringValue = (value) => typeof value === "string" ? value : "";
+    const pdfExtractionData = (data) => objectValue(data.pdf_extraction);
+    const pdfExtractionStatus = (pdf) => stringValue(pdf?.extraction_status) || stringValue(pdf?.status);
+    const pdfExtractionProvenance = (pdf) => [
+      stringValue(pdf?.plugin_descriptor),
+      stringValue(pdf?.model_descriptor),
+      stringValue(pdf?.reasoning_effort) === "" ? "" : "reasoning=" + stringValue(pdf?.reasoning_effort),
+      stringValue(pdf?.pdf_detail) === "" ? "" : "detail=" + stringValue(pdf?.pdf_detail),
+    ].filter(Boolean).join(" · ");
+    const pdfExtractionRetry = (data, pdf) => {
+      const command = stringValue(pdf?.retry_command);
+      if (command !== "") return command;
+      return data.source_id && pdf !== null ? "llm-wiki extract pdf " + data.source_id : "";
+    };
+    const pdfExtractionDiagnosis = (pdf) => {
+      const code = stringValue(pdf?.diagnosis_code);
+      const message = stringValue(pdf?.diagnosis_message);
+      return code === "" ? "" : code + (message === "" ? "" : ": " + message);
+    };
+    const pdfExtractionLastError = (pdf) => {
+      const code = stringValue(pdf?.last_error_code);
+      const message = stringValue(pdf?.last_error_message);
+      return code === "" ? "" : code + (message === "" ? "" : ": " + message);
+    };
     const autoIngestData = (data) => objectValue(data.auto_ingest);
     const autoIngestResult = (autoIngest) => stringValue(autoIngest?.outcome) || stringValue(autoIngest?.status);
     const autoIngestFinalStatus = (autoIngest, result) => {
@@ -3878,6 +4163,7 @@ function uploadFormComponentContent(): string {
         }
 
         const data = body.data || {};
+        const pdfExtraction = pdfExtractionData(data);
         const autoIngest = autoIngestData(data);
         const autoIngestResultValue = autoIngest === null ? "" : autoIngestResult(autoIngest);
         const autoIngestFinalStatusValue = autoIngest === null
@@ -3891,6 +4177,16 @@ function uploadFormComponentContent(): string {
           ["Source ID", data.source_id],
           ["Source kind", data.source_kind],
           ["Queue status", data.queue_status],
+          ["PDF extraction", pdfExtractionStatus(pdfExtraction)],
+          ["PDF artifact health", pdfExtraction?.artifact_health],
+          ["PDF extraction outcome", autoIngest === null ? "" : autoIngest?.pdf?.outcome],
+          ["PDF extraction ID", pdfExtraction?.extraction_id],
+          ["PDF artifact path", pdfExtraction?.artifact_path],
+          ["PDF provenance", pdfExtractionProvenance(pdfExtraction)],
+          ["PDF reusable", pdfExtraction === null ? "" : pdfExtraction.reusable === true ? "yes" : "no"],
+          ["PDF diagnosis", pdfExtractionDiagnosis(pdfExtraction)],
+          ["PDF last error", pdfExtractionLastError(pdfExtraction)],
+          ["PDF retry", pdfExtractionRetry(data, pdfExtraction)],
           ["Source card", data.source_card_path],
           ["Original", data.original_path],
           ["Ingest", data.source_id ? "llm-wiki ingest " + data.source_id : ""],
@@ -4316,6 +4612,7 @@ function profileSummaryContent(reviewData: ReviewDataModel, scan: RepoScan): str
 }
 
 function sourceQueueContent(reviewData: ReviewDataModel, options: { includeUploadPage?: boolean } = {}): string {
+  const hasPdfItems = reviewData.queue.items.some((item) => item.pdf_extraction !== undefined);
   const rows = reviewData.queue.items.map((item) =>
     [
       item.source_id,
@@ -4326,9 +4623,26 @@ function sourceQueueContent(reviewData: ReviewDataModel, options: { includeUploa
       item.source_card_path ?? "",
       item.queue_path,
       autoIngestMarkdownSummary(item.auto_ingest),
+      ...(hasPdfItems
+        ? [
+            item.pdf_extraction?.extraction_status ?? "Not applicable",
+            item.pdf_extraction?.artifact_health ?? "Not applicable",
+            item.pdf_extraction?.extraction_id ?? "",
+            item.pdf_extraction?.artifact_path ?? "",
+            item.pdf_extraction === undefined ? "" : pdfStatusMarkdownProvenance(item.pdf_extraction),
+            item.pdf_extraction === undefined ? "" : pdfStatusMarkdownDiagnosis(item.pdf_extraction),
+            item.pdf_extraction === undefined ? "" : pdfStatusMarkdownLastError(item.pdf_extraction),
+            item.pdf_extraction?.retry_command ?? "",
+          ]
+        : []),
       item.original_path ?? "",
     ].map((value) => escapeTableCell(String(value))).join(" | "),
   );
+  const tableHeader = hasPdfItems
+    ? `| Source ID | Title | Status | Kind | Visibility | Source card | Queue file | Auto ingest | PDF extraction | PDF artifact health | PDF extraction ID | PDF artifact path | PDF provenance | PDF diagnosis | PDF last error | PDF retry | Original |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|`
+    : `| Source ID | Title | Status | Kind | Visibility | Source card | Queue file | Auto ingest | Original |
+|---|---|---|---|---|---|---|---|---|`;
 
   return `${generatedReviewPageFrontmatter("Source Queue", "LlmWikiQueueDashboard", reviewData, [
     ...queueDashboardFrontmatterFields(reviewData, options),
@@ -4343,8 +4657,7 @@ function sourceQueueContent(reviewData: ReviewDataModel, options: { includeUploa
 | Blocked | ${reviewData.queue.counts.blocked} |
 | Ingested | ${reviewData.queue.counts.completed} |
 
-| Source ID | Title | Status | Kind | Visibility | Source card | Queue file | Auto ingest | Original |
-|---|---|---|---|---|---|---|---|---|
+${tableHeader}
 ${rows.map((row) => `| ${row} |`).join("\n")}
 
 ## Source Badge Data
@@ -4372,6 +4685,7 @@ function queueDashboardFrontmatterFields(reviewData: ReviewDataModel, options: {
       source_card_materialized: item.source_card_materialized,
       queue_path: item.queue_path,
       ...(item.auto_ingest === undefined ? {} : { auto_ingest: item.auto_ingest }),
+      ...(item.pdf_extraction === undefined ? {} : { pdf_extraction: item.pdf_extraction }),
     })),
   };
 
@@ -4397,6 +4711,30 @@ function autoIngestMarkdownSummary(autoIngest: ReviewQueueAutoIngestData | undef
   }
 
   return result;
+}
+
+function pdfStatusMarkdownProvenance(status: PdfSourceStatus): string {
+  return [
+    status.plugin_descriptor,
+    status.model_selection === null ? null : `model-selection=${status.model_selection}`,
+    status.model_descriptor,
+    status.reasoning_effort === null ? null : `reasoning=${status.reasoning_effort}`,
+    status.pdf_detail === null ? null : `detail=${status.pdf_detail}`,
+  ].filter((value): value is string => value !== null).join(" · ");
+}
+
+function pdfStatusMarkdownDiagnosis(status: PdfSourceStatus): string {
+  if (status.diagnosis_code === null) return "";
+  return status.diagnosis_message === null
+    ? status.diagnosis_code
+    : `${status.diagnosis_code}: ${status.diagnosis_message}`;
+}
+
+function pdfStatusMarkdownLastError(status: PdfSourceStatus): string {
+  if (status.last_error_code === null) return "";
+  return status.last_error_message === null
+    ? status.last_error_code
+    : `${status.last_error_code}: ${status.last_error_message}`;
 }
 
 function reviewCategoryContent(options: {
@@ -4452,10 +4790,10 @@ function reviewItemsJson(items: readonly unknown[]): string {
     return "No items.\n";
   }
 
-  return `\`\`\`json
-${JSON.stringify(items, null, 2)}
-\`\`\`
-`;
+  const json = JSON.stringify(items, null, 2);
+  const longestRun = Math.max(0, ...[...json.matchAll(/`+/gu)].map((match) => match[0].length));
+  const fence = "`".repeat(Math.max(3, longestRun + 1));
+  return `${fence}json\n${json}\n${fence}\n`;
 }
 
 function generatedPageFrontmatter(title: string, component: string, extraFields: readonly string[] = []): string {
@@ -4550,7 +4888,13 @@ function stringFrontmatterValue(file: RepoMarkdownFile, field: string): string |
 }
 
 function escapeTableCell(value: string): string {
-  return value.replaceAll("|", "\\|");
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll(/\r?\n/gu, " ")
+    .replaceAll("\\", "\\\\")
+    .replaceAll(/([|`\[\]()!])/gu, "\\$1");
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

@@ -2,6 +2,8 @@ import { readFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 
 import { publicLikeProfileFeatureIssues } from "../profiles/index.js";
+import { readPdfIngestionConfig } from "../pdf/config.js";
+import { readPdfRepositoryStatuses, type PdfSourceStatus } from "../pdf/status.js";
 import { scanWikiRepository, isRawOriginalPath, type RepoMarkdownFile, type RepoScan, type SourceCard } from "../scanner/repo.js";
 import type { StaticLeakFinding } from "../scanner/staticLeaks.js";
 import {
@@ -42,6 +44,10 @@ export type LintResult = {
     warning: number;
     fixed: number;
   };
+};
+
+export type LintReadContext = {
+  pdfStatuses?: ReadonlyMap<string, PdfSourceStatus>;
 };
 
 type LinkResolution = {
@@ -133,9 +139,16 @@ const PUBLIC_FORBIDDEN_SKIPPED_PROFILE_ROOTS = [
 ] as const;
 const PUBLIC_SKIPPED_NON_MARKDOWN_PROFILE_PATHS = [".llm-wiki/config.yml"] as const;
 
-export async function lintWiki(repoRoot: string, options: LintOptions = {}): Promise<LintResult> {
+export async function lintWiki(
+  repoRoot: string,
+  options: LintOptions = {},
+  context: LintReadContext = {},
+): Promise<LintResult> {
   const scan = await scanWikiRepository(repoRoot, scanOptionsForLint(options));
-  const issues = collectLintIssues(scan, options);
+  const issues = mergeLintIssues(
+    collectLintIssues(scan, options),
+    await collectPdfLintIssues(repoRoot, context.pdfStatuses),
+  );
 
   return withCounts({ issues, fixed_paths: [] });
 }
@@ -143,7 +156,7 @@ export async function lintWiki(repoRoot: string, options: LintOptions = {}): Pro
 export async function lintWikiWithFix(repoRoot: string, options: LintOptions = {}): Promise<LintResult> {
   const scanOptions = scanOptionsForLint(options);
   const firstScan = await scanWikiRepository(repoRoot, scanOptions);
-  const firstIssues = collectLintIssues(firstScan, options);
+  const firstIssues = mergeLintIssues(collectLintIssues(firstScan, options), await collectPdfLintIssues(repoRoot));
   const shouldFixIndex = firstIssues.some(
     (issue) => (issue.rule_id === "index_stale" || issue.rule_id === "index_missing") && issue.fixable,
   );
@@ -160,9 +173,93 @@ export async function lintWikiWithFix(repoRoot: string, options: LintOptions = {
   }
 
   const secondScan = shouldFixIndex ? await scanWikiRepository(repoRoot, scanOptions) : firstScan;
-  const secondIssues = collectLintIssues(secondScan, options);
+  const secondIssues = shouldFixIndex
+    ? mergeLintIssues(collectLintIssues(secondScan, options), await collectPdfLintIssues(repoRoot))
+    : firstIssues;
 
   return withCounts({ issues: secondIssues, fixed_paths: fixedPaths });
+}
+
+async function collectPdfLintIssues(
+  repoRoot: string,
+  suppliedStatuses?: ReadonlyMap<string, PdfSourceStatus>,
+): Promise<LintIssue[]> {
+  const [config, statuses] = await Promise.all([
+    readPdfIngestionConfig(repoRoot),
+    suppliedStatuses === undefined ? readPdfRepositoryStatuses(repoRoot) : Promise.resolve(suppliedStatuses),
+  ]);
+  const issues: LintIssue[] = [];
+
+  if (
+    !config.ok
+    && (
+      config.error.path.startsWith(".llm-wiki/config.yml:pdf_ingestion")
+      || statuses.size > 0
+    )
+  ) {
+    issues.push({
+      rule_id: "pdf_config_invalid",
+      severity: "error",
+      path: ".llm-wiki/config.yml",
+      message: "PDF ingestion configuration is invalid.",
+      fix_hint: config.error.hint,
+      fixable: false,
+    });
+  }
+
+  for (const status of [...statuses.values()].sort((left, right) => left.source_id.localeCompare(right.source_id))) {
+    const issue = pdfStatusLintIssue(status);
+    if (issue !== null) {
+      issues.push(issue);
+    }
+  }
+
+  return sortIssues(dedupeIssues(issues));
+}
+
+function pdfStatusLintIssue(status: PdfSourceStatus): LintIssue | null {
+  const queuePath = `raw/queue/${status.source_id}.json`;
+  if (status.artifact_health === "stale") {
+    return {
+      rule_id: "pdf_artifact_stale",
+      severity: "error",
+      path: status.artifact_path ?? queuePath,
+      message: `Selected PDF extraction for ${status.source_id} is stale.`,
+      fix_hint: status.retry_command,
+      fixable: false,
+    };
+  }
+
+  if (status.artifact_health === "missing" && status.extraction_status === "extracted") {
+    return {
+      rule_id: "pdf_artifact_missing",
+      severity: "error",
+      path: status.artifact_path ?? queuePath,
+      message: `Selected PDF extraction for ${status.source_id} is missing its immutable run files.`,
+      fix_hint: status.retry_command,
+      fixable: false,
+    };
+  }
+
+  if (status.artifact_health !== "inconsistent") {
+    return null;
+  }
+
+  const stateProblem = status.diagnosis_scope === "state";
+  return {
+    rule_id: stateProblem ? "pdf_state_inconsistent" : "pdf_artifact_inconsistent",
+    severity: "error",
+    path: stateProblem ? queuePath : status.artifact_path ?? queuePath,
+    message: stateProblem
+      ? `Mirrored PDF extraction state for ${status.source_id} is malformed or disagrees.`
+      : `Selected PDF extraction for ${status.source_id} failed artifact integrity validation.`,
+    fix_hint: status.retry_command,
+    fixable: false,
+  };
+}
+
+function mergeLintIssues(...issueGroups: readonly LintIssue[][]): LintIssue[] {
+  return sortIssues(dedupeIssues(issueGroups.flat()));
 }
 
 function scanOptionsForLint(options: LintOptions): Parameters<typeof scanWikiRepository>[1] {
@@ -1341,6 +1438,8 @@ function publicProfileIssues(scan: RepoScan, profileName: string, linkIndex: Lin
       continue;
     }
 
+    issues.push(...publicPdfProfileSelectionIssues(scan, path));
+
     if (isRawOriginalPath(path)) {
       issues.push({
         rule_id: "public_raw_original_selected",
@@ -1604,6 +1703,64 @@ function publicProfileIssues(scan: RepoScan, profileName: string, linkIndex: Lin
   issues.push(...publicStaticOutputLeakIssues(scan));
 
   return issues;
+}
+
+function publicPdfProfileSelectionIssues(scan: RepoScan, path: string): LintIssue[] {
+  if (/^raw\/inputs\/.+\/original\.pdf$/iu.test(path)) {
+    return [{
+      rule_id: "public_pdf_original_selected",
+      severity: "error",
+      path,
+      message: `Public profile selects an original PDF: ${path}.`,
+      fix_hint: "Exclude raw PDF originals from public profiles and publish a reviewed curated narrative instead.",
+      fixable: false,
+    }];
+  }
+
+  if (/^raw\/inputs\/.+\/extracted\/pdf\/[^/]+\/document\.md$/u.test(path)) {
+    return [{
+      rule_id: "public_pdf_artifact_selected",
+      severity: "error",
+      path,
+      message: `Public profile selects a private PDF extraction artifact: ${path}.`,
+      fix_hint: "Exclude extracted/pdf/**/document.md from public profiles and publish only reviewed curated pages.",
+      fixable: false,
+    }];
+  }
+
+  if (/^raw\/inputs\/.+\/extracted\/pdf\/[^/]+\/metadata\.json$/u.test(path)) {
+    return [{
+      rule_id: "public_pdf_metadata_selected",
+      severity: "error",
+      path,
+      message: `Public profile selects private PDF extraction metadata: ${path}.`,
+      fix_hint: "Exclude extracted/pdf/**/metadata.json and all extraction runtime provenance from public profiles.",
+      fixable: false,
+    }];
+  }
+
+  const queueFile = scan.queueFiles.find((candidate) => candidate.path === path);
+  if (queueFile !== undefined && queueFileContainsPdfState(queueFile.content)) {
+    return [{
+      rule_id: "public_pdf_queue_state_selected",
+      severity: "error",
+      path,
+      message: `Public profile selects operational PDF queue state: ${path}.`,
+      fix_hint: "Exclude raw/queue/** and operational PDF extraction state from public profiles.",
+      fixable: false,
+    }];
+  }
+
+  return [];
+}
+
+function queueFileContainsPdfState(content: string): boolean {
+  try {
+    const value = JSON.parse(content) as unknown;
+    return isRecord(value) && Object.prototype.hasOwnProperty.call(value, "pdf_extraction");
+  } catch {
+    return false;
+  }
 }
 
 function publicStaticOutputLeakIssues(scan: RepoScan): LintIssue[] {
@@ -2525,6 +2682,16 @@ function publicProfileForbiddenRouteIssues(include: string[], exclude: string[])
       fix_hint: route.fix_hint,
       fixable: false,
     });
+    if (route.rule_id === "public_profile_review_route_forbidden") {
+      issues.push({
+        rule_id: "public_quartz_review_page_selected",
+        severity: "error",
+        path: selectedPath,
+        message: "Public profile selects private local review data.",
+        fix_hint: route.fix_hint,
+        fixable: false,
+      });
+    }
   }
 
   return issues;

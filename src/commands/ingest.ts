@@ -8,7 +8,28 @@ import {
 } from "../agents/index.js";
 import { resumeAutoIngestSource, runAutoIngestSource, type AutoIngestSourceResult } from "../autoIngest/index.js";
 import type { CliIo } from "../cli.js";
+import {
+  addPdfExtractionOptions,
+  hasPdfExtractionOptions,
+  pdfOverridesFromRawOptions,
+  PDF_INGEST_HELP,
+  rejectPdfOptionsForNonExtractionMode,
+  type RawPdfExtractionOptions,
+} from "../pdf/cli.js";
+import {
+  readPdfIngestionConfig,
+  resolvePdfExtractionSettings,
+} from "../pdf/config.js";
+import { PdfPreflightRestartError } from "../pdf/extraction.js";
 import { buildIngestTask, type IngestTask } from "../agentTasks/ingest.js";
+import {
+  ensurePreparedIngestArtifactUnderLock,
+  prepareAutomatedIngestArtifact,
+  readRequiredIngestArtifact,
+  revalidateCanonicalIngestArtifact,
+  sourceRequiresPdfArtifact,
+  type PdfIngestArtifactResult,
+} from "../ingest/artifact.js";
 import { IngestValidationFailedError, runLocalAgentIngestCore } from "../ingest/localAgentCore.js";
 import {
   applyProviderProposalsWithValidation,
@@ -34,7 +55,7 @@ import { validateIngestReadiness, type IngestValidationIssue } from "../validati
 import { prepareIngestBranch } from "../utils/git.js";
 import { readTextFileInsideRoot, validateTextFileWriteInsideRoot, writeTextFileInsideRoot } from "../utils/fs.js";
 
-type RawIngestOptions = RawRuntimeCommandOptions & {
+type RawIngestOptions = RawRuntimeCommandOptions & RawPdfExtractionOptions & {
   validate?: unknown;
   taskOut?: unknown;
   createBranch?: unknown;
@@ -114,6 +135,7 @@ type IngestAgentData = {
     previous_status: QueueStatus;
     status: "ingested";
   };
+  pdf?: PdfIngestArtifactResult;
 };
 
 type IngestData = IngestTaskData | IngestValidationData | IngestProviderData | IngestAgentData;
@@ -127,18 +149,19 @@ type IngestStateSnapshot = {
 };
 
 export function registerIngestCommand(program: Command, io: CliIo): void {
-  addRuntimeOptions(
-    program
-      .command("ingest")
-      .description("Generate a manual prompt, execute local agents/providers, or validate completed curated edits")
-      .argument("<source_id>", "source ID to ingest")
-      .option("--validate", "validate completed ingest output and mark source ingested", false)
-      .option("--task-out <path>", "write the manual prompt to a repository-relative path")
-      .option("--create-branch", "create the recommended ingest branch when Git is enabled", false)
-      .option("--agent <name>", "run local agent execution with a configured agent such as codex")
-      .option("--auto", "run local agent execution with the configured default local agent", false)
-      .option("--provider <name>", "run HTTP provider mode with an explicitly configured provider"),
-  ).action(async (sourceId: string, rawOptions: RawIngestOptions) => {
+  const ingest = program
+    .command("ingest")
+    .description("Generate a manual prompt, execute local agents/providers, or validate completed curated edits")
+    .argument("<source_id>", "source ID to ingest")
+    .option("--validate", "validate completed ingest output and mark source ingested", false)
+    .option("--task-out <path>", "write the manual prompt to a repository-relative path")
+    .option("--create-branch", "create the recommended ingest branch when Git is enabled", false)
+    .option("--agent <name>", "run local agent execution with a configured agent such as codex")
+    .option("--auto", "execute the configured default local agent", false)
+    .option("--provider <name>", "run HTTP provider mode with an explicitly configured provider")
+    .addHelpText("after", PDF_INGEST_HELP);
+
+  addRuntimeOptions(addPdfExtractionOptions(ingest)).action(async (sourceId: string, rawOptions: RawIngestOptions) => {
     await runIngestCommand(sourceId, rawOptions, io);
   });
 }
@@ -160,8 +183,9 @@ async function runIngestCommand(sourceId: string, rawOptions: RawIngestOptions, 
 
   try {
     validateIngestModeOptions(rawOptions);
+    await validatePdfIngestOptions(resolvedRepo.value.rootDir, rawOptions);
     const data = rawOptions.validate === true
-      ? await validateAndCompleteIngest(resolvedRepo.value.rootDir, sourceId)
+      ? await executeValidationIngest(resolvedRepo.value.rootDir, sourceId)
       : typeof rawOptions.provider === "string"
         ? await executeProviderIngest(resolvedRepo.value.rootDir, sourceId, rawOptions.provider)
         : isAgentModeRequested(rawOptions)
@@ -257,6 +281,56 @@ function validateIngestModeOptions(rawOptions: RawIngestOptions): void {
       path: "--create-branch",
     });
   }
+
+  if (rawOptions.validate === true) {
+    rejectPdfOptionsForNonExtractionMode(
+      rawOptions,
+      "ingest --validate",
+      "Remove PDF options; validation consumes an existing canonical artifact and never starts extraction.",
+    );
+  }
+
+  if (typeof rawOptions.provider === "string") {
+    rejectPdfOptionsForNonExtractionMode(
+      rawOptions,
+      "HTTP provider ingest",
+      "Remove PDF options and run llm-wiki extract pdf <source_id> before provider ingest.",
+    );
+  }
+
+  if (!isAgentModeRequested(rawOptions)) {
+    rejectPdfOptionsForNonExtractionMode(
+      rawOptions,
+      "manual ingest",
+      "Remove PDF options and run llm-wiki extract pdf <source_id> before generating a manual task.",
+    );
+  }
+}
+
+async function validatePdfIngestOptions(repoRoot: string, rawOptions: RawIngestOptions): Promise<void> {
+  if (!hasPdfExtractionOptions(rawOptions)) {
+    return;
+  }
+
+  const config = await readPdfIngestionConfig(repoRoot);
+  if (!config.ok) {
+    throw new RuntimeCommandError(config.error);
+  }
+
+  const settings = resolvePdfExtractionSettings(config.value, pdfOverridesFromRawOptions(rawOptions));
+  if (!settings.ok) {
+    throw new RuntimeCommandError(settings.error);
+  }
+
+  if (typeof rawOptions.agent === "string" && rawOptions.agent.trim() !== config.value.codexAgent) {
+    throw new RuntimeCommandError({
+      code: "PDF_CONFIG_INVALID",
+      message: `PDF extraction options require agent ${config.value.codexAgent}.`,
+      path: "--agent",
+      hint: `Use --agent ${config.value.codexAgent}, use --auto when it selects that agent, or run llm-wiki extract pdf <source_id> first.`,
+    });
+  }
+
 }
 
 function isAgentModeRequested(rawOptions: RawIngestOptions): boolean {
@@ -278,7 +352,7 @@ async function executeAgentIngest(
       return executeLockedIngestingAutoIngest(repoRoot, sourceId, rawOptions);
     }
 
-    return executeDefaultAutoIngest(repoRoot, sourceId);
+    return executeDefaultAutoIngest(repoRoot, sourceId, rawOptions);
   }
 
   return executeLocalAgentIngest(repoRoot, sourceId, rawOptions);
@@ -289,66 +363,78 @@ async function executeLocalAgentIngest(
   sourceId: string,
   rawOptions: RawIngestOptions,
 ): Promise<IngestAgentData> {
-  const agent = await resolveLocalAgentConfig(repoRoot, rawOptions);
-  const preflightTask = await buildIngestTask({
-    repoRoot,
-    sourceId,
-  });
-  if (!preflightTask.ok) {
-    throw new RuntimeCommandError({
-      code: preflightTask.error.code,
-      message: preflightTask.error.message,
-      hint: preflightTask.error.hint,
-      path: preflightTask.error.path,
+  if (
+    typeof rawOptions.agent === "string"
+    && await sourceRequiresPdfArtifact(repoRoot, sourceId)
+  ) {
+    const pdfConfig = await readPdfIngestionConfig(repoRoot);
+    if (!pdfConfig.ok) throw new RuntimeCommandError(pdfConfig.error);
+    if (rawOptions.agent.trim() !== pdfConfig.value.codexAgent) {
+      await readRequiredIngestArtifact(repoRoot, sourceId);
+    }
+  }
+  for (let preflightAttempt = 0; preflightAttempt < 4; preflightAttempt += 1) {
+    const agent = await resolveLocalAgentConfig(repoRoot, rawOptions);
+    const artifactPreparation = await prepareAutomatedIngestArtifact({
+      repoRoot,
+      sourceId,
+      agent,
+      overrides: pdfOverridesFromRawOptions(rawOptions),
     });
+    const preflightTask = await buildIngestTask({ repoRoot, sourceId });
+    if (!preflightTask.ok) throw new RuntimeCommandError(preflightTask.error);
+    ensureIngestTaskCanStart(preflightTask.value);
+    await assertLocalAgentCommandAvailable(agent, repoRoot);
+    const command = agentIngestCommand(sourceId, agent.name, rawOptions);
+
+    try {
+      return await withIngestLock(
+        repoRoot,
+        { label: `agent-ingest:${sourceId}` },
+        async (lease) => {
+          let attempted = false;
+          try {
+            const ensured = await ensurePreparedIngestArtifactUnderLock(artifactPreparation, lease, {
+              onReady: async () => {
+                await ensureIngesting(repoRoot, sourceId, command);
+                attempted = true;
+              },
+            });
+            const result = await runLocalAgentIngestCore({
+              repoRoot,
+              sourceId,
+              agent,
+              canonicalArtifact: ensured.artifact,
+              completeAppliedIngest: async () => markIngested(repoRoot, sourceId),
+            });
+            return {
+              mode: "agent" as const,
+              agent: agent.name,
+              source: { source_id: sourceId, status: "ingested" as const },
+              applied_paths: result.appliedPaths,
+              validation: { passed: true as const, issues: [] as [] },
+              queue: result.completion,
+              ...(ensured.pdf === null ? {} : { pdf: ensured.pdf }),
+            };
+          } catch (error) {
+            if (attempted) await markBlockedIfIngesting(repoRoot, sourceId, command);
+            if (error instanceof LocalAgentExecutionError) throw localAgentExecutionRuntimeError(error);
+            throw error;
+          }
+        },
+      );
+    } catch (error) {
+      if (error instanceof PdfPreflightRestartError) continue;
+      throw error;
+    }
   }
 
-  ensureIngestTaskCanStart(preflightTask.value);
-  await assertLocalAgentCommandAvailable(agent, repoRoot);
-  const command = agentIngestCommand(sourceId, agent.name, rawOptions);
-
-  return withIngestLock(
-    repoRoot,
-    {
-      label: `agent-ingest:${sourceId}`,
-    },
-    async () => {
-      await ensureIngesting(repoRoot, sourceId, command);
-
-      try {
-        const result = await runLocalAgentIngestCore({
-          repoRoot,
-          sourceId,
-          agent,
-          completeAppliedIngest: async () => {
-            return markIngested(repoRoot, sourceId);
-          },
-        });
-
-        return {
-          mode: "agent",
-          agent: agent.name,
-          source: {
-            source_id: sourceId,
-            status: "ingested",
-          },
-          applied_paths: result.appliedPaths,
-          validation: {
-            passed: true,
-            issues: [],
-          },
-          queue: result.completion,
-        };
-      } catch (error) {
-        await markBlockedIfIngesting(repoRoot, sourceId, command);
-        if (error instanceof LocalAgentExecutionError) {
-          throw localAgentExecutionRuntimeError(error);
-        }
-
-        throw error;
-      }
-    },
-  );
+  throw new RuntimeCommandError({
+    code: "PDF_CONFIG_INVALID",
+    message: "PDF configuration kept changing while direct agent ingest waited for the repository lock.",
+    path: ".llm-wiki/config.yml",
+    hint: "Stop editing PDF/agent configuration, then retry ingest.",
+  });
 }
 
 async function executeLockedIngestingAutoIngest(
@@ -360,6 +446,7 @@ async function executeLockedIngestingAutoIngest(
     repoRoot,
     sourceId,
     command: agentIngestCommand(sourceId, "default", rawOptions),
+    pdfOverrides: pdfOverridesFromRawOptions(rawOptions),
   });
 
   if (result.outcome !== "ingested") {
@@ -382,14 +469,20 @@ async function executeLockedIngestingAutoIngest(
       previous_status: result.previous_status ?? "ingesting",
       status: "ingested",
     },
+    ...(result.pdf === undefined ? {} : { pdf: result.pdf }),
   };
 }
 
-async function executeDefaultAutoIngest(repoRoot: string, sourceId: string): Promise<IngestAgentData> {
+async function executeDefaultAutoIngest(
+  repoRoot: string,
+  sourceId: string,
+  rawOptions: RawIngestOptions,
+): Promise<IngestAgentData> {
   const result = await runAutoIngestSource({
     repoRoot,
     sourceId,
-    command: `llm-wiki ingest ${sourceId} --auto`,
+    command: agentIngestCommand(sourceId, "default", rawOptions),
+    pdfOverrides: pdfOverridesFromRawOptions(rawOptions),
   });
 
   if (result.outcome !== "ingested") {
@@ -412,6 +505,7 @@ async function executeDefaultAutoIngest(repoRoot: string, sourceId: string): Pro
       previous_status: result.previous_status ?? "queued",
       status: "ingested",
     },
+    ...(result.pdf === undefined ? {} : { pdf: result.pdf }),
   };
 }
 
@@ -420,9 +514,11 @@ async function executeProviderIngest(
   sourceId: string,
   providerName: string,
 ): Promise<IngestProviderData> {
+  const canonicalArtifact = await readRequiredIngestArtifact(repoRoot, sourceId);
   const task = await buildIngestTask({
     repoRoot,
     sourceId,
+    canonicalArtifact,
   });
   if (!task.ok) {
     throw new RuntimeCommandError({
@@ -440,18 +536,30 @@ async function executeProviderIngest(
     provider,
     task: task.value,
   });
+  const currentAttemptPaths = proposals.files.map((proposal) => proposal.path);
 
   await validateProviderProposalsOnTemporaryRepo(repoRoot, proposals, async (tempRepoRoot) => {
-    const validation = await validateIngestReadiness(tempRepoRoot, sourceId);
+    await revalidateCanonicalIngestArtifact(tempRepoRoot, sourceId, canonicalArtifact);
+    const validation = await validateIngestReadiness(tempRepoRoot, sourceId, { currentAttemptPaths });
     if (!validation.passed) {
       throw new IngestValidationFailedError(validation.issues);
     }
   });
 
-  const { appliedPaths, validation: completed } = await applyProviderProposalsWithValidation(
+  const { appliedPaths, validation: completed } = await withIngestLock(
     repoRoot,
-    proposals,
-    async () => validateAndCompleteIngest(repoRoot, sourceId),
+    { label: `provider-ingest:${sourceId}` },
+    async () => {
+      await revalidateCanonicalIngestArtifact(repoRoot, sourceId, canonicalArtifact);
+      return applyProviderProposalsWithValidation(
+        repoRoot,
+        proposals,
+        async () => {
+          await revalidateCanonicalIngestArtifact(repoRoot, sourceId, canonicalArtifact);
+          return validateAndCompleteIngest(repoRoot, sourceId);
+        },
+      );
+    },
   );
 
   return {
@@ -477,11 +585,13 @@ async function createIngestTask(
   sourceId: string,
   rawOptions: RawIngestOptions,
 ): Promise<IngestTaskData> {
+  const canonicalArtifact = await readRequiredIngestArtifact(repoRoot, sourceId);
   const artifactPath = typeof rawOptions.taskOut === "string" ? rawOptions.taskOut : null;
   const preflightTask = await buildIngestTask({
     repoRoot,
     sourceId,
     artifactPath,
+    canonicalArtifact,
   });
   if (!preflightTask.ok) {
     throw new RuntimeCommandError({
@@ -498,60 +608,68 @@ async function createIngestTask(
     await validateTaskArtifactWriteTarget(repoRoot, artifactPath);
   }
 
-  const git = await prepareIngestBranch(repoRoot, sourceId, { create: rawOptions.createBranch === true });
-  if (git.error !== null) {
-    throw new RuntimeCommandError({
-      code: "INGEST_BRANCH_CREATE_FAILED",
-      message: git.error,
-      hint: "Check Git status or create the ingest branch manually before rerunning.",
-      path: ".git",
-    });
-  }
+  return withIngestLock(
+    repoRoot,
+    { label: `manual-ingest:${sourceId}` },
+    async () => {
+      const confirmedArtifact = await revalidateCanonicalIngestArtifact(repoRoot, sourceId, canonicalArtifact);
+      const git = await prepareIngestBranch(repoRoot, sourceId, { create: rawOptions.createBranch === true });
+      if (git.error !== null) {
+        throw new RuntimeCommandError({
+          code: "INGEST_BRANCH_CREATE_FAILED",
+          message: git.error,
+          hint: "Check Git status or create the ingest branch manually before rerunning.",
+          path: ".git",
+        });
+      }
 
-  const rollbackSnapshot = await snapshotIngestState(repoRoot, preflightTask.value);
-  const queue = await ensureIngesting(repoRoot, sourceId);
+      const rollbackSnapshot = await snapshotIngestState(repoRoot, preflightTask.value);
+      const queue = await ensureIngesting(repoRoot, sourceId);
 
-  try {
-    const task = await buildIngestTask({
-      repoRoot,
-      sourceId,
-      artifactPath,
-      previousStatus: queue.previous_status,
-    });
-    if (!task.ok) {
-      throw new RuntimeCommandError({
-        code: task.error.code,
-        message: task.error.message,
-        hint: task.error.hint,
-        path: task.error.path,
-      });
-    }
+      try {
+        const task = await buildIngestTask({
+          repoRoot,
+          sourceId,
+          artifactPath,
+          canonicalArtifact: confirmedArtifact,
+          previousStatus: queue.previous_status,
+        });
+        if (!task.ok) {
+          throw new RuntimeCommandError({
+            code: task.error.code,
+            message: task.error.message,
+            hint: task.error.hint,
+            path: task.error.path,
+          });
+        }
 
-    if (artifactPath !== null) {
-      await writeTaskArtifact(repoRoot, artifactPath, task.value.task.prompt);
-    }
+        if (artifactPath !== null) {
+          await writeTaskArtifact(repoRoot, artifactPath, task.value.task.prompt);
+        }
 
-    return {
-      ...task.value,
-      source: {
-        ...task.value.source,
-        status: queue.status,
-      },
-      queue,
-      git: {
-        enabled: git.enabled,
-        branch_name: git.branchName,
-        recommended_command: git.recommendedCommand,
-        created: git.created,
-      },
-    };
-  } catch (error) {
-    if (rollbackSnapshot !== null && queue.previous_status !== null) {
-      await restoreIngestState(repoRoot, rollbackSnapshot);
-    }
+        return {
+          ...task.value,
+          source: {
+            ...task.value.source,
+            status: queue.status,
+          },
+          queue,
+          git: {
+            enabled: git.enabled,
+            branch_name: git.branchName,
+            recommended_command: git.recommendedCommand,
+            created: git.created,
+          },
+        };
+      } catch (error) {
+        if (rollbackSnapshot !== null && queue.previous_status !== null) {
+          await restoreIngestState(repoRoot, rollbackSnapshot);
+        }
 
-    throw error;
-  }
+        throw error;
+      }
+    },
+  );
 }
 
 async function validateTaskArtifactWriteTarget(repoRoot: string, artifactPath: string): Promise<void> {
@@ -679,7 +797,20 @@ function ensureIngestTaskCanStart(task: IngestTask): void {
   });
 }
 
+async function executeValidationIngest(repoRoot: string, sourceId: string): Promise<IngestValidationData> {
+  const canonicalArtifact = await readRequiredIngestArtifact(repoRoot, sourceId);
+  return withIngestLock(
+    repoRoot,
+    { label: `validate-ingest:${sourceId}` },
+    async () => {
+      await revalidateCanonicalIngestArtifact(repoRoot, sourceId, canonicalArtifact);
+      return validateAndCompleteIngest(repoRoot, sourceId);
+    },
+  );
+}
+
 async function validateAndCompleteIngest(repoRoot: string, sourceId: string): Promise<IngestValidationData> {
+  await readRequiredIngestArtifact(repoRoot, sourceId);
   const validation = await validateIngestReadiness(repoRoot, sourceId);
   if (!validation.passed) {
     throw new IngestValidationFailedError(validation.issues);
@@ -891,9 +1022,20 @@ function localAgentExecutionRuntimeError(error: LocalAgentExecutionError): Runti
 }
 
 function agentIngestCommand(sourceId: string, agentName: string, rawOptions: RawIngestOptions): string {
-  return rawOptions.auto === true
-    ? `llm-wiki ingest ${sourceId} --auto`
-    : `llm-wiki ingest ${sourceId} --agent ${agentName}`;
+  const parts = rawOptions.auto === true
+    ? ["llm-wiki", "ingest", sourceId, "--auto"]
+    : ["llm-wiki", "ingest", sourceId, "--agent", agentName];
+  if (typeof rawOptions.pdfModel === "string") parts.push("--pdf-model", rawOptions.pdfModel);
+  if (typeof rawOptions.pdfReasoningEffort === "string") {
+    parts.push("--pdf-reasoning-effort", rawOptions.pdfReasoningEffort);
+  }
+  if (typeof rawOptions.pdfDetail === "string") parts.push("--pdf-detail", rawOptions.pdfDetail);
+  if (rawOptions.force === true) parts.push("--force");
+  return parts.map(commandArgument).join(" ");
+}
+
+function commandArgument(value: string): string {
+  return /^[A-Za-z0-9_./:@+-]+$/u.test(value) ? value : JSON.stringify(value);
 }
 
 async function resolveProviderConfig(repoRoot: string, providerName: string): Promise<HttpProviderConfig> {

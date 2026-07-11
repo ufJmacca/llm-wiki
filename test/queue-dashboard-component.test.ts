@@ -340,6 +340,65 @@ describe("LlmWikiQueueDashboard generated component", () => {
     });
   });
 
+  it("renders content-free PDF extraction health, provenance, and retry guidance", async () => {
+    await withTempWorkspace("llm-wiki-queue-dashboard-pdf-status-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await mkdir(wikiDir, { recursive: true });
+      await initializeQuartzRuntime(wikiDir);
+      const component = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiQueueDashboard.tsx");
+
+      // Act
+      const dashboard = await renderGeneratedDashboard(component, {
+        llm_wiki_queue_total: 1,
+        llm_wiki_queue_queued: 1,
+        llm_wiki_queue_ingesting: 0,
+        llm_wiki_queue_blocked: 0,
+        llm_wiki_queue_completed: 0,
+        llm_wiki_queue_items: [
+          {
+            title: "PDF Research",
+            source_id: "src_2026_06_23_pdf",
+            source_kind: "file",
+            queue_status: "queued",
+            visibility: "private",
+            source_card_path: "raw/inputs/2026/06/pdf/_source.md",
+            source_card_materialized: true,
+            queue_path: "raw/queue/src_2026_06_23_pdf.json",
+            pdf_extraction: {
+              extraction_status: "failed",
+              artifact_health: "missing",
+              extraction_id: "pdfext_ui_failure",
+              artifact_path: "raw/inputs/private/extracted/pdf/pdfext_ui_failure/document.md",
+              plugin_descriptor: "openai-pdf@1.2.3",
+              model_descriptor: "explicit:gpt-5.2",
+              reasoning_effort: "medium",
+              pdf_detail: "high",
+              reusable: false,
+              diagnosis_code: "PDF_ARTIFACT_REQUIRED",
+              diagnosis_message: "No validated artifact is selected.",
+              retry_command: "llm-wiki extract pdf src_2026_06_23_pdf",
+              artifact_content: "PRIVATE EXTRACTED PDF BODY",
+            },
+          },
+        ],
+      });
+      const text = renderText(dashboard);
+      const cells = tableRowCells(tableBodyRows(dashboard)[0]);
+
+      // Assert
+      expect(cells[5]).toContain("Status: failed");
+      expect(cells[5]).toContain("Artifact health: missing");
+      expect(cells[5]).toContain("Extraction ID: pdfext_ui_failure");
+      expect(cells[5]).toContain("Artifact path: raw/inputs/private/extracted/pdf/pdfext_ui_failure/document.md");
+      expect(cells[5]).toContain("Diagnosis: PDF_ARTIFACT_REQUIRED: No validated artifact is selected.");
+      expect(cells[5]).toContain("openai-pdf@1.2.3");
+      expect(cells[5]).toContain("explicit:gpt-5.2");
+      expect(cells[5]).toContain("llm-wiki extract pdf src_2026_06_23_pdf");
+      expect(text).not.toContain("PRIVATE EXTRACTED PDF BODY");
+    });
+  });
+
   it("renders unavailable source card paths without internal links", async () => {
     await withTempWorkspace("llm-wiki-queue-dashboard-unavailable-source-card-", async (workspaceDir) => {
       // Arrange

@@ -1,6 +1,10 @@
 import { runLocalAgentInTemporaryWorkspace } from "../agents/index.js";
 import { buildIngestTask } from "../agentTasks/ingest.js";
 import {
+  revalidateCanonicalIngestArtifact,
+  type CanonicalIngestArtifact,
+} from "./artifact.js";
+import {
   applyProposalsWithValidation,
   createIngestProposalPolicy,
   normalizeFileProposals,
@@ -15,6 +19,7 @@ export type RunLocalAgentIngestCoreInput<Completion = void> = {
   repoRoot: string;
   sourceId: string;
   agent: LocalAgentConfig;
+  canonicalArtifact?: CanonicalIngestArtifact | null;
   completeAppliedIngest?: () => Promise<Completion>;
 };
 
@@ -46,6 +51,7 @@ export async function runLocalAgentIngestCore<Completion = void>(
     repoRoot: input.repoRoot,
     sourceId: input.sourceId,
     promptMode: "local-agent",
+    canonicalArtifact: input.canonicalArtifact,
   });
   if (!task.ok) {
     throw new RuntimeCommandError({
@@ -70,6 +76,11 @@ export async function runLocalAgentIngestCore<Completion = void>(
     result.proposals,
     AGENT_INGEST_PROPOSAL_POLICY,
     async (tempRepoRoot) => {
+      await revalidateCanonicalIngestArtifact(
+        tempRepoRoot,
+        input.sourceId,
+        input.canonicalArtifact ?? null,
+      );
       await assertIngestReadiness(tempRepoRoot, input.sourceId, {
         currentAttemptPaths,
       });
@@ -82,6 +93,11 @@ export async function runLocalAgentIngestCore<Completion = void>(
     result.proposals,
     AGENT_INGEST_PROPOSAL_POLICY,
     async () => {
+      await revalidateCanonicalIngestArtifact(
+        input.repoRoot,
+        input.sourceId,
+        input.canonicalArtifact ?? null,
+      );
       await assertIngestReadiness(input.repoRoot, input.sourceId, {
         changedFilesBaseline,
         currentAttemptPaths,

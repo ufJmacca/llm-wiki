@@ -9,6 +9,7 @@ import { registerAddTextCommand } from "./commands/addText.js";
 import { registerAddUrlCommand } from "./commands/addUrl.js";
 import { registerDeployCommand } from "./commands/deploy.js";
 import { registerExploreCommand } from "./commands/explore.js";
+import { registerExtractCommand } from "./commands/extract.js";
 import { registerIngestCommand } from "./commands/ingest.js";
 import { registerIndexCommand } from "./commands/index.js";
 import { registerInitCommand } from "./commands/init.js";
@@ -85,6 +86,7 @@ function createProgram(io: CliIo): Command {
   registerAddUrlCommand(program, io);
   registerDeployCommand(program, io);
   registerExploreCommand(program, io);
+  registerExtractCommand(program, io);
   registerIngestCommand(program, io);
   registerLintCommand(program, io);
   registerIndexCommand(program, io);

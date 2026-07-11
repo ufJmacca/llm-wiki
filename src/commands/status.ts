@@ -1,6 +1,8 @@
 import { CommanderError, type Command } from "commander";
 
 import type { CliIo } from "../cli.js";
+import { PDF_STATUS_HELP } from "../pdf/cli.js";
+import { formatHumanPdfSourceStatus } from "../pdf/status.js";
 import {
   addRuntimeOptions,
   runRuntimeCommand,
@@ -13,7 +15,8 @@ export function registerStatusCommand(program: Command, io: CliIo): void {
   addRuntimeOptions(
     program
       .command("status")
-      .description("Report runtime readiness for an existing LLM Wiki workspace"),
+      .description("Report runtime readiness for an existing LLM Wiki workspace")
+      .addHelpText("after", PDF_STATUS_HELP),
   ).action(async (rawOptions: RawRuntimeCommandOptions) => {
     await runRuntimeCommand({
       command: "status",
@@ -79,13 +82,45 @@ function formatHumanStatus(repo: string, data: StatusData): string {
     ...formatCodexAvailabilityLines(data),
     `HTTP providers: ${formatNamedCount(data.providers.count, data.providers.names)}`,
     `--auto: ${formatAutoReadiness(data)}`,
+    ...formatPdfReadinessLines(data),
     `Health: ${data.health.state}`,
     `Lint: ${data.lint.counts.error} errors, ${data.lint.counts.warning} warnings`,
     `Queue: ${data.queue.counts.total} total, ${data.queue.counts.queued} queued, ${data.queue.counts.ingesting} ingesting, ${data.queue.counts.ingested} ingested, ${data.queue.counts.blocked} blocked`,
+    ...data.queue.items.flatMap((item) => item.pdf_extraction === undefined
+      ? []
+      : [
+          `PDF source: ${item.source_id}`,
+          `Queue status: ${item.status}`,
+          ...formatHumanPdfSourceStatus(item.pdf_extraction),
+        ]),
     `Git: ${formatGitStatus(data)}`,
     `Profiles: ${data.profiles.valid}/${data.profiles.total} valid`,
     `Explorer: ${data.explorer.ready ? "ready" : data.explorer.initialized ? "initialized" : "not initialized"}`,
   ].join("\n");
+}
+
+function formatPdfReadinessLines(data: StatusData): string[] {
+  const pdf = data.pdf_ingestion;
+  const lines = [
+    `PDF ingestion config: ${pdf.config_valid ? "valid" : "invalid"}`,
+    `PDF Codex agent: ${pdf.codex_agent}`,
+    `PDF required plugin: ${pdf.required_plugin}`,
+    `PDF plugin installed: ${formatOptionalBoolean(pdf.plugin_installed)}`,
+    `PDF plugin enabled: ${formatOptionalBoolean(pdf.plugin_enabled)}`,
+    `PDF plugin version: ${pdf.plugin_version ?? "unknown"}`,
+    `PDF plugin descriptor: ${pdf.plugin_descriptor ?? "unresolved (not reusable)"}`,
+    `PDF extraction readiness: ${pdf.ready ? "ready" : "not ready"}`,
+  ];
+
+  for (const issue of pdf.issues) {
+    lines.push(`PDF readiness issue: ${issue.code}: ${issue.message}`);
+  }
+
+  return lines;
+}
+
+function formatOptionalBoolean(value: boolean | null): string {
+  return value === null ? "unknown" : value ? "yes" : "no";
 }
 
 function formatConfigErrorLines(data: StatusData): string[] {

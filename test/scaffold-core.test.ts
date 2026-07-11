@@ -106,6 +106,9 @@ describe("core wiki scaffold templates", () => {
     expect(agents).toContain("Maintain this repo as a persistent, compounding LLM Wiki.");
     expect(agents).toContain("Never modify files under `raw/inputs/**/original.*`.");
     expect(agents).toContain("Write and update curated Markdown pages under `curated/`.");
+    expect(agents).toContain(
+      "Link targets must be repo-root-relative. For curated pages, include the `curated/` prefix",
+    );
     expect(agents).toContain("Update `curated/index.md` after every ingest.");
     expect(agents).toContain("Append to `curated/log.md` after every ingest, query save, or lint pass.");
     expect(agents).toContain("Preserve provenance through `source_ids`.");

@@ -916,6 +916,7 @@ Maintain this repo as a persistent, compounding LLM Wiki.
 2. Treat raw inputs as source of truth.
 3. Write and update curated Markdown pages under `curated/`.
 4. Use Obsidian wikilinks.
+   - Link targets must be repo-root-relative. For curated pages, include the `curated/` prefix, for example `[[curated/topics/example|Example]]`.
 5. Preserve provenance through `source_ids`.
 6. Update `curated/index.md` after every ingest.
 7. Append to `curated/log.md` after every ingest, query save, or lint pass.

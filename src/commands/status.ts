@@ -1,6 +1,7 @@
 import { CommanderError, type Command } from "commander";
 
 import type { CliIo } from "../cli.js";
+import { formatHumanPdfSourceStatus } from "../pdf/status.js";
 import {
   addRuntimeOptions,
   runRuntimeCommand,
@@ -83,6 +84,13 @@ function formatHumanStatus(repo: string, data: StatusData): string {
     `Health: ${data.health.state}`,
     `Lint: ${data.lint.counts.error} errors, ${data.lint.counts.warning} warnings`,
     `Queue: ${data.queue.counts.total} total, ${data.queue.counts.queued} queued, ${data.queue.counts.ingesting} ingesting, ${data.queue.counts.ingested} ingested, ${data.queue.counts.blocked} blocked`,
+    ...data.queue.items.flatMap((item) => item.pdf_extraction === undefined
+      ? []
+      : [
+          `PDF source: ${item.source_id}`,
+          `Queue status: ${item.status}`,
+          ...formatHumanPdfSourceStatus(item.pdf_extraction),
+        ]),
     `Git: ${formatGitStatus(data)}`,
     `Profiles: ${data.profiles.valid}/${data.profiles.total} valid`,
     `Explorer: ${data.explorer.ready ? "ready" : data.explorer.initialized ? "initialized" : "not initialized"}`,

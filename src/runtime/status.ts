@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { checkLocalAgentAvailability, type LocalAgentAvailabilityError } from "../agents/index.js";
 import { lintWiki, type LintResult } from "../lint/index.js";
 import { getPdfReadinessStatus, type PdfReadinessStatus } from "../pdf/readiness.js";
+import { readPdfRepositoryStatuses, type PdfSourceStatus } from "../pdf/status.js";
 import { scanWikiRepository, type RepoScan } from "../scanner/repo.js";
 import { readGitState, type GitState } from "../utils/git.js";
 import {
@@ -73,7 +74,9 @@ export type StatusData = {
   };
   queue: {
     counts: QueueListResult["counts"];
-    items: Array<Pick<QueueListItem, "source_id" | "title" | "kind" | "status" | "visibility" | "queue_path" | "source_card_path">>;
+    items: Array<Pick<QueueListItem, "source_id" | "title" | "kind" | "status" | "visibility" | "queue_path" | "source_card_path"> & {
+      pdf_extraction?: PdfSourceStatus;
+    }>;
     errors: Array<{
       code: string;
       message: string;
@@ -113,14 +116,20 @@ const EMPTY_QUEUE_COUNTS: QueueListResult["counts"] = {
 };
 
 export async function getWikiStatus(repoRoot: string): Promise<StatusData> {
-  const [configSummary, configReadiness, scan, lint, queue, explorer, pdfReadiness] = await Promise.all([
+  const [configSummary, configReadiness, scan, explorer, pdfReadiness] = await Promise.all([
     readWikiConfigSummary(repoRoot),
     readWikiStatusConfigReadiness(repoRoot),
     scanWikiRepository(repoRoot),
-    lintWiki(repoRoot),
-    readQueueStatus(repoRoot),
     readExplorerStatus(repoRoot),
     getPdfReadinessStatus(repoRoot),
+  ]);
+  const pdfStatuses = await readPdfRepositoryStatuses(repoRoot, {
+    checkCurrentPluginDescriptor: true,
+    currentPluginDescriptor: pdfReadiness.ready ? pdfReadiness.plugin_descriptor : null,
+  });
+  const [lint, queue] = await Promise.all([
+    lintWiki(repoRoot, {}, { pdfStatuses }),
+    readQueueStatus(repoRoot, pdfStatuses),
   ]);
   const config = summarizeConfig(configSummary);
   if (configSummary.ok && !pdfReadiness.config_valid && !config.errors.some((issue) => issue.message.includes("pdf_ingestion"))) {
@@ -299,7 +308,10 @@ function summarizeProfiles(scan: RepoScan): StatusData["profiles"] {
   };
 }
 
-async function readQueueStatus(repoRoot: string): Promise<StatusData["queue"]> {
+async function readQueueStatus(
+  repoRoot: string,
+  pdfStatuses: ReadonlyMap<string, PdfSourceStatus>,
+): Promise<StatusData["queue"]> {
   const queue = await listQueue(repoRoot);
   if (!queue.ok) {
     return {
@@ -318,15 +330,19 @@ async function readQueueStatus(repoRoot: string): Promise<StatusData["queue"]> {
 
   return {
     counts: queue.value.counts,
-    items: queue.value.items.map((item) => ({
-      source_id: item.source_id,
-      title: item.title,
-      kind: item.kind,
-      status: item.status,
-      visibility: item.visibility,
-      queue_path: item.queue_path,
-      source_card_path: item.source_card_path,
-    })),
+    items: queue.value.items.map((item) => {
+      const pdfStatus = pdfStatuses.get(item.source_id);
+      return {
+        source_id: item.source_id,
+        title: item.title,
+        kind: item.kind,
+        status: item.status,
+        visibility: item.visibility,
+        queue_path: item.queue_path,
+        source_card_path: item.source_card_path,
+        ...(pdfStatus === undefined ? {} : { pdf_extraction: pdfStatus }),
+      };
+    }),
     errors: [],
   };
 }

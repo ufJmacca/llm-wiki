@@ -139,6 +139,57 @@ describe("LlmWikiSourceBadge generated component", () => {
     });
   });
 
+  it("renders normalized PDF status without passing extracted content through the badge", async () => {
+    await withTempWorkspace("llm-wiki-source-badge-pdf-status-", async (workspaceDir) => {
+      // Arrange
+      const wikiDir = resolve(workspaceDir, "wiki");
+      await initializeWiki(wikiDir);
+      const document = new ComponentTestDocument();
+      appendSourceBadgeMarker(document);
+      appendJsonCodeBlock(document, [
+        {
+          source_id: "src-pdf-status",
+          title: "PDF Source",
+          source_kind: "file",
+          queue_status: "blocked",
+          visibility: "private",
+          source_card_path: "raw/inputs/pdf/_source.md",
+          pdf_extraction: {
+            extraction_status: "failed",
+            artifact_health: "missing",
+            extraction_id: "pdfext_ui_failure",
+            artifact_path: "raw/inputs/private/extracted/pdf/pdfext_ui_failure/document.md",
+            plugin_descriptor: "openai-pdf@1.2.3",
+            model_descriptor: "explicit:gpt-5.2",
+            reasoning_effort: "medium",
+            pdf_detail: "high",
+            diagnosis_code: "PDF_ARTIFACT_REQUIRED",
+            diagnosis_message: "No validated artifact is selected.",
+            retry_command: "llm-wiki extract pdf src-pdf-status",
+            artifact_content: "PRIVATE EXTRACTED PDF BODY",
+          },
+        },
+      ]);
+
+      // Act
+      await initializeQuartzRuntime(wikiDir);
+      const component = await readGeneratedFile(wikiDir, "quartz/components/LlmWikiSourceBadge.tsx");
+      const script = extractGeneratedClientScript(component, "sourceBadgeScript");
+      executeGeneratedClientScript(script, document);
+      const renderedBadge = document.article.querySelector("[data-llm-wiki-source-badge-list]");
+
+      // Assert
+      expect(renderedBadge?.textContent).toContain("PDF extractionfailed");
+      expect(renderedBadge?.textContent).toContain("PDF artifact healthmissing");
+      expect(renderedBadge?.textContent).toContain("PDF extraction IDpdfext_ui_failure");
+      expect(renderedBadge?.textContent).toContain("PDF artifact pathraw/inputs/private/extracted/pdf/pdfext_ui_failure/document.md");
+      expect(renderedBadge?.textContent).toContain("PDF provenanceopenai-pdf@1.2.3 · explicit:gpt-5.2");
+      expect(renderedBadge?.textContent).toContain("PDF retryllm-wiki extract pdf src-pdf-status");
+      expect(renderedBadge?.textContent).toContain("PDF diagnosisPDF_ARTIFACT_REQUIRED: No validated artifact is selected.");
+      expect(renderedBadge?.textContent).not.toContain("PRIVATE EXTRACTED PDF BODY");
+    });
+  });
+
   it("does not mutate pages without the source badge marker", async () => {
     await withTempWorkspace("llm-wiki-source-badge-unmarked-page-", async (workspaceDir) => {
       // Arrange

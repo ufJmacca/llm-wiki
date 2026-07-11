@@ -1,4 +1,5 @@
 import { collectLintIssues, type LintIssue, type LintResult } from "../lint/index.js";
+import type { PdfSourceStatus } from "../pdf/status.js";
 import { matchesFileProfile, selectMarkdownForProfile, type WikiProfile } from "../profiles/index.js";
 import type { RuntimeLogEntry } from "../scanner/index.js";
 import type { RepoMarkdownFile, RepoScan, SourceCard } from "../scanner/repo.js";
@@ -48,6 +49,7 @@ export type ReviewSourceBadgeData = {
   queue_path: string | null;
   original_path: string | null;
   page_path: string | null;
+  pdf_extraction?: PdfSourceStatus;
 };
 
 export type ReviewQueueItem = {
@@ -64,6 +66,7 @@ export type ReviewQueueItem = {
   captured_at: string | null;
   updated_at: string | null;
   source: ReviewSourceBadgeData;
+  pdf_extraction?: PdfSourceStatus;
 };
 
 export type ReviewQueueAutoIngestData = {
@@ -168,6 +171,7 @@ export type BuildReviewDataModelOptions = {
   lintResult?: LintResult;
   materializedMarkdownPaths?: ReadonlySet<string>;
   profile?: WikiProfile;
+  pdfStatuses?: ReadonlyMap<string, PdfSourceStatus>;
 };
 
 const CONTRADICTION_TAGS = new Set(["contradiction", "contradictions"]);
@@ -181,12 +185,12 @@ export function buildReviewDataModel(
   const lintIssues = options.lintResult?.issues ?? collectLintIssues(reviewScan, lintOptionsForProfile(options.profile));
   const visibilityLintIssues = options.lintResult?.issues ?? visibilityLintIssuesForProfile(scan, options.profile, lintIssues);
   const materializedMarkdownPaths = options.materializedMarkdownPaths ?? defaultMaterializedMarkdownPaths(options.profile);
-  const sourceBadgesById = buildSourceBadgeIndex(reviewScan);
+  const sourceBadgesById = buildSourceBadgeIndex(reviewScan, options.pdfStatuses);
 
   return {
     generated_at: generatedAt.toISOString(),
     profile: options.profile === undefined ? null : toProfileMetadata(options.profile),
-    queue: buildQueueData(reviewScan, materializedMarkdownPaths, sourceBadgesById),
+    queue: buildQueueData(reviewScan, materializedMarkdownPaths, sourceBadgesById, options.pdfStatuses),
     recent_ingests: category(buildRecentIngestItems(reviewScan, sourceBadgesById)),
     needs_review: category(buildNeedsReviewItems(reviewScan, sourceBadgesById)),
     contradictions: category(buildContradictionItems(reviewScan, sourceBadgesById)),
@@ -267,6 +271,7 @@ function buildQueueData(
   scan: RepoScan,
   materializedMarkdownPaths: ReadonlySet<string> | undefined,
   sourceBadgesById: ReadonlyMap<string, ReviewSourceBadgeData>,
+  pdfStatuses: ReadonlyMap<string, PdfSourceStatus> | undefined,
 ): ReviewQueueData {
   const sourceCardsById = new Map(
     scan.sourceCards.flatMap((card) => (card.source_id === null ? [] : [[card.source_id, card] as const])),
@@ -290,6 +295,7 @@ function buildQueueData(
         original_path: stringValue(queueFile.item.original_path),
         captured_at: stringValue(card?.scan.frontmatter?.captured_at) ?? stringValue(queueFile.item.captured_at),
         updated_at: stringValue(card?.scan.frontmatter?.updated_at) ?? stringValue(queueFile.item.updated_at),
+        ...pdfStatusField(pdfStatuses?.get(queueFile.item.source_id)),
         source,
       };
     })
@@ -644,7 +650,10 @@ function sourceCardsByIdMap(scan: RepoScan): Map<string, SourceCard> {
   return new Map(scan.sourceCards.flatMap((card) => (card.source_id === null ? [] : [[card.source_id, card] as const])));
 }
 
-function buildSourceBadgeIndex(scan: RepoScan): Map<string, ReviewSourceBadgeData> {
+function buildSourceBadgeIndex(
+  scan: RepoScan,
+  pdfStatuses: ReadonlyMap<string, PdfSourceStatus> | undefined,
+): Map<string, ReviewSourceBadgeData> {
   const sourceCardsById = sourceCardsByIdMap(scan);
   const queueItemsById = new Map(scan.queueItems.map((queueFile) => [queueFile.item.source_id, queueFile]));
   const sourceIds = new Set([...sourceCardsById.keys(), ...queueItemsById.keys()]);
@@ -654,13 +663,23 @@ function buildSourceBadgeIndex(scan: RepoScan): Map<string, ReviewSourceBadgeDat
     const card = sourceCardsById.get(sourceId);
     const queueFile = queueItemsById.get(sourceId);
     if (queueFile !== undefined) {
-      badges.set(sourceId, sourceBadgeFromQueueItem(queueFile, card));
+      badges.set(sourceId, {
+        ...sourceBadgeFromQueueItem(queueFile, card),
+        ...pdfStatusField(pdfStatuses?.get(sourceId)),
+      });
     } else if (card !== undefined) {
-      badges.set(sourceId, sourceBadgeFromCard(card));
+      badges.set(sourceId, {
+        ...sourceBadgeFromCard(card),
+        ...pdfStatusField(pdfStatuses?.get(sourceId)),
+      });
     }
   }
 
   return badges;
+}
+
+function pdfStatusField(status: PdfSourceStatus | undefined): { pdf_extraction?: PdfSourceStatus } {
+  return status === undefined ? {} : { pdf_extraction: status };
 }
 
 function sourceBadgeFromQueueItem(

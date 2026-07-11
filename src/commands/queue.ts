@@ -17,6 +17,12 @@ import {
   type RawPdfExtractionOptions,
 } from "../pdf/cli.js";
 import { readPdfIngestionConfig, resolvePdfExtractionSettings } from "../pdf/config.js";
+import {
+  formatHumanPdfSourceStatus,
+  readPdfRepositoryStatuses,
+  readPdfSourceStatus,
+  type PdfSourceStatus,
+} from "../pdf/status.js";
 import { addRuntimeOptions, runRuntimeCommand, type RawRuntimeCommandOptions } from "../runtime/command.js";
 import {
   buildRuntimeCommandFailureEnvelope,
@@ -37,6 +43,12 @@ import { resolveWikiRoot } from "../runtime/repo.js";
 type QueueIngestData = Omit<AutoIngestBatchResult, "agent"> & {
   agent: string | null;
 };
+
+type QueueListWithPdfStatus = Omit<QueueListResult, "items"> & {
+  items: Array<QueueListResult["items"][number] & { pdf_extraction?: PdfSourceStatus }>;
+};
+
+type QueueShowWithPdfStatus = QueueShowResult & { pdf_extraction?: PdfSourceStatus };
 
 type RawQueueCommandOptions = RawRuntimeCommandOptions & RawPdfExtractionOptions & {
   auto?: unknown;
@@ -89,9 +101,7 @@ export function registerQueueCommand(program: Command, io: CliIo): void {
             throwQueueCommandError(io, "queue", repo.rootDir, queue.error, runtimeOptions.json === true);
           }
 
-          return {
-            data: queue.value,
-          };
+          return { data: await queueListWithPdfStatus(repo.rootDir, queue.value) };
         },
         formatHuman: (envelope) => formatHumanQueueList(envelope.data),
       });
@@ -113,8 +123,12 @@ export function registerQueueCommand(program: Command, io: CliIo): void {
             throwQueueCommandError(io, "queue show", repo.rootDir, queueItem.error, runtimeOptions.json === true);
           }
 
+          const pdfStatus = await readPdfSourceStatus(repo.rootDir, sourceId);
           return {
-            data: queueItem.value,
+            data: {
+              ...queueItem.value,
+              ...(pdfStatus === null ? {} : { pdf_extraction: pdfStatus }),
+            },
           };
         },
         formatHuman: (envelope) => formatHumanQueueShow(envelope.data),
@@ -650,7 +664,7 @@ function queueIngestIssues(data: QueueIngestData): RuntimeIssue[] {
     });
 }
 
-function formatHumanQueueList(data: QueueListResult): string {
+function formatHumanQueueList(data: QueueListWithPdfStatus): string {
   if (data.items.length === 0) {
     return "Queue items: 0";
   }
@@ -665,29 +679,50 @@ function formatHumanQueueList(data: QueueListResult): string {
       "",
       `${item.source_id} | ${item.title}`,
       `Kind: ${item.source_kind}`,
-      `Status: ${item.status}`,
+      `Queue status: ${item.status}`,
       `Visibility: ${item.visibility}`,
       `Updated: ${item.updated_at}`,
       `Source card: ${item.source_card_path}`,
       `Queue: ${item.queue_path}`,
       `Original: ${item.original_path}`,
     );
+    const pdf = item.pdf_extraction;
+    if (pdf !== undefined) lines.push(...formatHumanPdfSourceStatus(pdf));
   }
 
   return lines.join("\n");
 }
 
-function formatHumanQueueShow(data: QueueShowResult): string {
-  return [
+function formatHumanQueueShow(data: QueueShowWithPdfStatus): string {
+  const lines = [
     `Source ID: ${data.queue_record.source_id}`,
     `Title: ${data.queue_record.title}`,
     `Kind: ${data.queue_record.source_kind}`,
-    `Status: ${data.queue_record.status}`,
+    `Queue status: ${data.queue_record.status}`,
     `Visibility: ${data.queue_record.visibility}`,
     `Queue: ${data.queue_record.queue_path}`,
     `Source card: ${data.source_card.path}`,
     `Original: ${data.queue_record.original_path}`,
-  ].join("\n");
+  ];
+  if (data.pdf_extraction !== undefined) lines.push(...formatHumanPdfSourceStatus(data.pdf_extraction));
+  return lines.join("\n");
+}
+
+async function queueListWithPdfStatus(
+  repoRoot: string,
+  data: QueueListResult,
+): Promise<QueueListWithPdfStatus> {
+  const statuses = await readPdfRepositoryStatuses(repoRoot);
+  return {
+    ...data,
+    items: data.items.map((item) => {
+      const pdfStatus = statuses.get(item.source_id);
+      return {
+        ...item,
+        ...(pdfStatus === undefined ? {} : { pdf_extraction: pdfStatus }),
+      };
+    }),
+  };
 }
 
 function formatHumanQueueSetStatus(data: QueueSetStatusResult): string {

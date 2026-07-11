@@ -811,7 +811,10 @@ describe("explore sync command", () => {
       expect(profileSummary).toContain("| Raw source cards | 4 |");
       expect(sourceQueue).toContain("| Total | 4 |");
       expect(sourceQueue).toContain(`| ${ingested.sourceId} | Sync Ingested | ingested | text | private | ${ingested.sourceCardPath} | ${ingested.queuePath} | ingested | ${ingested.originalPath} |`);
-      expect(sourceQueue).toContain(`| ${blocked.sourceId} | Sync Blocked | blocked | url | public | ${blocked.sourceCardPath} | ${blocked.queuePath} | blocked - INGEST_VALIDATION_FAILED: ${safeBlockedAutoIngest.last_error_message} | ${blocked.originalPath} |`);
+      const escapedBlockedMessage = safeBlockedAutoIngest.last_error_message
+        .replaceAll("[", "\\[")
+        .replaceAll("]", "\\]");
+      expect(sourceQueue).toContain(`| ${blocked.sourceId} | Sync Blocked | blocked | url | public | ${blocked.sourceCardPath} | ${blocked.queuePath} | blocked - INGEST_VALIDATION_FAILED: ${escapedBlockedMessage} | ${blocked.originalPath} |`);
       expect(JSON.stringify(sourceQueueFrontmatter)).toContain("[raw upload content redacted]");
       expect(sourceQueue).toContain("[raw upload content redacted]");
       expect(JSON.stringify(sourceQueueFrontmatter)).not.toContain("PRIVATE RAW UPLOAD BODY");

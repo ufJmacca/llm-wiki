@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 
@@ -11,6 +12,10 @@ export type StaticLeakCode =
   | "STATIC_DAEMON_METADATA_LEAK"
   | "STATIC_UPLOAD_ENDPOINT_CONFIG_LEAK"
   | "STATIC_UPLOAD_AUTH_LEAK"
+  | "STATIC_PDF_ORIGINAL_LEAK"
+  | "STATIC_PDF_DOCUMENT_LEAK"
+  | "STATIC_PDF_METADATA_LEAK"
+  | "STATIC_PDF_STATE_LEAK"
   | "STATIC_RAW_INPUTS_LEAK"
   | "STATIC_RAW_QUEUE_LEAK"
   | "STATIC_AUTO_INGEST_METADATA_LEAK"
@@ -46,6 +51,10 @@ type MarkerMatch = {
 type MarkerRule = {
   code: Exclude<StaticLeakCode, "STATIC_SCAN_TARGET_UNSAFE">;
   pattern: RegExp;
+};
+
+type PrivatePdfFingerprints = {
+  documentHashes: ReadonlySet<string>;
 };
 
 const DEFAULT_STATIC_SCAN_ROOTS = ["quartz/content", "quartz/public"] as const;
@@ -101,6 +110,9 @@ const UPLOAD_ENDPOINT_CONFIG_PATTERN =
   /\bllm_wiki_upload_endpoint\b|\bupload_endpoint\b|\bupload_base_url\b|\bremote_upload_endpoint\b|\bendpoint_config\b/iu;
 const UPLOAD_ENDPOINT_PATTERN = /\/api\/raw-upload\b/iu;
 const DAEMON_METADATA_PATTERN = /\bllm_wiki_daemon\b|\blocal_daemon\b|\bdaemon_url\b|\blocal-daemon\b/iu;
+const PDF_SIGNATURE = Buffer.from("%PDF-", "ascii");
+const PDF_METADATA_FIELDS = ["extraction_id", "artifact_path", "plugin"] as const;
+const PDF_STATE_PATTERN = /\bpdf_extraction(?:_status)?\b/iu;
 
 export async function scanStaticOutputLeaks(
   repoRoot: string,
@@ -109,6 +121,7 @@ export async function scanStaticOutputLeaks(
   const roots = options.roots ?? DEFAULT_STATIC_SCAN_ROOTS;
   const scannedRoots: string[] = [];
   const findings: StaticLeakFinding[] = [];
+  const privatePdfFingerprints = await collectPrivatePdfFingerprints(repoRoot);
 
   for (const root of roots) {
     const targetSafety = await staticScanTargetSafety(repoRoot, root);
@@ -132,7 +145,7 @@ export async function scanStaticOutputLeaks(
     }
 
     scannedRoots.push(root);
-    await visitStaticOutputPath(repoRoot, root, findings);
+    await visitStaticOutputPath(repoRoot, root, findings, privatePdfFingerprints);
   }
 
   const sortedFindings = sortFindings(findings);
@@ -143,7 +156,12 @@ export async function scanStaticOutputLeaks(
   };
 }
 
-async function visitStaticOutputPath(repoRoot: string, path: string, findings: StaticLeakFinding[]): Promise<void> {
+async function visitStaticOutputPath(
+  repoRoot: string,
+  path: string,
+  findings: StaticLeakFinding[],
+  privatePdfFingerprints: PrivatePdfFingerprints,
+): Promise<void> {
   const entries = await readdir(resolve(repoRoot, path));
   for (const entry of entries.sort()) {
     const childPath = `${path}/${entry}`;
@@ -158,7 +176,7 @@ async function visitStaticOutputPath(repoRoot: string, path: string, findings: S
     }
 
     if (childState.isDirectory()) {
-      await visitStaticOutputPath(repoRoot, childPath, findings);
+      await visitStaticOutputPath(repoRoot, childPath, findings, privatePdfFingerprints);
       continue;
     }
 
@@ -167,11 +185,21 @@ async function visitStaticOutputPath(repoRoot: string, path: string, findings: S
       continue;
     }
 
-    findings.push(...scanStaticFile(pathFromRoot(repoRoot, resolve(repoRoot, childPath)), await readFile(resolve(repoRoot, childPath))));
+    findings.push(
+      ...scanStaticFile(
+        pathFromRoot(repoRoot, resolve(repoRoot, childPath)),
+        await readFile(resolve(repoRoot, childPath)),
+        privatePdfFingerprints,
+      ),
+    );
   }
 }
 
-function scanStaticFile(path: string, content: Buffer): StaticLeakFinding[] {
+function scanStaticFile(
+  path: string,
+  content: Buffer,
+  privatePdfFingerprints: PrivatePdfFingerprints,
+): StaticLeakFinding[] {
   const text = content.toString("utf8");
   const matches: MarkerMatch[] = [];
 
@@ -193,6 +221,23 @@ function scanStaticFile(path: string, content: Buffer): StaticLeakFinding[] {
 
   if (isRawQueuePath(path)) {
     matches.push({ code: "STATIC_RAW_QUEUE_LEAK", line: 1 });
+  }
+
+  if (hasPdfSignature(content)) {
+    matches.push({ code: "STATIC_PDF_ORIGINAL_LEAK", line: 1 });
+  }
+
+  if (isPdfDocumentArtifactPath(path) || privatePdfFingerprints.documentHashes.has(contentHash(content))) {
+    matches.push({ code: "STATIC_PDF_DOCUMENT_LEAK", line: 1 });
+  }
+
+  if (isPdfMetadataArtifactPath(path) || hasPdfMetadataShape(text)) {
+    matches.push({ code: "STATIC_PDF_METADATA_LEAK", line: firstPdfMetadataLine(text) ?? 1 });
+  }
+
+  const pdfStateLine = firstMatchLine(text, PDF_STATE_PATTERN);
+  if (pdfStateLine !== null) {
+    matches.push({ code: "STATIC_PDF_STATE_LEAK", line: pdfStateLine });
   }
 
   const endpointConfigLine = firstMatchLine(text, UPLOAD_ENDPOINT_CONFIG_PATTERN);
@@ -238,6 +283,66 @@ function isRawInputsPath(path: string): boolean {
 
 function isRawQueuePath(path: string): boolean {
   return /(^|\/)raw\/queue(?:\/|$)/u.test(path);
+}
+
+function isPdfDocumentArtifactPath(path: string): boolean {
+  return /(^|\/)extracted\/pdf\/[^/]+\/document\.md$/u.test(path);
+}
+
+function isPdfMetadataArtifactPath(path: string): boolean {
+  return /(^|\/)extracted\/pdf\/[^/]+\/metadata\.json$/u.test(path);
+}
+
+function hasPdfSignature(content: Buffer): boolean {
+  return content.subarray(0, Math.min(content.byteLength, 1024)).includes(PDF_SIGNATURE);
+}
+
+function hasPdfMetadataShape(content: string): boolean {
+  return PDF_METADATA_FIELDS.every((field) => new RegExp(`(?:^|[\\s{,])['\"]?${field}['\"]?\\s*[:=]`, "imu").test(content));
+}
+
+function firstPdfMetadataLine(content: string): number | null {
+  const lines = PDF_METADATA_FIELDS
+    .map((field) => firstMatchLine(content, new RegExp(`(?:^|[\\s{,])['\"]?${field}['\"]?\\s*[:=]`, "imu")))
+    .filter((line): line is number => line !== null);
+  return lines.length === 0 ? null : Math.min(...lines);
+}
+
+async function collectPrivatePdfFingerprints(repoRoot: string): Promise<PrivatePdfFingerprints> {
+  const documentHashes = new Set<string>();
+  await collectPrivatePdfDocumentHashes(repoRoot, "raw/inputs", documentHashes);
+  return { documentHashes };
+}
+
+async function collectPrivatePdfDocumentHashes(
+  repoRoot: string,
+  path: string,
+  documentHashes: Set<string>,
+): Promise<void> {
+  const state = await safeLstat(repoRoot, path);
+  if (state === null || state.isSymbolicLink()) {
+    return;
+  }
+
+  if (state.isFile()) {
+    if (isPdfDocumentArtifactPath(path)) {
+      documentHashes.add(contentHash(await readFile(resolve(repoRoot, path))));
+    }
+    return;
+  }
+
+  if (!state.isDirectory()) {
+    return;
+  }
+
+  const entries = await readdir(resolve(repoRoot, path));
+  for (const entry of entries.sort()) {
+    await collectPrivatePdfDocumentHashes(repoRoot, `${path}/${entry}`, documentHashes);
+  }
+}
+
+function contentHash(content: Buffer): string {
+  return createHash("sha256").update(content).digest("hex");
 }
 
 function uniqueMatches(matches: MarkerMatch[]): MarkerMatch[] {
@@ -296,6 +401,14 @@ function messageForCode(code: Exclude<StaticLeakCode, "STATIC_SCAN_TARGET_UNSAFE
       return "GitHub Pages static output contains upload endpoint configuration";
     case "STATIC_UPLOAD_AUTH_LEAK":
       return "GitHub Pages static output contains upload auth or signature markers";
+    case "STATIC_PDF_ORIGINAL_LEAK":
+      return "GitHub Pages static output contains an original PDF";
+    case "STATIC_PDF_DOCUMENT_LEAK":
+      return "GitHub Pages static output contains a private PDF document artifact";
+    case "STATIC_PDF_METADATA_LEAK":
+      return "GitHub Pages static output contains private PDF extraction metadata";
+    case "STATIC_PDF_STATE_LEAK":
+      return "GitHub Pages static output contains private PDF extraction state";
     case "STATIC_RAW_INPUTS_LEAK":
       return "GitHub Pages static output contains raw input path metadata";
     case "STATIC_RAW_QUEUE_LEAK":

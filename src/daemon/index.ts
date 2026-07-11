@@ -13,6 +13,7 @@ import {
   type AutoIngestSourceResult,
   type RunAutoIngestSourceInput,
 } from "../autoIngest/index.js";
+import { readPdfSourceStatus, type PdfSourceStatus } from "../pdf/status.js";
 import { RuntimeCommandError } from "../runtime/errors.js";
 import { INGEST_LOCK_RELATIVE_PATH, withIngestLock } from "../runtime/ingestLock.js";
 import { showQueueSource, type AutoIngestMetadata, type QueueStatus } from "../runtime/queue.js";
@@ -185,6 +186,7 @@ type UploadApiData = {
   message: string;
   commit: UploadCommitResult;
   auto_ingest?: AutoIngestSourceResult;
+  pdf_extraction?: PdfSourceStatus & { status: PdfSourceStatus["extraction_status"] };
 };
 
 type MultipartUpload = {
@@ -419,7 +421,7 @@ async function handleDaemonRequest(
     const statusCode = upload.value.capture.status === "added" ? 201 : 200;
     writeJson(response, statusCode, {
       ok: true,
-      data: toUploadApiData(upload.value.capture, upload.value.commit, upload.value.autoIngest),
+      data: await toUploadApiData(options.repoRoot, upload.value.capture, upload.value.commit, upload.value.autoIngest),
     });
   } catch (error) {
     const daemonError = error instanceof UploadDaemonError
@@ -1236,14 +1238,16 @@ async function commitUploadWithGit(request: UploadCommitRequest): Promise<Upload
   }
 }
 
-function toUploadApiData(
+async function toUploadApiData(
+  repoRoot: string,
   capture: SourceCaptureSuccess,
   commit: UploadCommitResult,
   autoIngest: AutoIngestSourceResult | undefined,
-): UploadApiData {
+): Promise<UploadApiData> {
   const safeAutoIngest = autoIngest === undefined
     ? undefined
     : safeUploadAutoIngestResult(autoIngest, capture.source.queue_path);
+  const pdfStatus = await readPdfSourceStatus(repoRoot, capture.source.source_id);
   return {
     status: capture.status,
     source_id: capture.source.source_id,
@@ -1259,6 +1263,9 @@ function toUploadApiData(
       ? "Raw source uploaded and queued for ingest."
       : "Raw source was already captured; no new artifacts were created.",
     commit,
+    ...(pdfStatus === null
+      ? {}
+      : { pdf_extraction: { ...pdfStatus, status: pdfStatus.extraction_status } }),
     ...(safeAutoIngest === undefined ? {} : { auto_ingest: safeAutoIngest }),
   };
 }

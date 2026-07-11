@@ -43,6 +43,12 @@ type UploadSuccessEnvelope = {
       ok: boolean;
     };
     auto_ingest?: AutoIngestSourceResult;
+    pdf_extraction?: {
+      status: string;
+      extraction_status: string;
+      artifact_health: string;
+      retry_command: string;
+    };
   };
 };
 
@@ -2553,6 +2559,12 @@ describe("local upload daemon", () => {
           message: "Raw source uploaded and queued for ingest.",
         });
         if (fileName.endsWith(".pdf")) {
+          expect(upload.body.data.pdf_extraction).toMatchObject({
+            status: "pending",
+            extraction_status: "pending",
+            artifact_health: "missing",
+            retry_command: `llm-wiki extract pdf ${upload.body.data.source_id}`,
+          });
           const queue = JSON.parse(await readGeneratedFile(wikiDir, upload.body.data.queue_path)) as {
             pdf_extraction: Record<string, unknown>;
           };

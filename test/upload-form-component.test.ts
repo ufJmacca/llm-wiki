@@ -290,6 +290,64 @@ describe("generated LlmWikiUploadForm component", () => {
     expect(detailValue(form.details, "Auto ingest")).toBe(scenario.expectedAutoCommand);
   });
 
+  it("presents final PDF extraction health and retry guidance without extracted content", async () => {
+    // Arrange
+    stubFetch(async (input) => {
+      if (String(input) === metadataPath) return jsonResponse(enabledMetadata());
+      return jsonResponse({
+        ok: true,
+        data: {
+          status: "added",
+          title: "Uploaded PDF",
+          source_id: "src_2026_06_24_pdf",
+          source_kind: "file",
+          queue_status: "queued",
+          auto_ingest: { pdf: { outcome: "failed" } },
+          pdf_extraction: {
+            extraction_status: "failed",
+            artifact_health: "missing",
+            extraction_id: "pdfext_ui_failure",
+            artifact_path: null,
+            plugin_descriptor: "openai-pdf@1.2.3",
+            model_descriptor: "explicit:gpt-5.2",
+            reasoning_effort: "medium",
+            pdf_detail: "high",
+            reusable: false,
+            diagnosis_code: "PDF_ARTIFACT_REQUIRED",
+            diagnosis_message: "No validated artifact is selected.",
+            last_error_code: "PDF_CODEX_EXTRACTION_FAILED",
+            last_error_message: "PDF extraction failed; inspect it locally.",
+            retry_command: "llm-wiki extract pdf src_2026_06_24_pdf",
+            artifact_content: "PRIVATE EXTRACTED PDF BODY",
+          },
+        },
+      }, 201);
+    });
+    const form = renderUploadForm();
+    await executeGeneratedUploadFormScript();
+    await waitFor(() => expect(form.status.textContent).toBe("Local upload daemon is ready."));
+    const file = new File(["%PDF-private"], "research.pdf", { type: "application/pdf" });
+    Object.defineProperty(form.fileInput, "files", { configurable: true, value: [file] });
+
+    // Act
+    submit(form);
+
+    // Assert
+    await waitFor(() => expect(form.status.textContent).toBe("Upload queued."));
+    expect(detailValue(form.details, "PDF extraction")).toBe("failed");
+    expect(detailValue(form.details, "PDF artifact health")).toBe("missing");
+    expect(detailValue(form.details, "PDF extraction outcome")).toBe("failed");
+    expect(detailValue(form.details, "PDF extraction ID")).toBe("pdfext_ui_failure");
+    expect(detailValue(form.details, "PDF provenance")).toBe(
+      "openai-pdf@1.2.3 · explicit:gpt-5.2 · reasoning=medium · detail=high",
+    );
+    expect(detailValue(form.details, "PDF reusable")).toBe("no");
+    expect(detailValue(form.details, "PDF diagnosis")).toBe("PDF_ARTIFACT_REQUIRED: No validated artifact is selected.");
+    expect(detailValue(form.details, "PDF last error")).toBe("PDF_CODEX_EXTRACTION_FAILED: PDF extraction failed; inspect it locally.");
+    expect(detailValue(form.details, "PDF retry")).toBe("llm-wiki extract pdf src_2026_06_24_pdf");
+    expect(form.details.textContent).not.toContain("PRIVATE EXTRACTED PDF BODY");
+  });
+
   it.each([
     {
       name: "ingested status alias",

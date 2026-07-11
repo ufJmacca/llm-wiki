@@ -250,6 +250,7 @@ describe("explore serve watcher target refresh", () => {
       const sourceCardDir = dirname(sourceCardPath);
       const safeErrorMessage =
         "Validation failed while checking source text: [raw upload content redacted] api_key=[redacted] token=[redacted]";
+      const safeTableErrorMessage = safeErrorMessage.replaceAll("[", "\\[").replaceAll("]", "\\]");
 
       // Act
       const serveResult = serveQuartzExplorer(wikiDir, {
@@ -310,7 +311,7 @@ describe("explore serve watcher target refresh", () => {
         (content) =>
           content.includes("| Blocked | 1 |") &&
           content.includes("Watcher Blocked Source") &&
-          content.includes(`blocked - INGEST_VALIDATION_FAILED: ${safeErrorMessage}`) &&
+          content.includes(`blocked - INGEST_VALIDATION_FAILED: ${safeTableErrorMessage}`) &&
           !content.includes("PRIVATE RAW UPLOAD BODY") &&
           !content.includes("sk-watch-leak") &&
           !content.includes("watch-upload-token"),

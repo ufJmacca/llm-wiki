@@ -14,6 +14,7 @@ import {
   addPdfExtractionOptions,
   hasPdfExtractionOptions,
   pdfOverridesFromRawOptions,
+  PDF_QUEUE_HELP,
   type RawPdfExtractionOptions,
 } from "../pdf/cli.js";
 import { readPdfIngestionConfig, resolvePdfExtractionSettings } from "../pdf/config.js";
@@ -75,7 +76,8 @@ export function registerQueueCommand(program: Command, io: CliIo): void {
       .option("--auto", "run queue ingest with the configured default local agent", false)
       .option("--limit <n>", "maximum number of queued sources to auto-ingest")
       .option("--source-id <source_id>", "specific source ID for queue ingest")
-      .option("--watch", "keep processing newly queued sources until interrupted", false),
+      .option("--watch", "keep processing newly queued sources until interrupted", false)
+      .addHelpText("after", PDF_QUEUE_HELP),
   ));
 
   queueCommand.action(async (

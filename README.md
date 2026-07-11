@@ -25,7 +25,8 @@ CI is defined in `.github/workflows/ci.yml`. It verifies the package itself and 
 - `src/commands/init.ts` owns the first supported `llm-wiki init` command behavior.
 - `src/commands/add.ts`, `src/commands/addText.ts`, and `src/commands/addUrl.ts` own source capture command behavior.
 - `src/commands/queue.ts` and `src/commands/log.ts` own queue inspection, status transitions, and parsed runtime log output.
-- `src/commands/ingest.ts` owns ingest task prompt generation, optional branch creation, local agent/provider execution, and validation-driven completion.
+- `src/commands/extract.ts` owns explicit private extraction commands; `src/pdf/` owns Codex PDF configuration, readiness, isolated execution, immutable runs, mirrored state, and normalized status.
+- `src/commands/ingest.ts` owns ingest task prompt generation, optional branch creation, local agent/provider execution, and validation-driven completion; `src/ingest/` owns the agent-neutral canonical-artifact boundary and shared ingest core.
 - `src/commands/query.ts` owns query task prompt generation, local agent/provider execution, and validation of durable saved question pages.
 - `src/commands/lint.ts` and `src/commands/index.ts` own executable lint checks and rebuildable cache generation.
 - `src/commands/search.ts` and `src/commands/nav.ts` own offline search and Markdown graph/navigation command behavior.
@@ -68,6 +69,8 @@ llm-wiki add-text --title "Pasted Note" --text "Captured text"
 llm-wiki add-url https://example.com/research-note --title "Fetched Note"
 llm-wiki queue
 llm-wiki queue show <source_id>
+llm-wiki extract pdf <source_id>
+llm-wiki extract pdf <source_id> --pdf-detail high --force
 llm-wiki queue ingest --auto
 llm-wiki queue ingest --auto --limit 5
 llm-wiki queue ingest --auto --source-id <source_id>
@@ -125,6 +128,8 @@ llm-wiki add-text --repo my-wiki --title "Pasted Note" --text "Captured text" --
 llm-wiki add-url https://example.com/research-note --repo my-wiki --title "Fetched Note" --json
 llm-wiki queue --repo my-wiki --json
 llm-wiki queue show <source_id> --repo my-wiki --json
+llm-wiki extract pdf <source_id> --repo my-wiki --json
+llm-wiki extract pdf <source_id> --repo my-wiki --pdf-detail high --force --json
 llm-wiki queue ingest --repo my-wiki --auto --json
 llm-wiki queue ingest --repo my-wiki --auto --limit 5 --json
 llm-wiki queue ingest --repo my-wiki --auto --source-id <source_id> --json
@@ -174,6 +179,58 @@ llm-wiki snapshot --repo my-wiki --json
 `snapshot` runs lint before touching Git. It refuses to commit while error-severity lint issues exist, and malformed or unreadable config fails with an actionable config error before Git preflight. When lint passes, it stages the repository, creates a `chore: snapshot llm-wiki state` commit, falls back to the built-in llm-wiki Git identity when local Git identity is missing, and reports the commit SHA plus post-commit Git state.
 
 `add`, `add-text`, `add-url`, and Explorer upload API responses return the captured source metadata, created paths, or duplicate source metadata. `queue`, `queue show`, `queue ingest`, `queue set-status`, and `log` return the queue records, source-card frontmatter, auto-ingest summaries, transition results, and parsed runtime log entries. `ingest` and `query` return generated manual task prompts, local agent/provider execution results, or validation results. `lint` returns stable issue records and exits non-zero for error-severity findings. `index rebuild` writes non-authoritative cache files under `.llm-wiki/cache/` from Markdown, queue, raw, and profile state. `search` and `nav` read live Markdown from disk and do not require Quartz, network access, or cache files. `explore init` writes isolated Quartz runtime files, `explore sync` materializes profile-selected Markdown into generated Quartz content, `explore serve` starts the local Quartz script after sync and can optionally start the local upload daemon, `explore open` prints the recorded local URL, and `explore build` runs public sync, strict public lint, and the Quartz build script. `deploy github-pages` generates the publisher-only Pages workflow/profile pair, validates deploy readiness, and runs the local build/check path used before committing `quartz/public`. The standalone daemon and remote upload scaffold commands are not part of the v1 public CLI.
+
+## Standalone Codex PDF ingestion experiment
+
+This bounded PDF path is implemented directly through Codex and does not invoke `ainative` for planning, execution, review, or commits. Other `ainative` files and workflows remain supported and unchanged. The experiment requires `pdf@openai-primary-runtime`; Codex installation, authentication, plugin installation, and plugin enablement are user-managed. There is no parser fallback.
+
+New Codex scaffolds make the repository settings explicit:
+
+```yaml
+pdf_ingestion:
+  codex_agent: codex
+  required_plugin: pdf@openai-primary-runtime
+  # model: optional-model-name
+  reasoning_effort: high
+  pdf_detail: high
+  timeout_seconds: 900
+  require_artifact_before_ingest: true
+```
+
+Setting resolution is command-line override, repository `pdf_ingestion` value, then documented default or inheritance. Omitting `--pdf-model` inherits the active Codex model and omits `--model` from the Codex invocation. If Codex has no supported read-only way to identify that inherited model before execution, the resulting artifact remains valid for immediate ingest but is not automatically reusable later.
+
+Codex readiness is checked without starting extraction. `llm-wiki status` reports configuration, executable, plugin installation/enabled state, version descriptor, and actionable issues. The supported read-only preflight is `codex plugin list --json`. If the executable is unavailable or plugin output is missing, disabled, or malformed, repair the user-managed Codex installation, authentication, or plugin state and retry; the CLI never installs, enables, upgrades, authenticates, or substitutes a parser.
+
+Extract, automate, and override settings with:
+
+```bash
+llm-wiki extract pdf <source_id>
+llm-wiki extract pdf <source_id> --pdf-model <model> --pdf-reasoning-effort <effort> --pdf-detail high --force
+llm-wiki ingest <source_id> --agent codex --pdf-detail high
+llm-wiki ingest <source_id> --auto --pdf-detail high
+llm-wiki queue ingest --auto --source-id <source_id> --pdf-detail high
+llm-wiki queue ingest --auto --limit 5 --pdf-detail high
+llm-wiki queue ingest --auto --watch --pdf-detail high
+```
+
+A matching validated run is reused when its source hash, stable plugin descriptor, stable model descriptor, reasoning effort, and PDF detail match. Changed identity settings or `--force` create a new immutable run; successful older runs are never rewritten. Timeout is operational and does not change reuse identity.
+
+Queue status and PDF extraction status are separate state machines. Queue status remains `queued | ingesting | ingested | blocked`; PDF extraction status is `pending | running | extracted | failed`. A newly captured PDF reports `pdf_extraction.status: pending`. Human and JSON status, queue, upload, and local review surfaces show the two statuses separately with content-free provenance, health diagnosis, and an exact retry command.
+
+Manual, validation, provider, and other-agent modes require an existing validated PDF artifact. They cannot start this Codex extraction path or bypass the artifact gate. Run `llm-wiki extract pdf <source_id>` first. If automated extraction fails, the PDF state becomes `failed` and the queue becomes `blocked`; resolve the readiness or extraction error, run `llm-wiki queue set-status <source_id> queued`, and retry automated ingest. Explicit extraction failures leave an already queued source queued.
+
+Successful runs contain exactly:
+
+```text
+raw/inputs/<yyyy>/<mm>/<source_id>/extracted/pdf/<extraction_id>/document.md
+raw/inputs/<yyyy>/<mm>/<source_id>/extracted/pdf/<extraction_id>/metadata.json
+```
+
+`document.md` is the one agent-authored, CLI-validated proposal. `metadata.json` is CLI-owned and records non-content provenance such as hashes, plugin/version, model selection/descriptor, reasoning effort, detail, and timestamps. Neither status nor upload responses include extracted document content, prompts, environment values, or sensitive process output. The upload-triggered auto-ingest reports whether extraction was reused, extracted, or failed while retaining the normal auto-ingest result.
+
+Original PDFs, `document.md`, `metadata.json`, queue state, and private review data are rejected from public output. Local/review Explorer pages may show private artifact paths and non-sensitive provenance, but they do not synchronize the canonical document as a curated page. Public profiles, strict lint, and built-output scanning fail closed on original, artifact, metadata, operational state, or review leaks.
+
+`src/ingest/artifact.ts` is the agent-neutral artifact boundary. Its `prepareAutomatedIngestArtifact` and `ensurePreparedIngestArtifactUnderLock` exports coordinate the PDF adapter with caller-owned locking while keeping proposal application, state synchronization, validation, and ingest orchestration agent-neutral. A future `ainative` workflow must call that boundary rather than duplicate Codex-specific extraction logic.
 
 ## Quartz Explorer
 
@@ -458,9 +515,9 @@ The scaffold is private by default.
 
 AGENTS.md is always generated and is the source of truth for agent behavior.
 
-Agent-specific files are thin pointers:
+Agent-specific files supplement the shared rules without replacing them:
 
-- CODEX.md is generated only with `--agent codex` and points back to `AGENTS.md`.
+- CODEX.md is generated only with `--agent codex`; it points back to `AGENTS.md` and records the standalone Codex PDF experiment boundary and readiness responsibilities.
 - CLAUDE.md is generated only with `--agent claude` and points back to `AGENTS.md`.
 - The default `--agent generic` mode generates only `AGENTS.md`.
 

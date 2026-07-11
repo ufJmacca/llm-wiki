@@ -12,6 +12,7 @@ import {
   addPdfExtractionOptions,
   hasPdfExtractionOptions,
   pdfOverridesFromRawOptions,
+  PDF_INGEST_HELP,
   rejectPdfOptionsForNonExtractionMode,
   type RawPdfExtractionOptions,
 } from "../pdf/cli.js";
@@ -148,18 +149,19 @@ type IngestStateSnapshot = {
 };
 
 export function registerIngestCommand(program: Command, io: CliIo): void {
-  addRuntimeOptions(addPdfExtractionOptions(
-    program
-      .command("ingest")
-      .description("Generate a manual prompt, execute local agents/providers, or validate completed curated edits")
-      .argument("<source_id>", "source ID to ingest")
-      .option("--validate", "validate completed ingest output and mark source ingested", false)
-      .option("--task-out <path>", "write the manual prompt to a repository-relative path")
-      .option("--create-branch", "create the recommended ingest branch when Git is enabled", false)
-      .option("--agent <name>", "run local agent execution with a configured agent such as codex")
-      .option("--auto", "execute the configured default local agent", false)
-      .option("--provider <name>", "run HTTP provider mode with an explicitly configured provider"),
-  )).action(async (sourceId: string, rawOptions: RawIngestOptions) => {
+  const ingest = program
+    .command("ingest")
+    .description("Generate a manual prompt, execute local agents/providers, or validate completed curated edits")
+    .argument("<source_id>", "source ID to ingest")
+    .option("--validate", "validate completed ingest output and mark source ingested", false)
+    .option("--task-out <path>", "write the manual prompt to a repository-relative path")
+    .option("--create-branch", "create the recommended ingest branch when Git is enabled", false)
+    .option("--agent <name>", "run local agent execution with a configured agent such as codex")
+    .option("--auto", "execute the configured default local agent", false)
+    .option("--provider <name>", "run HTTP provider mode with an explicitly configured provider")
+    .addHelpText("after", PDF_INGEST_HELP);
+
+  addRuntimeOptions(addPdfExtractionOptions(ingest)).action(async (sourceId: string, rawOptions: RawIngestOptions) => {
     await runIngestCommand(sourceId, rawOptions, io);
   });
 }

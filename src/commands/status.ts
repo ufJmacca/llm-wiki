@@ -1,6 +1,7 @@
 import { CommanderError, type Command } from "commander";
 
 import type { CliIo } from "../cli.js";
+import { PDF_STATUS_HELP } from "../pdf/cli.js";
 import { formatHumanPdfSourceStatus } from "../pdf/status.js";
 import {
   addRuntimeOptions,
@@ -14,7 +15,8 @@ export function registerStatusCommand(program: Command, io: CliIo): void {
   addRuntimeOptions(
     program
       .command("status")
-      .description("Report runtime readiness for an existing LLM Wiki workspace"),
+      .description("Report runtime readiness for an existing LLM Wiki workspace")
+      .addHelpText("after", PDF_STATUS_HELP),
   ).action(async (rawOptions: RawRuntimeCommandOptions) => {
     await runRuntimeCommand({
       command: "status",

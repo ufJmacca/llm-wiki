@@ -22,6 +22,7 @@ Maintain this repo as a persistent, compounding LLM Wiki.
 10. Prefer updating existing pages over creating duplicates.
 11. Respect page \`visibility\`.
 12. Never make private/raw content public without explicit human instruction.
+13. Do not curate a PDF until a validated canonical \`document.md\` artifact is selected.
 
 ## Page types
 
@@ -35,13 +36,23 @@ Maintain this repo as a persistent, compounding LLM Wiki.
 
 ## Ingest workflow
 
-1. Read the source card and original or extracted content.
+1. Read the source card. For PDFs, use only the selected validated canonical extraction artifact; for other supported sources, use the captured content supplied by the ingest task.
 2. Read \`curated/index.md\` before creating pages.
 3. Create or update the curated source summary.
 4. Update relevant entity, concept, topic, question, or comparison pages.
 5. Add source provenance through \`source_ids\`.
 6. Update \`curated/index.md\`.
 7. Append an entry to \`curated/log.md\`.
+
+## PDF artifact workflow
+
+Queue status and PDF extraction status are separate state machines.
+
+Do not curate a PDF until a validated canonical \`document.md\` artifact is selected.
+
+Run \`llm-wiki extract pdf <source_id>\` when the artifact is missing, stale, or inconsistent. A blocked queue item must first be returned to \`queued\` with \`llm-wiki queue set-status <source_id> queued\`.
+
+PDF originals, extraction runs, metadata, queue state, and review data stay private. Never copy raw extraction content or operational provenance into public output.
 
 ## Query workflow
 
@@ -74,6 +85,23 @@ Local and review profiles may include private curated pages and source cards. Pu
 }
 
 export function agentVariantContent(agentName: string): string {
+  if (agentName === "Codex") {
+    return `# Codex Instructions
+
+Read AGENTS.md first. AGENTS.md is authoritative for this LLM Wiki.
+
+## Standalone PDF experiment
+
+The standalone PDF experiment requires \`pdf@openai-primary-runtime\`.
+
+Codex installation, authentication, and plugin enablement are user-managed. This is a standalone Codex experiment with no parser fallback.
+
+Use \`llm-wiki status\` to inspect readiness and \`llm-wiki extract pdf <source_id>\` to create or reselect the private canonical artifact. Never write PDF extraction metadata or any path other than the permitted \`document.md\` proposal.
+
+A future \`ainative\` workflow must call the shared artifact boundary instead of duplicating extraction logic.
+`;
+  }
+
   return `# ${agentName} Instructions
 
 Read AGENTS.md first. AGENTS.md is authoritative for this LLM Wiki.

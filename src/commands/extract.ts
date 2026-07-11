@@ -1,7 +1,12 @@
 import type { Command } from "commander";
 
 import type { CliIo } from "../cli.js";
-import { addPdfExtractionOptions, pdfOverridesFromRawOptions, type RawPdfExtractionOptions } from "../pdf/cli.js";
+import {
+  addPdfExtractionOptions,
+  pdfOverridesFromRawOptions,
+  PDF_EXTRACT_HELP,
+  type RawPdfExtractionOptions,
+} from "../pdf/cli.js";
 import { extractPdfSource, type PdfExtractionResult } from "../pdf/extraction.js";
 import {
   addRuntimeOptions,
@@ -16,12 +21,13 @@ export function registerExtractCommand(program: Command, io: CliIo): void {
     .command("extract")
     .description("Create validated private source extraction artifacts");
 
-  addRuntimeOptions(addPdfExtractionOptions(
-    extract
-      .command("pdf")
-      .description("Extract a queued PDF with the configured Codex PDF plugin")
-      .argument("<source_id>", "queued PDF source ID"),
-  )).action(async (sourceId: string, rawOptions: RawExtractPdfOptions) => {
+  const pdf = extract
+    .command("pdf")
+    .description("Extract a queued PDF with the configured Codex PDF plugin")
+    .argument("<source_id>", "queued PDF source ID")
+    .addHelpText("after", PDF_EXTRACT_HELP);
+
+  addRuntimeOptions(addPdfExtractionOptions(pdf)).action(async (sourceId: string, rawOptions: RawExtractPdfOptions) => {
     await runRuntimeCommand({
       command: "extract pdf",
       rawOptions,

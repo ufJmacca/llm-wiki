@@ -31,7 +31,7 @@ export function planWikiScaffold(options: WikiScaffoldOptions): ScaffoldEntry[] 
     { path: ".llm-wiki/templates/source-summary.md", content: sourceSummaryTemplateContent() },
     { path: ".llm-wiki/templates/topic.md", content: topicTemplateContent() },
     { path: "AGENTS.md", content: agentInstructionsContent() },
-    { path: "README.md", content: readmeContent() },
+    { path: "README.md", content: readmeContent(options.agent) },
     { path: "curated/comparisons/.gitkeep", content: "" },
     { path: "curated/concepts/.gitkeep", content: "" },
     { path: "curated/contradictions.md", content: titledPage("Contradictions", "page") },
@@ -73,7 +73,27 @@ export function planWikiScaffold(options: WikiScaffoldOptions): ScaffoldEntry[] 
   return entries.sort((left, right) => comparePaths(left.path, right.path));
 }
 
-function readmeContent(): string {
+function readmeContent(agent: InitAgent): string {
+  const pdfSection = agent === "codex" ? `
+## Codex PDF ingestion
+
+The required \`pdf@openai-primary-runtime\` plugin, Codex installation, authentication, and plugin enablement are user-managed. Run \`llm-wiki status\` to inspect readiness; there is no parser fallback.
+
+The generated \`.llm-wiki/config.yml\` declares \`pdf_ingestion.codex_agent\`, \`required_plugin\`, \`reasoning_effort\`, \`pdf_detail\`, \`timeout_seconds\`, and \`require_artifact_before_ingest\`; add the optional \`model\` only when a repository should request an explicit model. If readiness reports a missing, disabled, or malformed plugin, repair the user-managed Codex/plugin setup, confirm it with \`llm-wiki status\`, and retry.
+
+Extract explicitly with \`llm-wiki extract pdf <source_id>\`. Automated Codex ingest can extract or reuse first with \`llm-wiki ingest <source_id> --auto --pdf-detail high\`, and queue source, batch, or watch processing forwards the same PDF controls, for example \`llm-wiki queue ingest --auto --watch --pdf-detail high\`.
+
+CLI overrides take precedence over \`pdf_ingestion\`, then defaults or inheritance. Omitting the model inherits Codex's active model and can make later automatic reuse unavailable. Matching runs are reused; changed settings or \`--force\` create a new immutable run.
+
+Queue status and PDF extraction status are separate. A newly captured PDF starts with extraction status \`pending\`. If automated extraction fails, the queue becomes \`blocked\`; run \`llm-wiki queue set-status <source_id> queued\` before retrying auto-ingest.
+
+Manual and provider ingest cannot bypass the PDF artifact requirement. Create the validated artifact first, then retry those modes without PDF override flags.
+
+Validated runs live under \`raw/inputs/<yyyy>/<mm>/<source_id>/extracted/pdf/<extraction_id>/\`. Original PDFs and \`extracted/pdf/**\` remain private and are rejected from public builds.
+
+A future \`ainative\` workflow must call the shared artifact boundary in \`src/ingest/artifact.ts\` rather than duplicating readiness, extraction, locking, or state logic.
+` : "";
+
   return `# llm-wiki
 
 This repository is an LLM Wiki workspace with immutable raw sources and curated Markdown synthesis.
@@ -105,6 +125,8 @@ If no default local agent is configured, upload capture can still leave the sour
 If auto-ingest fails, inspect the \`blocked\` source with \`llm-wiki queue show <source_id>\` or review pages. To retry automation, run \`llm-wiki queue set-status <source_id> queued\` and then \`llm-wiki ingest <source_id> --auto\`; after manual repairs, run \`llm-wiki ingest <source_id> --validate\`.
 
 Duplicate uploads do not trigger a second ingest when the existing source is already \`ingested\`; queued duplicates may attempt the existing queue item.
+
+${pdfSection}
 
 ## GitHub Pages publication
 
@@ -354,7 +376,11 @@ function rawReadmeContent(): string {
 
 Raw source originals are immutable and private by default. Store captured inputs under \`raw/inputs/\`.
 
-Each source folder should contain a source card named \`_source.md\` and an immutable captured original named \`original.*\`. Derived files such as extracted text may be added next to the original.
+Each source folder contains a source card named \`_source.md\` and an immutable captured original named \`original.*\`.
+
+Validated PDF runs use \`extracted/pdf/<extraction_id>/document.md\` plus \`extracted/pdf/<extraction_id>/metadata.json\`. \`metadata.json\` is CLI-owned provenance; do not hand-edit successful runs or let an extraction agent create metadata.
+
+Extraction artifacts must not be selected by public profiles. Original PDFs, canonical \`document.md\`, metadata, queue state, and private review data remain local evidence rather than public wiki pages.
 `;
 }
 

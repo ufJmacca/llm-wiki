@@ -152,7 +152,16 @@ export async function preflightPdfIngestion(
     return runtime;
   }
 
-  const availability = await checkLocalAgentAvailability(runtime.value.agent, {
+  return preflightLoadedPdfIngestion(repoRoot, runtime.value, options);
+}
+
+export async function preflightLoadedPdfIngestion(
+  repoRoot: string,
+  runtime: PdfIngestionRuntimeConfig,
+  options: PdfPreflightOptions = {},
+): Promise<Result<PdfPreflightSuccess, PdfReadinessError>> {
+
+  const availability = await checkLocalAgentAvailability(runtime.agent, {
     cwd: repoRoot,
     env: options.env,
   });
@@ -160,7 +169,7 @@ export async function preflightPdfIngestion(
     return err({
       code: "PDF_CODEX_NOT_READY",
       message: `PDF Codex executable is not ready: ${availability.error.message}`,
-      path: `.llm-wiki/config.yml:agents.${runtime.value.agent.name}.command`,
+      path: `.llm-wiki/config.yml:agents.${runtime.agent.name}.command`,
       hint: availability.error.hint,
       executablePath: availability.error.executablePath,
       exitCode: null,
@@ -169,7 +178,7 @@ export async function preflightPdfIngestion(
     });
   }
 
-  const args = [...runtime.value.invocation.globalPrefix, "plugin", "list", "--json"];
+  const args = [...runtime.invocation.globalPrefix, "plugin", "list", "--json"];
   const processResult = await runPluginListProcess(
     availability.value.executablePath,
     args,
@@ -186,7 +195,7 @@ export async function preflightPdfIngestion(
       message: processResult.value.timedOut
         ? "Codex plugin discovery timed out."
         : "Codex plugin discovery exited unsuccessfully.",
-      path: runtime.value.agent.command,
+      path: runtime.agent.command,
       hint: "Run codex plugin list --json, fix Codex readiness, and retry PDF extraction.",
       executablePath: availability.value.executablePath,
       exitCode: processResult.value.exitCode,
@@ -206,12 +215,12 @@ export async function preflightPdfIngestion(
     });
   }
 
-  const plugin = parsed.value.find((candidate) => candidate.id === runtime.value.config.requiredPlugin);
+  const plugin = parsed.value.find((candidate) => candidate.id === runtime.config.requiredPlugin);
   if (plugin === undefined || !plugin.installed) {
     return err({
       code: "PDF_PLUGIN_MISSING",
-      message: `Required Codex plugin is not installed: ${runtime.value.config.requiredPlugin}.`,
-      path: runtime.value.config.requiredPlugin,
+      message: `Required Codex plugin is not installed: ${runtime.config.requiredPlugin}.`,
+      path: runtime.config.requiredPlugin,
       hint: "Install the required plugin in Codex, then rerun the command. llm-wiki never installs plugins automatically.",
       executablePath: availability.value.executablePath,
       exitCode: 0,
@@ -224,8 +233,8 @@ export async function preflightPdfIngestion(
   if (!plugin.enabled) {
     return err({
       code: "PDF_PLUGIN_DISABLED",
-      message: `Required Codex plugin is disabled: ${runtime.value.config.requiredPlugin}.`,
-      path: runtime.value.config.requiredPlugin,
+      message: `Required Codex plugin is disabled: ${runtime.config.requiredPlugin}.`,
+      path: runtime.config.requiredPlugin,
       hint: "Enable the required plugin in Codex, then rerun the command. llm-wiki never changes plugin state.",
       executablePath: availability.value.executablePath,
       exitCode: 0,
@@ -236,7 +245,7 @@ export async function preflightPdfIngestion(
   }
 
   return ok({
-    runtime: runtime.value,
+    runtime,
     executablePath: availability.value.executablePath,
     args,
     plugin,

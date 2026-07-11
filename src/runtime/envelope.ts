@@ -13,6 +13,11 @@ export type RuntimeErrorEnvelope = {
   code: string;
   message: string;
   hint: string;
+  executable?: string;
+  exit_code?: number | null;
+  stderr_tail?: string;
+  timed_out?: boolean;
+  workspace_mutations_observed?: boolean;
 };
 
 export type RuntimeSuccessEnvelope<Command extends string, Data> = {
@@ -95,6 +100,7 @@ export function buildRuntimeCommandFailureEnvelope<Command extends string>(
       code: error.code,
       message: error.message,
       hint: error.hint,
+      ...runtimeProcessErrorFields(error),
     },
     issues: error.issues ?? [
       {
@@ -105,6 +111,20 @@ export function buildRuntimeCommandFailureEnvelope<Command extends string>(
         hint: error.hint,
       },
     ],
+  };
+}
+
+function runtimeProcessErrorFields(error: RuntimeCommandError): Partial<RuntimeErrorEnvelope> {
+  if (error.executable === undefined) {
+    return {};
+  }
+
+  return {
+    executable: error.executable,
+    exit_code: error.exitCode ?? null,
+    stderr_tail: error.stderrTail ?? "",
+    timed_out: error.timedOut ?? false,
+    workspace_mutations_observed: error.workspaceMutationsObserved ?? false,
   };
 }
 
@@ -126,6 +146,7 @@ export function buildRuntimePartialFailureEnvelope<Command extends string, Data>
       code: error.code,
       message: error.message,
       hint: error.hint,
+      ...runtimeProcessErrorFields(error),
     },
     issues,
   };

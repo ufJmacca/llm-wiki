@@ -2552,6 +2552,22 @@ describe("local upload daemon", () => {
           visibility: "private",
           message: "Raw source uploaded and queued for ingest.",
         });
+        if (fileName.endsWith(".pdf")) {
+          const queue = JSON.parse(await readGeneratedFile(wikiDir, upload.body.data.queue_path)) as {
+            pdf_extraction: Record<string, unknown>;
+          };
+          const source = await readGeneratedFile(wikiDir, upload.body.data.source_card_path);
+          const sourceFrontmatter = parse(source.match(/^---\n([\s\S]*?)\n---/u)?.[1] ?? "") as {
+            pdf_extraction: Record<string, unknown>;
+          };
+          expect(queue.pdf_extraction).toEqual(sourceFrontmatter.pdf_extraction);
+          expect(queue.pdf_extraction).toMatchObject({
+            required: true,
+            status: "pending",
+            extraction_id: null,
+            artifact_path: null,
+          });
+        }
       } finally {
         await daemon.close();
       }

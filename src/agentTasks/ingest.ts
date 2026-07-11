@@ -1,5 +1,6 @@
 import { extname } from "node:path";
 
+import type { CanonicalIngestArtifact } from "../ingest/artifact.js";
 import { getGraph } from "../nav/index.js";
 import { showQueueSource, type QueueStatus } from "../runtime/queue.js";
 import { searchWiki } from "../search/index.js";
@@ -25,6 +26,13 @@ export type IngestTaskSource = {
   source_card_path: string;
   original_path: string;
   queue_path: string;
+  canonical_artifact?: {
+    kind: "pdf";
+    original_path: string;
+    artifact_path: string;
+    metadata_path: string;
+    extraction_id: string;
+  };
 };
 
 export type IngestTask = {
@@ -54,6 +62,7 @@ type IngestTaskInput = {
   repoRoot: string;
   sourceId: string;
   artifactPath?: string | null;
+  canonicalArtifact?: CanonicalIngestArtifact | null;
   previousStatus?: QueueStatus | null;
   promptMode?: "manual" | "local-agent";
 };
@@ -70,6 +79,11 @@ type RawPromptContent =
   | {
       mode: "path_only";
       reason: string;
+    }
+  | {
+      mode: "canonical_pdf";
+      content: string;
+      artifact: CanonicalIngestArtifact;
     };
 
 const AGENTS_PATH = "AGENTS.md";
@@ -133,6 +147,7 @@ export async function buildIngestTask(input: IngestTaskInput): Promise<Result<In
     });
   }
 
+  const canonicalArtifact = input.canonicalArtifact ?? null;
   const source = {
     source_id: queueSource.value.queue_record.source_id,
     title: queueSource.value.queue_record.title,
@@ -140,7 +155,24 @@ export async function buildIngestTask(input: IngestTaskInput): Promise<Result<In
     source_card_path: queueSource.value.source_card.path,
     original_path: queueSource.value.queue_record.original_path,
     queue_path: queueSource.value.queue_record.queue_path,
+    ...(canonicalArtifact === null
+      ? {}
+      : { canonical_artifact: {
+          kind: canonicalArtifact.kind,
+          original_path: canonicalArtifact.original_path,
+          artifact_path: canonicalArtifact.artifact_path,
+          metadata_path: canonicalArtifact.metadata_path,
+          extraction_id: canonicalArtifact.extraction_id,
+        } }),
   };
+  if (canonicalArtifact !== null && canonicalArtifact.original_path !== source.original_path) {
+    return err({
+      code: "PDF_ARTIFACT_INCONSISTENT",
+      message: "Canonical PDF artifact original path does not match the queued source.",
+      path: canonicalArtifact.artifact_path,
+      hint: `Run llm-wiki extract pdf ${source.source_id} to create a matching artifact.`,
+    });
+  }
   let sourceCardContent: string;
   let rawPromptContent: RawPromptContent;
   let agentsContent: string;
@@ -150,7 +182,13 @@ export async function buildIngestTask(input: IngestTaskInput): Promise<Result<In
   try {
     [sourceCardContent, rawPromptContent, agentsContent, indexContent, relatedPages] = await Promise.all([
       readRepoText(input.repoRoot, source.source_card_path),
-      readRawPromptContent(input.repoRoot, source.original_path, queueSource.value.queue_record.source_kind),
+      canonicalArtifact === null
+        ? readRawPromptContent(input.repoRoot, source.original_path, queueSource.value.queue_record.source_kind)
+        : Promise.resolve({
+            mode: "canonical_pdf" as const,
+            content: canonicalArtifact.content,
+            artifact: canonicalArtifact,
+          }),
       readRepoText(input.repoRoot, AGENTS_PATH),
       readRepoText(input.repoRoot, INDEX_PATH),
       findRelatedPages(input.repoRoot, source.source_id, source.title),
@@ -166,6 +204,9 @@ export async function buildIngestTask(input: IngestTaskInput): Promise<Result<In
     source.source_card_path,
     source.original_path,
     source.queue_path,
+    ...(canonicalArtifact === null
+      ? []
+      : [canonicalArtifact.artifact_path, canonicalArtifact.metadata_path]),
     AGENTS_PATH,
     INDEX_PATH,
     ...relatedPages.map((page) => page.path),
@@ -385,6 +426,17 @@ function formatValidationInstruction(input: {
 }
 
 function formatRawPromptSection(path: string, rawPromptContent: RawPromptContent): string[] {
+  if (rawPromptContent.mode === "canonical_pdf") {
+    return [
+      `Original PDF path: ${rawPromptContent.artifact.original_path}`,
+      `Canonical PDF artifact path: ${rawPromptContent.artifact.artifact_path}`,
+      `PDF extraction metadata path: ${rawPromptContent.artifact.metadata_path}`,
+      `PDF extraction ID: ${rawPromptContent.artifact.extraction_id}`,
+      "Use the complete validated canonical Markdown below as the source evidence. The binary original is provenance only.",
+      codeFence(rawPromptContent.content, "markdown"),
+    ];
+  }
+
   if (rawPromptContent.mode === "inline") {
     return [codeFence(snippet(rawPromptContent.content, 8000), "markdown")];
   }
@@ -406,5 +458,7 @@ function snippet(content: string, maxLength: number): string {
 }
 
 function codeFence(content: string, language: string): string {
-  return ["```" + language, content.replaceAll("```", "``\\`"), "```"].join("\n");
+  const longestRun = Math.max(0, ...(content.match(/`+/gu) ?? []).map((run) => run.length));
+  const fence = "`".repeat(Math.max(3, longestRun + 1));
+  return [`${fence}${language}`, content, fence].join("\n");
 }

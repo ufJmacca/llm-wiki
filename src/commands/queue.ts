@@ -184,12 +184,15 @@ export function registerQueueCommand(program: Command, io: CliIo): void {
         io,
         run: async ({ repo }) => {
           await validateQueuePdfOptions(repo.rootDir, runtimeOptions);
+          const pdfOverrides = pdfOverridesFromRawOptions(runtimeOptions);
           const data = target === undefined
-            ? await runQueueIngestBatch(repo.rootDir, limit)
+            ? await runQueueIngestBatch(repo.rootDir, limit, runtimeOptions)
             : batchDataFromSourceResult(await runAutoIngestSource({
                 repoRoot: repo.rootDir,
                 sourceId: target,
                 command: `llm-wiki queue ingest --auto --source-id ${target}`,
+                pdfOverrides,
+                allowNonPdfPdfOptions: true,
               }));
 
           if (queueIngestIsIncomplete(data)) {
@@ -310,11 +313,16 @@ function queueCommandName(action: string | undefined): "queue" | "queue show" | 
   return "queue";
 }
 
-async function runQueueIngestBatch(repoRoot: string, limit: number | undefined): Promise<QueueIngestData> {
+async function runQueueIngestBatch(
+  repoRoot: string,
+  limit: number | undefined,
+  options: RawQueueCommandOptions,
+): Promise<QueueIngestData> {
   const result = await runAutoIngestBatch({
     repoRoot,
     ...(limit === undefined ? {} : { limit }),
     command: limit === undefined ? "llm-wiki queue ingest --auto" : `llm-wiki queue ingest --auto --limit ${limit}`,
+    pdfOverrides: pdfOverridesFromRawOptions(options),
   });
 
   return result;
@@ -507,6 +515,7 @@ async function runQueueIngestWatchCommand(rawOptions: RawQueueCommandOptions, io
         repoRoot,
         signal: controller.signal,
         command: "llm-wiki queue ingest --auto --watch",
+        pdfOverrides: pdfOverridesFromRawOptions(rawOptions),
         onEvent: async (event) => {
           writeQueueIngestWatchEvent(io, repoRoot, event, { json, quiet });
         },

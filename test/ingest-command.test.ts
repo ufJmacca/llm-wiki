@@ -744,16 +744,15 @@ describe("ingest command task scaffolding", () => {
     });
   });
 
-  it("keeps binary file originals out of generated ingest prompts", async () => {
+  it("requires a canonical artifact before generating a prompt for a PDF", async () => {
     await withTempWorkspace("llm-wiki-ingest-binary-task-", async (workspaceDir) => {
       // Arrange
       vi.useFakeTimers();
       vi.setSystemTime(new Date("2026-06-18T09:30:00.000Z"));
       const wikiDir = resolve(workspaceDir, "wiki");
       const binaryPath = resolve(workspaceDir, "scan.pdf");
-      const binarySentinel = "BINARY_ORIGINAL_SHOULD_NOT_BE_INLINED";
       await initializeWiki(wikiDir);
-      await writeFile(binaryPath, Buffer.from([0x25, 0x50, 0x44, 0x46, 0x00, ...Buffer.from(binarySentinel), 0xff]));
+      await writeFile(binaryPath, Buffer.from([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37, 0x0a, 0x00, 0xff]));
       const addResult = await runCliBuffered([
         "add",
         binaryPath,
@@ -767,16 +766,23 @@ describe("ingest command task scaffolding", () => {
 
       // Act
       const result = await runCliBuffered(["ingest", addPayload.data.source.source_id, "--repo", wikiDir, "--json"]);
-      const payload = parseJsonSuccess<"ingest", IngestTaskData>(result.stdout);
+      const payload = parseJsonFailure<"ingest">(result.stdout);
+      const shown = await runCliBuffered([
+        "queue",
+        "show",
+        addPayload.data.source.source_id,
+        "--repo",
+        wikiDir,
+        "--json",
+      ]);
+      const shownPayload = parseJsonSuccess<"queue show", QueueShowData>(shown.stdout);
 
       // Assert
       expect(addResult.exitCode).toBe(0);
-      expect(result.exitCode).toBe(0);
-      expect(payload.data.context.paths).toContain(addPayload.data.source.original_path);
-      expect(payload.data.task.prompt).toContain(`Raw original path: ${addPayload.data.source.original_path}`);
-      expect(payload.data.task.prompt).toContain("Content not inlined");
-      expect(payload.data.task.prompt).toContain("extraction or OCR");
-      expect(payload.data.task.prompt).not.toContain(binarySentinel);
+      expect(result.exitCode).toBe(1);
+      expect(payload.error.code).toBe("PDF_ARTIFACT_REQUIRED");
+      expect(payload.error.hint).toContain(`llm-wiki extract pdf ${addPayload.data.source.source_id}`);
+      expect(shownPayload.data.queue_record.status).toBe("queued");
     });
   });
 

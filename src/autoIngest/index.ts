@@ -9,6 +9,16 @@ import {
   runLocalAgentIngestCore,
 } from "../ingest/localAgentCore.js";
 import {
+  ensurePreparedIngestArtifactUnderLock,
+  prepareAutomatedIngestArtifact,
+  readPdfIngestFailureResult,
+  sourceRequiresPdfArtifact,
+  type PdfIngestArtifactResult,
+  type PreparedIngestArtifact,
+} from "../ingest/artifact.js";
+import type { PdfExtractionSettingOverrides } from "../pdf/config.js";
+import { PdfPreflightRestartError } from "../pdf/extraction.js";
+import {
   loadDefaultLocalAgentConfig,
   type LocalAgentConfig,
   type LocalAgentConfigError,
@@ -27,6 +37,7 @@ import {
 export type { AutoIngestMetadata } from "../runtime/queue.js";
 
 export type AutoIngestOutcome = "ingested" | "blocked" | "skipped" | "deferred";
+export type PdfAutoIngestResult = PdfIngestArtifactResult;
 
 export type AutoIngestSafeIssue = {
   severity: "error";
@@ -54,6 +65,7 @@ export type AutoIngestSourceResult = {
   applied_paths: string[];
   auto_ingest: AutoIngestMetadata | null;
   error: AutoIngestSafeError | null;
+  pdf?: PdfAutoIngestResult;
 };
 
 export type AutoIngestBatchResult = {
@@ -95,6 +107,7 @@ export type RunAutoIngestBatchInput = {
   now?: () => Date;
   lock?: Pick<IngestLockOptions, "timeoutMs" | "retryDelayMs">;
   command?: string;
+  pdfOverrides?: PdfExtractionSettingOverrides;
 };
 
 export type RunAutoIngestSourceInput = {
@@ -103,6 +116,8 @@ export type RunAutoIngestSourceInput = {
   now?: () => Date;
   lock?: Pick<IngestLockOptions, "timeoutMs" | "retryDelayMs">;
   command?: string;
+  pdfOverrides?: PdfExtractionSettingOverrides;
+  allowNonPdfPdfOptions?: boolean;
 };
 
 export type RunAutoIngestWatchInput = {
@@ -114,6 +129,7 @@ export type RunAutoIngestWatchInput = {
   signal?: AbortSignal;
   onPreflightComplete?: (agent: LocalAgentConfig) => void | Promise<void>;
   onEvent?: (event: AutoIngestWatchEvent) => void | Promise<void>;
+  pdfOverrides?: PdfExtractionSettingOverrides;
 };
 
 type QueueCandidate = {
@@ -129,6 +145,9 @@ type RunQueuedSourceInput = {
   now?: () => Date;
   lock?: Pick<IngestLockOptions, "timeoutMs" | "retryDelayMs">;
   command?: string;
+  pdfOverrides?: PdfExtractionSettingOverrides;
+  includeNotApplicablePdfResult?: boolean;
+  resume?: boolean;
 };
 
 type CurrentSourceState = {
@@ -162,6 +181,8 @@ export async function runAutoIngestBatch(input: RunAutoIngestBatchInput): Promis
       now: input.now,
       lock: input.lock,
       command: input.command,
+      pdfOverrides: input.pdfOverrides,
+      includeNotApplicablePdfResult: true,
     }));
   }
 
@@ -191,6 +212,8 @@ export async function runAutoIngestSource(input: RunAutoIngestSourceInput): Prom
     now: input.now,
     lock: input.lock,
     command: input.command,
+    pdfOverrides: input.pdfOverrides,
+    includeNotApplicablePdfResult: input.allowNonPdfPdfOptions === true,
   });
 }
 
@@ -213,6 +236,9 @@ export async function resumeAutoIngestSource(input: RunAutoIngestSourceInput): P
     now: input.now,
     lock: input.lock,
     command: input.command,
+    pdfOverrides: input.pdfOverrides,
+    includeNotApplicablePdfResult: input.allowNonPdfPdfOptions === true,
+    resume: true,
   });
 }
 
@@ -222,13 +248,16 @@ export async function runAutoIngestWatch(input: RunAutoIngestWatchInput): Promis
   const command = input.command ?? "llm-wiki queue ingest --auto --watch";
   let failureCount = 0;
   let interrupted = signalIsAborted(input.signal);
+  const selectedSourceIds = new Set<string>();
 
   await input.onPreflightComplete?.(agent);
 
   while (!interrupted) {
-    const candidates = await selectQueuedCandidates(input.repoRoot);
+    const candidates = (await selectQueuedCandidates(input.repoRoot))
+      .filter((candidate) => !selectedSourceIds.has(candidate.sourceId));
 
     for (const candidate of candidates) {
+      selectedSourceIds.add(candidate.sourceId);
       if (signalIsAborted(input.signal)) {
         interrupted = true;
         break;
@@ -242,6 +271,8 @@ export async function runAutoIngestWatch(input: RunAutoIngestWatchInput): Promis
             now: input.now,
             lock: input.lock,
             command,
+            pdfOverrides: input.pdfOverrides,
+            includeNotApplicablePdfResult: true,
           })
         : skippedResult(
             candidate.sourceId,
@@ -295,242 +326,171 @@ export async function runAutoIngestWatch(input: RunAutoIngestWatchInput): Promis
 }
 
 async function runQueuedSourceWithAgent(input: RunQueuedSourceInput): Promise<AutoIngestSourceResult> {
+  return runSourceWithPreparedArtifact(input);
+}
+
+async function runIngestingSourceWithAgent(input: RunQueuedSourceInput): Promise<AutoIngestSourceResult> {
+  return runSourceWithPreparedArtifact({ ...input, resume: true });
+}
+
+async function runSourceWithPreparedArtifact(input: RunQueuedSourceInput): Promise<AutoIngestSourceResult> {
   const command = input.command ?? `llm-wiki ingest ${input.sourceId} --auto`;
+  const expectedStatus: QueueStatus = input.resume === true ? "ingesting" : "queued";
 
+  for (let preflightAttempt = 0; preflightAttempt < 4; preflightAttempt += 1) {
+    const prepared = await prepareSourceArtifactOrResult(input, expectedStatus);
+    if (!("kind" in prepared)) return prepared;
+
+    try {
+      return await withIngestLock(
+        input.repoRoot,
+        {
+          label: `auto-ingest:${input.sourceId}`,
+          timeoutMs: input.lock?.timeoutMs,
+          retryDelayMs: input.lock?.retryDelayMs,
+          now: input.now,
+        },
+        (lease) => runPreparedSourceUnderLock(input, prepared, lease, expectedStatus, command),
+      );
+    } catch (error) {
+      if (error instanceof PdfPreflightRestartError) continue;
+      if (error instanceof RuntimeCommandError && error.code === "INGEST_LOCK_BUSY") {
+        return deferredForBusyLock(input, error);
+      }
+      throw error;
+    }
+  }
+
+  const error = new RuntimeCommandError({
+    code: "PDF_CONFIG_INVALID",
+    message: "PDF configuration kept changing while auto-ingest waited for the repository lock.",
+    path: ".llm-wiki/config.yml",
+    hint: "Stop editing PDF/agent configuration, then retry auto-ingest.",
+  });
+  return readinessRejectedResult(input, expectedStatus, error);
+}
+
+async function prepareSourceArtifactOrResult(
+  input: RunQueuedSourceInput,
+  expectedStatus: QueueStatus,
+): Promise<PreparedIngestArtifact | AutoIngestSourceResult> {
   try {
-    return await withIngestLock(
-      input.repoRoot,
-      {
-        label: `auto-ingest:${input.sourceId}`,
-        timeoutMs: input.lock?.timeoutMs,
-        retryDelayMs: input.lock?.retryDelayMs,
-        now: input.now,
+    return await prepareAutomatedIngestArtifact({
+      repoRoot: input.repoRoot,
+      sourceId: input.sourceId,
+      agent: input.agent,
+      overrides: input.pdfOverrides,
+      includeNotApplicableResult: input.includeNotApplicablePdfResult,
+    });
+  } catch (error) {
+    return readinessRejectedResult(input, expectedStatus, error);
+  }
+}
+
+async function runPreparedSourceUnderLock(
+  input: RunQueuedSourceInput,
+  prepared: PreparedIngestArtifact,
+  lease: Parameters<typeof ensurePreparedIngestArtifactUnderLock>[1],
+  expectedStatus: QueueStatus,
+  command: string,
+): Promise<AutoIngestSourceResult> {
+  const current = await readCurrentSourceState(input.repoRoot, input.sourceId);
+  if (!current.ok) {
+    return skippedResult(input.sourceId, null, null, input.agent.name, queueErrorToSafeError(current.error));
+  }
+  if (current.value.status !== expectedStatus) {
+    return input.resume === true
+      ? resumeNotEligibleResult(input.sourceId, current.value.status, current.value.autoIngest, input.agent.name)
+      : statusNotEligibleResult(input.sourceId, current.value.status, current.value.autoIngest, input.agent.name);
+  }
+
+  let attempted = false;
+  let previousStatus: QueueStatus = current.value.status;
+  let pdf: PdfAutoIngestResult | null = null;
+  try {
+    const ensured = await ensurePreparedIngestArtifactUnderLock(prepared, lease, {
+      onReady: async () => {
+        if (expectedStatus === "queued") {
+          const started = await transitionQueueStatus(input.repoRoot, input.sourceId, "ingesting", {
+            now: currentDate(input.now),
+            command,
+            autoIngest: {
+              enabled: true,
+              result: "ingesting",
+              errorCode: null,
+              errorMessage: null,
+            },
+          });
+          if (!started.ok) throw queueRuntimeError(started.error);
+          previousStatus = started.value.previous_status;
+        }
+        attempted = true;
       },
-      async () => {
-        const current = await readCurrentSourceState(input.repoRoot, input.sourceId);
-        if (!current.ok) {
-          return skippedResult(input.sourceId, null, null, input.agent.name, queueErrorToSafeError(current.error));
-        }
-
-        if (current.value.status !== "queued") {
-          return statusNotEligibleResult(input.sourceId, current.value.status, current.value.autoIngest, input.agent.name);
-        }
-
-        const started = await transitionQueueStatus(input.repoRoot, input.sourceId, "ingesting", {
+    });
+    pdf = ensured.pdf;
+    const coreResult = await runLocalAgentIngestCore({
+      repoRoot: input.repoRoot,
+      sourceId: input.sourceId,
+      agent: input.agent,
+      canonicalArtifact: ensured.artifact,
+      completeAppliedIngest: async () => {
+        const completed = await transitionQueueStatus(input.repoRoot, input.sourceId, "ingested", {
           now: currentDate(input.now),
           command,
           autoIngest: {
             enabled: true,
-            result: "ingesting",
+            result: "ingested",
             errorCode: null,
             errorMessage: null,
           },
         });
-        if (!started.ok) {
-          throw queueRuntimeError(started.error);
-        }
-
-        try {
-          const coreResult = await runLocalAgentIngestCore({
-            repoRoot: input.repoRoot,
-            sourceId: input.sourceId,
-            agent: input.agent,
-            completeAppliedIngest: async () => {
-              const completed = await transitionQueueStatus(input.repoRoot, input.sourceId, "ingested", {
-                now: currentDate(input.now),
-                command,
-                autoIngest: {
-                  enabled: true,
-                  result: "ingested",
-                  errorCode: null,
-                  errorMessage: null,
-                },
-              });
-              if (!completed.ok) {
-                throw queueRuntimeError(completed.error);
-              }
-
-              return completed.value;
-            },
-          });
-          const finalState = await readCurrentSourceStateOrThrow(input.repoRoot, input.sourceId);
-
-          return {
-            source_id: input.sourceId,
-            previous_status: started.value.previous_status,
-            final_status: "ingested",
-            outcome: "ingested",
-            attempted: true,
-            agent: input.agent.name,
-            applied_paths: coreResult.appliedPaths,
-            auto_ingest: finalState.autoIngest,
-            error: null,
-          };
-        } catch (error) {
-          const safeError = errorToSafeAutoIngestError(error, input.sourceId);
-          const blocked = await transitionQueueStatus(input.repoRoot, input.sourceId, "blocked", {
-            now: currentDate(input.now),
-            command,
-            autoIngest: {
-              enabled: true,
-              result: "blocked",
-              errorCode: safeError.code,
-              errorMessage: safeError.message,
-            },
-          });
-          if (!blocked.ok) {
-            throw queueRuntimeError(blocked.error);
-          }
-
-          const finalState = await readCurrentSourceStateOrThrow(input.repoRoot, input.sourceId);
-
-          return {
-            source_id: input.sourceId,
-            previous_status: started.value.previous_status,
-            final_status: "blocked",
-            outcome: "blocked",
-            attempted: true,
-            agent: input.agent.name,
-            applied_paths: [],
-            auto_ingest: finalState.autoIngest,
-            error: safeError,
-          };
-        }
+        if (!completed.ok) throw queueRuntimeError(completed.error);
+        return completed.value;
       },
-    );
+    });
+    const finalState = await readCurrentSourceStateOrThrow(input.repoRoot, input.sourceId);
+    return {
+      source_id: input.sourceId,
+      previous_status: previousStatus,
+      final_status: "ingested",
+      outcome: "ingested",
+      attempted: true,
+      agent: input.agent.name,
+      applied_paths: coreResult.appliedPaths,
+      auto_ingest: finalState.autoIngest,
+      error: null,
+      ...optionalPdfResult(pdf),
+    };
   } catch (error) {
-    if (error instanceof RuntimeCommandError && error.code === "INGEST_LOCK_BUSY") {
-      const current = await readCurrentSourceState(input.repoRoot, input.sourceId);
-      const currentStatus = current.ok ? current.value.status : null;
-      const currentMetadata = current.ok ? current.value.autoIngest : null;
-
-      return {
-        source_id: input.sourceId,
-        previous_status: currentStatus,
-        final_status: currentStatus,
-        outcome: "deferred",
-        attempted: false,
-        agent: input.agent.name,
-        applied_paths: [],
-        auto_ingest: currentMetadata,
-        error: runtimeErrorToSafeError(error),
-      };
+    if (!attempted) throw error;
+    const safeError = errorToSafeAutoIngestError(error, input.sourceId);
+    if (pdf === null && await sourceRequiresPdfArtifact(input.repoRoot, input.sourceId)) {
+      pdf = await readPdfIngestFailureResult(input.repoRoot, input.sourceId, "failed");
     }
-
-    throw error;
-  }
-}
-
-async function runIngestingSourceWithAgent(input: RunQueuedSourceInput): Promise<AutoIngestSourceResult> {
-  const command = input.command ?? `llm-wiki ingest ${input.sourceId} --auto`;
-
-  try {
-    return await withIngestLock(
-      input.repoRoot,
-      {
-        label: `auto-ingest:${input.sourceId}`,
-        timeoutMs: input.lock?.timeoutMs,
-        retryDelayMs: input.lock?.retryDelayMs,
-        now: input.now,
+    const blocked = await transitionQueueStatus(input.repoRoot, input.sourceId, "blocked", {
+      now: currentDate(input.now),
+      command,
+      autoIngest: {
+        enabled: true,
+        result: "blocked",
+        errorCode: safeError.code,
+        errorMessage: safeError.message,
       },
-      async () => {
-        const current = await readCurrentSourceState(input.repoRoot, input.sourceId);
-        if (!current.ok) {
-          return skippedResult(input.sourceId, null, null, input.agent.name, queueErrorToSafeError(current.error));
-        }
-
-        if (current.value.status !== "ingesting") {
-          return resumeNotEligibleResult(input.sourceId, current.value.status, current.value.autoIngest, input.agent.name);
-        }
-
-        try {
-          const coreResult = await runLocalAgentIngestCore({
-            repoRoot: input.repoRoot,
-            sourceId: input.sourceId,
-            agent: input.agent,
-            completeAppliedIngest: async () => {
-              const completed = await transitionQueueStatus(input.repoRoot, input.sourceId, "ingested", {
-                now: currentDate(input.now),
-                command,
-                autoIngest: {
-                  enabled: true,
-                  result: "ingested",
-                  errorCode: null,
-                  errorMessage: null,
-                },
-              });
-              if (!completed.ok) {
-                throw queueRuntimeError(completed.error);
-              }
-
-              return completed.value;
-            },
-          });
-          const finalState = await readCurrentSourceStateOrThrow(input.repoRoot, input.sourceId);
-
-          return {
-            source_id: input.sourceId,
-            previous_status: current.value.status,
-            final_status: "ingested",
-            outcome: "ingested",
-            attempted: true,
-            agent: input.agent.name,
-            applied_paths: coreResult.appliedPaths,
-            auto_ingest: finalState.autoIngest,
-            error: null,
-          };
-        } catch (error) {
-          const safeError = errorToSafeAutoIngestError(error, input.sourceId);
-          const blocked = await transitionQueueStatus(input.repoRoot, input.sourceId, "blocked", {
-            now: currentDate(input.now),
-            command,
-            autoIngest: {
-              enabled: true,
-              result: "blocked",
-              errorCode: safeError.code,
-              errorMessage: safeError.message,
-            },
-          });
-          if (!blocked.ok) {
-            throw queueRuntimeError(blocked.error);
-          }
-
-          const finalState = await readCurrentSourceStateOrThrow(input.repoRoot, input.sourceId);
-
-          return {
-            source_id: input.sourceId,
-            previous_status: current.value.status,
-            final_status: "blocked",
-            outcome: "blocked",
-            attempted: true,
-            agent: input.agent.name,
-            applied_paths: [],
-            auto_ingest: finalState.autoIngest,
-            error: safeError,
-          };
-        }
-      },
-    );
-  } catch (error) {
-    if (error instanceof RuntimeCommandError && error.code === "INGEST_LOCK_BUSY") {
-      const current = await readCurrentSourceState(input.repoRoot, input.sourceId);
-      const currentStatus = current.ok ? current.value.status : null;
-      const currentMetadata = current.ok ? current.value.autoIngest : null;
-
-      return {
-        source_id: input.sourceId,
-        previous_status: currentStatus,
-        final_status: currentStatus,
-        outcome: "deferred",
-        attempted: false,
-        agent: input.agent.name,
-        applied_paths: [],
-        auto_ingest: currentMetadata,
-        error: runtimeErrorToSafeError(error),
-      };
-    }
-
-    throw error;
+    });
+    if (!blocked.ok) throw queueRuntimeError(blocked.error);
+    const finalState = await readCurrentSourceStateOrThrow(input.repoRoot, input.sourceId);
+    return {
+      source_id: input.sourceId,
+      previous_status: previousStatus,
+      final_status: "blocked",
+      outcome: "blocked",
+      attempted: true,
+      agent: input.agent.name,
+      applied_paths: [],
+      auto_ingest: finalState.autoIngest,
+      error: safeError,
+      ...optionalPdfResult(pdf),
+    };
   }
 }
 
@@ -678,6 +638,8 @@ function skippedResult(
   finalStatus: QueueStatus | null,
   agent: string | null,
   error: AutoIngestSafeError,
+  pdf: PdfAutoIngestResult | null = null,
+  autoIngest: AutoIngestMetadata | null = null,
 ): AutoIngestSourceResult {
   return {
     source_id: sourceId,
@@ -687,9 +649,61 @@ function skippedResult(
     attempted: false,
     agent,
     applied_paths: [],
-    auto_ingest: null,
+    auto_ingest: autoIngest,
     error,
+    ...optionalPdfResult(pdf),
   };
+}
+
+async function readinessRejectedResult(
+  input: RunQueuedSourceInput,
+  expectedStatus: QueueStatus,
+  error: unknown,
+): Promise<AutoIngestSourceResult> {
+  const safeError = errorToSafeAutoIngestError(error, input.sourceId);
+  const current = await readCurrentSourceState(input.repoRoot, input.sourceId);
+  const status = current.ok ? current.value.status : expectedStatus;
+  let pdf: PdfAutoIngestResult | null = null;
+  try {
+    if (await sourceRequiresPdfArtifact(input.repoRoot, input.sourceId)) {
+      pdf = await readPdfIngestFailureResult(input.repoRoot, input.sourceId, "readiness_rejected");
+    }
+  } catch {
+    pdf = null;
+  }
+  return skippedResult(
+    input.sourceId,
+    status,
+    status,
+    input.agent.name,
+    safeError,
+    pdf,
+    current.ok ? current.value.autoIngest : null,
+  );
+}
+
+async function deferredForBusyLock(
+  input: RunQueuedSourceInput,
+  error: RuntimeCommandError,
+): Promise<AutoIngestSourceResult> {
+  const current = await readCurrentSourceState(input.repoRoot, input.sourceId);
+  const currentStatus = current.ok ? current.value.status : null;
+  const currentMetadata = current.ok ? current.value.autoIngest : null;
+  return {
+    source_id: input.sourceId,
+    previous_status: currentStatus,
+    final_status: currentStatus,
+    outcome: "deferred",
+    attempted: false,
+    agent: input.agent.name,
+    applied_paths: [],
+    auto_ingest: currentMetadata,
+    error: runtimeErrorToSafeError(error),
+  };
+}
+
+function optionalPdfResult(pdf: PdfAutoIngestResult | null): { pdf?: PdfAutoIngestResult } {
+  return pdf === null ? {} : { pdf };
 }
 
 function countResults(selected: number, results: readonly AutoIngestSourceResult[]): AutoIngestBatchResult["counts"] {

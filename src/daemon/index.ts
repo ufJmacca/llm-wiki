@@ -1241,13 +1241,16 @@ function toUploadApiData(
   commit: UploadCommitResult,
   autoIngest: AutoIngestSourceResult | undefined,
 ): UploadApiData {
+  const safeAutoIngest = autoIngest === undefined
+    ? undefined
+    : safeUploadAutoIngestResult(autoIngest, capture.source.queue_path);
   return {
     status: capture.status,
     source_id: capture.source.source_id,
     title: capture.source.title,
     source_kind: capture.source.source_kind,
     visibility: capture.source.visibility,
-    queue_status: autoIngest?.final_status ?? capture.source.queue_status,
+    queue_status: safeAutoIngest?.final_status ?? capture.source.queue_status,
     queue_path: capture.source.queue_path,
     source_card_path: capture.source.source_card_path,
     original_path: capture.source.original_path,
@@ -1256,7 +1259,33 @@ function toUploadApiData(
       ? "Raw source uploaded and queued for ingest."
       : "Raw source was already captured; no new artifacts were created.",
     commit,
-    ...(autoIngest === undefined ? {} : { auto_ingest: autoIngest }),
+    ...(safeAutoIngest === undefined ? {} : { auto_ingest: safeAutoIngest }),
+  };
+}
+
+function safeUploadAutoIngestResult(
+  result: AutoIngestSourceResult,
+  queuePath: string,
+): AutoIngestSourceResult {
+  if (
+    result.error === null
+    || (result.pdf?.applicable !== true && !result.error.code.startsWith("PDF_"))
+  ) return result;
+  const message = `PDF auto-ingest failed with ${result.error.code}.`;
+  return {
+    ...result,
+    auto_ingest: result.auto_ingest === null
+      ? null
+      : {
+          ...result.auto_ingest,
+          last_error_message: message,
+        },
+    error: {
+      code: result.error.code,
+      message,
+      path: queuePath,
+      hint: "Review private local PDF status, fix the reported condition, and retry auto-ingest.",
+    },
   };
 }
 

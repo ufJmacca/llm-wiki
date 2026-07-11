@@ -43,6 +43,7 @@ import {
   type IngestLockLease,
 } from "../runtime/ingestLock.js";
 import { RuntimeCommandError } from "../runtime/errors.js";
+import type { QueueStatus } from "../runtime/queue.js";
 import { validateReadFileInsideRoot } from "../utils/fs.js";
 
 export type PdfExtractionMetadata = {
@@ -106,6 +107,7 @@ export type PreparedPdfExtractionOperation = {
   env?: NodeJS.ProcessEnv;
   now: () => Date;
   generateExtractionId: () => string;
+  allowedQueueStatuses: readonly QueueStatus[];
 };
 
 type ValidatedPdfSource = PdfExtractionSourceState & {
@@ -126,7 +128,7 @@ type WorkspaceExtractionResult = {
   finishedAt: string;
 };
 
-class PdfPreflightRestartError extends Error {
+export class PdfPreflightRestartError extends Error {
   constructor() {
     super("PDF configuration changed while waiting for the ingest lock.");
     this.name = "PdfPreflightRestartError";
@@ -206,7 +208,20 @@ export function buildPdfExtractionTask(input: {
 export async function preparePdfExtractionOperation(
   input: ExtractPdfSourceInput,
 ): Promise<PreparedPdfExtractionOperation> {
-  const source = await readAndValidatePdfSource(input.repoRoot, input.sourceId, true);
+  return preparePdfExtractionOperationForStatuses(input, ["queued"]);
+}
+
+export async function preparePdfExtractionForAutomatedIngest(
+  input: ExtractPdfSourceInput,
+): Promise<PreparedPdfExtractionOperation> {
+  return preparePdfExtractionOperationForStatuses(input, ["queued", "ingesting"]);
+}
+
+async function preparePdfExtractionOperationForStatuses(
+  input: ExtractPdfSourceInput,
+  allowedQueueStatuses: readonly QueueStatus[],
+): Promise<PreparedPdfExtractionOperation> {
+  const source = await readAndValidatePdfSource(input.repoRoot, input.sourceId, allowedQueueStatuses);
   const runtime = await loadPdfIngestionRuntimeConfig(input.repoRoot);
   if (!runtime.ok) {
     throw readinessRuntimeError(runtime.error);
@@ -232,6 +247,7 @@ export async function preparePdfExtractionOperation(
     env: input.env,
     now: input.now ?? (() => new Date()),
     generateExtractionId: input.generateExtractionId ?? generateExtractionId,
+    allowedQueueStatuses,
   };
 }
 
@@ -264,7 +280,7 @@ export async function readValidatedPdfArtifact(
   repoRoot: string,
   sourceId: string,
 ): Promise<ValidatedPdfArtifact> {
-  const source = await readAndValidatePdfSource(repoRoot, sourceId, false);
+  const source = await readAndValidatePdfSource(repoRoot, sourceId, null);
   if (source.state.status !== "extracted" || source.state.extraction_id === null || source.state.artifact_path === null) {
     throw new RuntimeCommandError({
       code: "PDF_ARTIFACT_REQUIRED",
@@ -321,20 +337,17 @@ export async function readValidatedPdfArtifact(
 export async function ensurePreparedPdfArtifactUnderLock(
   prepared: PreparedPdfExtractionOperation,
   lease: IngestLockLease,
+  options: { onReady?: () => Promise<void> } = {},
 ): Promise<PdfExtractionResult> {
-  assertIngestLockLease(lease, prepared.repoRoot);
-  const runtime = await loadPdfIngestionRuntimeConfig(prepared.repoRoot);
-  if (!runtime.ok || runtime.value.fingerprint !== prepared.runtime.fingerprint) {
-    throw new PdfPreflightRestartError();
-  }
-
-  let source = await readAndValidatePdfSource(prepared.repoRoot, prepared.sourceId, true);
-  if (
-    source.contentHash !== prepared.source.contentHash
-    || source.originalPath !== prepared.source.originalPath
-    || source.originalHash !== prepared.source.originalHash
-  ) {
-    throw originalChanged(source.originalPath, "PDF source changed while extraction waited for the repository lock.");
+  let source = await revalidatePreparedPdfOperationUnderLock(prepared, lease);
+  if (options.onReady !== undefined) {
+    await options.onReady();
+    source = await readAndValidatePdfSource(
+      prepared.repoRoot,
+      prepared.sourceId,
+      prepared.allowedQueueStatuses,
+    );
+    assertPreparedSourceUnchanged(prepared, source);
   }
 
   let recoveredInterrupted = false;
@@ -438,14 +451,47 @@ export async function ensurePreparedPdfArtifactUnderLock(
   }
 }
 
+async function revalidatePreparedPdfOperationUnderLock(
+  prepared: PreparedPdfExtractionOperation,
+  lease: IngestLockLease,
+): Promise<ValidatedPdfSource> {
+  assertIngestLockLease(lease, prepared.repoRoot);
+  const runtime = await loadPdfIngestionRuntimeConfig(prepared.repoRoot);
+  if (!runtime.ok || runtime.value.fingerprint !== prepared.runtime.fingerprint) {
+    throw new PdfPreflightRestartError();
+  }
+
+  const source = await readAndValidatePdfSource(
+    prepared.repoRoot,
+    prepared.sourceId,
+    prepared.allowedQueueStatuses,
+  );
+  assertPreparedSourceUnchanged(prepared, source);
+
+  return source;
+}
+
+function assertPreparedSourceUnchanged(
+  prepared: PreparedPdfExtractionOperation,
+  source: ValidatedPdfSource,
+): void {
+  if (
+    source.contentHash !== prepared.source.contentHash
+    || source.originalPath !== prepared.source.originalPath
+    || source.originalHash !== prepared.source.originalHash
+  ) {
+    throw originalChanged(source.originalPath, "PDF source changed while extraction waited for the repository lock.");
+  }
+}
+
 async function readAndValidatePdfSource(
   repoRoot: string,
   sourceId: string,
-  requireQueued: boolean,
+  allowedQueueStatuses: readonly QueueStatus[] | null,
 ): Promise<ValidatedPdfSource> {
   const source = await readPdfExtractionSourceState(repoRoot, sourceId);
-  if (requireQueued && source.queueStatus !== "queued") {
-    throw invalidSourceStatus(sourceId, source.queueStatus);
+  if (allowedQueueStatuses !== null && !allowedQueueStatuses.includes(source.queueStatus)) {
+    throw invalidSourceStatus(sourceId, source.queueStatus, allowedQueueStatuses);
   }
   if (
     source.sourceKind !== "file"
@@ -1071,7 +1117,11 @@ async function ensureSafeRunsRoot(repoRoot: string, sourceDir: string): Promise<
   }
 }
 
-function invalidSourceStatus(sourceId: string, status: string): RuntimeCommandError {
+function invalidSourceStatus(
+  sourceId: string,
+  status: string,
+  allowedQueueStatuses: readonly QueueStatus[],
+): RuntimeCommandError {
   const hint = status === "blocked"
     ? `Run llm-wiki queue set-status ${sourceId} queued before explicit PDF extraction.`
     : status === "ingesting"
@@ -1079,7 +1129,7 @@ function invalidSourceStatus(sourceId: string, status: string): RuntimeCommandEr
       : "Re-extraction of an ingested source is outside this experiment's queue lifecycle.";
   return new RuntimeCommandError({
     code: "PDF_SOURCE_STATUS_INVALID",
-    message: `Explicit PDF extraction requires queue status queued; ${sourceId} is ${status}.`,
+    message: `PDF extraction requires queue status ${allowedQueueStatuses.join(" or ")}; ${sourceId} is ${status}.`,
     path: sourceId,
     hint,
   });

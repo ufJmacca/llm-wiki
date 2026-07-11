@@ -190,6 +190,49 @@ describe("llm-wiki CLI baseline", () => {
     expect(help).toContain("HTTP provider");
     expect(help).not.toContain("--provider codex");
     expect(help).toContain("--validate");
+    expect(help).toContain("--pdf-model <model>");
+    expect(help).toContain("--pdf-reasoning-effort <effort>");
+    expect(help).toContain("--pdf-detail <detail>");
+    expect(help).toContain("--force");
+  });
+
+  it("registers the extract pdf command family and shared runtime controls", async () => {
+    const root = { stdout: [] as string[], stderr: [] as string[] };
+    const rootExitCode = await runCli(["extract", "--help"], {
+      stdout: (message) => root.stdout.push(message),
+      stderr: (message) => root.stderr.push(message),
+    });
+    const pdf = { stdout: [] as string[], stderr: [] as string[] };
+    const pdfExitCode = await runCli(["extract", "pdf", "--help"], {
+      stdout: (message) => pdf.stdout.push(message),
+      stderr: (message) => pdf.stderr.push(message),
+    });
+
+    expect(rootExitCode).toBe(0);
+    expect(pdfExitCode).toBe(0);
+    expect(root.stderr).toEqual([]);
+    expect(pdf.stderr).toEqual([]);
+    expect(root.stdout.join("\n")).toContain("pdf");
+    expect(pdf.stdout.join("\n")).toContain("<source_id>");
+    expect(pdf.stdout.join("\n")).toContain("--pdf-model <model>");
+    expect(pdf.stdout.join("\n")).toContain("--pdf-reasoning-effort <effort>");
+    expect(pdf.stdout.join("\n")).toContain("--pdf-detail <detail>");
+    expect(pdf.stdout.join("\n")).toContain("--force");
+    expect(pdf.stdout.join("\n")).toContain("--repo <path>");
+    expect(pdf.stdout.join("\n")).toContain("--json");
+    expect(pdf.stdout.join("\n")).toContain("--quiet");
+
+    const queue = { stdout: [] as string[], stderr: [] as string[] };
+    const queueExitCode = await runCli(["queue", "--help"], {
+      stdout: (message) => queue.stdout.push(message),
+      stderr: (message) => queue.stderr.push(message),
+    });
+    expect(queueExitCode).toBe(0);
+    expect(queue.stderr).toEqual([]);
+    expect(queue.stdout.join("\n")).toContain("--pdf-model <model>");
+    expect(queue.stdout.join("\n")).toContain("--pdf-reasoning-effort <effort>");
+    expect(queue.stdout.join("\n")).toContain("--pdf-detail <detail>");
+    expect(queue.stdout.join("\n")).toContain("--force");
   });
 
   it("describes query manual, local agent, auto, validation, and HTTP provider modes in help", async () => {

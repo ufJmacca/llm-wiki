@@ -169,6 +169,14 @@ describe("init end-to-end scaffold contract", () => {
             timeout_seconds: 900,
           },
         },
+        pdf_ingestion: {
+          codex_agent: "codex",
+          required_plugin: "pdf@openai-primary-runtime",
+          reasoning_effort: "high",
+          pdf_detail: "high",
+          timeout_seconds: 900,
+          require_artifact_before_ingest: true,
+        },
       });
       expect(await readGeneratedFile(targetDir, "curated/dashboards/ingestion-queue.md")).toContain(
         'FROM "raw/inputs"',

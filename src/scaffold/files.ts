@@ -134,7 +134,7 @@ function configContent(options: WikiScaffoldOptions): string {
   return `version: 1
 agent:
   default: ${options.agent}
-${localAgentConfigContent(options.agent)}features:
+${localAgentConfigContent(options.agent)}${pdfIngestionConfigContent(options.agent)}features:
   obsidian: ${options.obsidian}
   dataview: ${options.dataview}
   git: ${options.git}
@@ -180,6 +180,21 @@ function localAgentConfigContent(agent: InitAgent): string {
     sandbox_mode: workspace-write
     output_mode: git-diff
     timeout_seconds: 900
+`;
+}
+
+function pdfIngestionConfigContent(agent: InitAgent): string {
+  if (agent !== "codex") {
+    return "";
+  }
+
+  return `pdf_ingestion:
+  codex_agent: codex
+  required_plugin: pdf@openai-primary-runtime
+  reasoning_effort: high
+  pdf_detail: high
+  timeout_seconds: 900
+  require_artifact_before_ingest: true
 `;
 }
 

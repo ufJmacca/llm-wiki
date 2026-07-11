@@ -8,6 +8,18 @@ import {
 } from "../agents/index.js";
 import { resumeAutoIngestSource, runAutoIngestSource, type AutoIngestSourceResult } from "../autoIngest/index.js";
 import type { CliIo } from "../cli.js";
+import {
+  addPdfExtractionOptions,
+  hasPdfExtractionOptions,
+  pdfOverridesFromRawOptions,
+  rejectPdfOptionsForNonExtractionMode,
+  type RawPdfExtractionOptions,
+} from "../pdf/cli.js";
+import {
+  loadPdfIngestionRuntimeConfig,
+  readPdfIngestionConfig,
+  resolvePdfExtractionSettings,
+} from "../pdf/config.js";
 import { buildIngestTask, type IngestTask } from "../agentTasks/ingest.js";
 import { IngestValidationFailedError, runLocalAgentIngestCore } from "../ingest/localAgentCore.js";
 import {
@@ -34,7 +46,7 @@ import { validateIngestReadiness, type IngestValidationIssue } from "../validati
 import { prepareIngestBranch } from "../utils/git.js";
 import { readTextFileInsideRoot, validateTextFileWriteInsideRoot, writeTextFileInsideRoot } from "../utils/fs.js";
 
-type RawIngestOptions = RawRuntimeCommandOptions & {
+type RawIngestOptions = RawRuntimeCommandOptions & RawPdfExtractionOptions & {
   validate?: unknown;
   taskOut?: unknown;
   createBranch?: unknown;
@@ -127,7 +139,7 @@ type IngestStateSnapshot = {
 };
 
 export function registerIngestCommand(program: Command, io: CliIo): void {
-  addRuntimeOptions(
+  addRuntimeOptions(addPdfExtractionOptions(
     program
       .command("ingest")
       .description("Generate a manual prompt, execute local agents/providers, or validate completed curated edits")
@@ -136,9 +148,9 @@ export function registerIngestCommand(program: Command, io: CliIo): void {
       .option("--task-out <path>", "write the manual prompt to a repository-relative path")
       .option("--create-branch", "create the recommended ingest branch when Git is enabled", false)
       .option("--agent <name>", "run local agent execution with a configured agent such as codex")
-      .option("--auto", "run local agent execution with the configured default local agent", false)
+      .option("--auto", "execute the configured default local agent", false)
       .option("--provider <name>", "run HTTP provider mode with an explicitly configured provider"),
-  ).action(async (sourceId: string, rawOptions: RawIngestOptions) => {
+  )).action(async (sourceId: string, rawOptions: RawIngestOptions) => {
     await runIngestCommand(sourceId, rawOptions, io);
   });
 }
@@ -160,6 +172,7 @@ async function runIngestCommand(sourceId: string, rawOptions: RawIngestOptions, 
 
   try {
     validateIngestModeOptions(rawOptions);
+    await validatePdfIngestOptions(resolvedRepo.value.rootDir, rawOptions);
     const data = rawOptions.validate === true
       ? await validateAndCompleteIngest(resolvedRepo.value.rootDir, sourceId)
       : typeof rawOptions.provider === "string"
@@ -256,6 +269,60 @@ function validateIngestModeOptions(rawOptions: RawIngestOptions): void {
       hint: "Create or switch to the ingest branch first, then rerun with --agent <name> or --auto.",
       path: "--create-branch",
     });
+  }
+
+  if (rawOptions.validate === true) {
+    rejectPdfOptionsForNonExtractionMode(
+      rawOptions,
+      "ingest --validate",
+      "Remove PDF options; validation consumes an existing canonical artifact and never starts extraction.",
+    );
+  }
+
+  if (typeof rawOptions.provider === "string") {
+    rejectPdfOptionsForNonExtractionMode(
+      rawOptions,
+      "HTTP provider ingest",
+      "Remove PDF options and run llm-wiki extract pdf <source_id> before provider ingest.",
+    );
+  }
+
+  if (!isAgentModeRequested(rawOptions)) {
+    rejectPdfOptionsForNonExtractionMode(
+      rawOptions,
+      "manual ingest",
+      "Remove PDF options and run llm-wiki extract pdf <source_id> before generating a manual task.",
+    );
+  }
+}
+
+async function validatePdfIngestOptions(repoRoot: string, rawOptions: RawIngestOptions): Promise<void> {
+  if (!hasPdfExtractionOptions(rawOptions)) {
+    return;
+  }
+
+  const config = await readPdfIngestionConfig(repoRoot);
+  if (!config.ok) {
+    throw new RuntimeCommandError(config.error);
+  }
+
+  const settings = resolvePdfExtractionSettings(config.value, pdfOverridesFromRawOptions(rawOptions));
+  if (!settings.ok) {
+    throw new RuntimeCommandError(settings.error);
+  }
+
+  if (typeof rawOptions.agent === "string" && rawOptions.agent.trim() !== config.value.codexAgent) {
+    throw new RuntimeCommandError({
+      code: "PDF_CONFIG_INVALID",
+      message: `PDF extraction options require agent ${config.value.codexAgent}.`,
+      path: "--agent",
+      hint: `Use --agent ${config.value.codexAgent}, use --auto when it selects that agent, or run llm-wiki extract pdf <source_id> first.`,
+    });
+  }
+
+  const runtime = await loadPdfIngestionRuntimeConfig(repoRoot);
+  if (!runtime.ok) {
+    throw new RuntimeCommandError(runtime.error);
   }
 }
 

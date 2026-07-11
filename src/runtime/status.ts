@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 
 import { checkLocalAgentAvailability, type LocalAgentAvailabilityError } from "../agents/index.js";
 import { lintWiki, type LintResult } from "../lint/index.js";
+import { getPdfReadinessStatus, type PdfReadinessStatus } from "../pdf/readiness.js";
 import { scanWikiRepository, type RepoScan } from "../scanner/repo.js";
 import { readGitState, type GitState } from "../utils/git.js";
 import {
@@ -63,6 +64,7 @@ export type StatusData = {
     agent: string | null;
     reason: string | null;
   };
+  pdf_ingestion: PdfReadinessStatus;
   health: {
     state: "ok" | "warning" | "error";
     ok: boolean;
@@ -111,15 +113,29 @@ const EMPTY_QUEUE_COUNTS: QueueListResult["counts"] = {
 };
 
 export async function getWikiStatus(repoRoot: string): Promise<StatusData> {
-  const [configSummary, configReadiness, scan, lint, queue, explorer] = await Promise.all([
+  const [configSummary, configReadiness, scan, lint, queue, explorer, pdfReadiness] = await Promise.all([
     readWikiConfigSummary(repoRoot),
     readWikiStatusConfigReadiness(repoRoot),
     scanWikiRepository(repoRoot),
     lintWiki(repoRoot),
     readQueueStatus(repoRoot),
     readExplorerStatus(repoRoot),
+    getPdfReadinessStatus(repoRoot),
   ]);
   const config = summarizeConfig(configSummary);
+  if (configSummary.ok && !pdfReadiness.config_valid && !config.errors.some((issue) => issue.message.includes("pdf_ingestion"))) {
+    const issue = pdfReadiness.issues[0];
+    if (issue !== undefined) {
+      config.valid = false;
+      config.errors.push({
+        severity: "error",
+        code: "wiki_config_invalid",
+        message: `Invalid ${WIKI_CONFIG_RELATIVE_PATH} pdf_ingestion config: ${issue.message}`,
+        path: WIKI_CONFIG_RELATIVE_PATH,
+        hint: issue.hint,
+      });
+    }
+  }
   const agents = await summarizeAgents(configReadiness, repoRoot);
   const providers = configReadiness.providers;
   const auto = summarizeAutoReadiness(agents);
@@ -134,6 +150,7 @@ export async function getWikiStatus(repoRoot: string): Promise<StatusData> {
     agents,
     providers,
     auto,
+    pdf_ingestion: pdfReadiness,
     health: {
       state: errorCount > 0 ? "error" : warningCount > 0 ? "warning" : "ok",
       ok: errorCount === 0,

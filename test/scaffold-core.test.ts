@@ -223,10 +223,12 @@ describe("core wiki scaffold templates", () => {
     const codexConfig = parse(codexConfigSource ?? "") as {
       agent: { default: string };
       agents?: Record<string, unknown>;
+      pdf_ingestion?: Record<string, unknown>;
     };
     const genericConfig = parse(genericEntries.get(".llm-wiki/config.yml") ?? "") as {
       agent: { default: string };
       agents?: Record<string, unknown>;
+      pdf_ingestion?: Record<string, unknown>;
     };
 
     // Assert
@@ -244,9 +246,18 @@ describe("core wiki scaffold templates", () => {
           timeout_seconds: 900,
         },
       },
+      pdf_ingestion: {
+        codex_agent: "codex",
+        required_plugin: "pdf@openai-primary-runtime",
+        reasoning_effort: "high",
+        pdf_detail: "high",
+        timeout_seconds: 900,
+        require_artifact_before_ingest: true,
+      },
     });
     expect(genericConfig).toMatchObject({ agent: { default: "generic" } });
     expect(genericConfig.agents).toBeUndefined();
+    expect(genericConfig.pdf_ingestion).toBeUndefined();
   });
 
   it("generates stable parseable index and log control-plane pages", () => {

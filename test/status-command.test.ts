@@ -83,6 +83,21 @@ type StatusData = {
     agent: string | null;
     reason: string | null;
   };
+  pdf_ingestion: {
+    config_valid: boolean;
+    codex_agent: string;
+    required_plugin: string;
+    executable_ready: boolean;
+    executable_path: string | null;
+    plugin_list_ready: boolean;
+    plugin_installed: boolean | null;
+    plugin_enabled: boolean | null;
+    plugin_version: string | null;
+    plugin_descriptor: string | null;
+    stable_descriptor_permits_reuse: boolean;
+    ready: boolean;
+    issues: Array<{ code: string; message: string; path: string; hint: string }>;
+  };
   health: {
     state: "ok" | "warning" | "error";
     ok: boolean;
@@ -264,8 +279,8 @@ async function createFakeAgentCommand(commandName = "codex"): Promise<FakeAgent>
   const oldPath = process.env.PATH;
   const oldLog = process.env.LLM_WIKI_FAKE_AGENT_LOG;
   const script = process.platform === "win32"
-    ? "@echo off\r\necho executed>>\"%LLM_WIKI_FAKE_AGENT_LOG%\"\r\nexit /b 0\r\n"
-    : "#!/usr/bin/env sh\nprintf executed >> \"$LLM_WIKI_FAKE_AGENT_LOG\"\n";
+    ? "@echo off\r\necho %*>>\"%LLM_WIKI_FAKE_AGENT_LOG%\"\r\necho {\"installed\":[{\"pluginId\":\"pdf@openai-primary-runtime\",\"installed\":true,\"enabled\":true,\"version\":\"1.2.3\"}],\"available\":[]}\r\n"
+    : "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> \"$LLM_WIKI_FAKE_AGENT_LOG\"\nprintf '%s' '{\"installed\":[{\"pluginId\":\"pdf@openai-primary-runtime\",\"installed\":true,\"enabled\":true,\"version\":\"1.2.3\"}],\"available\":[]}'\n";
 
   await writeFile(commandPath, script, "utf8");
   await chmod(commandPath, 0o755);
@@ -478,7 +493,22 @@ describe("status command", () => {
           agent: "codex",
           reason: null,
         });
-        await expect(readFile(fakeAgent.logPath, "utf8")).rejects.toThrow();
+        expect(payload.data.pdf_ingestion).toMatchObject({
+          config_valid: true,
+          codex_agent: "codex",
+          required_plugin: "pdf@openai-primary-runtime",
+          plugin_list_ready: true,
+          plugin_installed: true,
+          plugin_enabled: true,
+          plugin_version: "1.2.3",
+          plugin_descriptor: "pdf@openai-primary-runtime#version:1.2.3",
+          stable_descriptor_permits_reuse: true,
+          ready: true,
+          issues: [],
+        });
+        const preflightArgs = await readFile(fakeAgent.logPath, "utf8");
+        expect(preflightArgs).toContain("plugin list --json");
+        expect(preflightArgs).not.toMatch(/\bexec\b/u);
       } finally {
         fakeAgent.restore();
         await rm(fakeAgent.binDir, { force: true, recursive: true });
@@ -759,6 +789,8 @@ describe("status command", () => {
             "  codex:",
             "    type: local-exec",
             "    command: codex",
+            "    args:",
+            "      - exec",
             "    timeout_seconds: 900",
             "providers:",
             "  remote:",
@@ -781,7 +813,10 @@ describe("status command", () => {
         expect(result.stdout[0]).toContain("Codex executable: available");
         expect(result.stdout[0]).toContain("HTTP providers: 1 (remote)");
         expect(result.stdout[0]).toContain("--auto: ready (codex)");
-        await expect(readFile(fakeAgent.logPath, "utf8")).rejects.toThrow();
+        expect(result.stdout[0]).toContain("PDF extraction readiness: ready");
+        const preflightArgs = await readFile(fakeAgent.logPath, "utf8");
+        expect(preflightArgs).toContain("plugin list --json");
+        expect(preflightArgs).not.toMatch(/\bexec\b/u);
       } finally {
         fakeAgent.restore();
         await rm(fakeAgent.binDir, { force: true, recursive: true });
